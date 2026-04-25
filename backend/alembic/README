@@ -1,0 +1,3 @@
+Alembic migration environment for the local MVP.
+
+The app creates tables on startup for the MVP. Use Alembic revisions when evolving the schema after the first release.

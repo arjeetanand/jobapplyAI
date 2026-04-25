@@ -1,0 +1,93 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --paper: #f7f2e8;
+  --paper-2: #fffdf7;
+  --ink: #121212;
+  --line: #d9cfbf;
+  --dark: #111111;
+  --lime: #b7ff29;
+
+  color: var(--ink);
+  background: var(--paper);
+  font-family:
+    Inter, "Geist", "Satoshi", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 12% 14%, rgba(183, 255, 41, 0.12), transparent 35%),
+    radial-gradient(circle at 88% 2%, rgba(18, 18, 18, 0.06), transparent 24%),
+    linear-gradient(180deg, #f8f4ea 0%, #f7f2e8 100%);
+  letter-spacing: 0;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.focus-ring {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+}
+
+.focus-ring:focus-visible {
+  outline-color: #1b2a14;
+}
+
+.section-kicker {
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #6e6658;
+}
+
+.hero-title {
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1.05;
+  font-size: clamp(2rem, 3.2vw, 3.4rem);
+}
+
+.floating-lift {
+  transition:
+    transform 220ms ease,
+    box-shadow 220ms ease;
+}
+
+.floating-lift:hover {
+  transform: translateY(-2px) scale(1.01);
+  box-shadow: 0 18px 32px rgba(18, 18, 18, 0.12);
+}
+
+.fade-slide-up {
+  animation: fade-slide-up 420ms ease both;
+}
+
+@keyframes fade-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
