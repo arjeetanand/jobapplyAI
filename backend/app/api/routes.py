@@ -534,6 +534,7 @@ def tailor_resume(job_id: int, user_id: int | None = None, db: Session = Depends
         file_path=str(tailored.pdf_path),
         docx_path=str(tailored.docx_path),
         pdf_path=str(tailored.pdf_path),
+        tex_path=str(tailored.tex_path) if tailored.tex_path else None,
         metadata_path=str(tailored.metadata_path),
         skills_emphasized=tailored.skills_emphasized,
         similarity_group="-".join(tailored.skills_emphasized[:4]) or None,
@@ -715,18 +716,30 @@ def required_questions_for_job(job_id: int, user_id: int | None = None, db: Sess
 
 @router.post("/jobs/{job_id}/auto-apply")
 def auto_apply_job(job_id: int, db: Session = Depends(get_db)) -> dict:
-    """Trigger automated application submission."""
+    """Trigger automated application submission with knowledge base integration."""
     from app.services.submission import SubmissionAgent
-    from app.services.application_packet import ApplicationPacketAgent
-    
+
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    
+
     user = db.scalar(select(User).order_by(User.id.desc()))
     if not user:
         raise HTTPException(status_code=400, detail="User profile not found. Please complete onboarding.")
-    
+
+    preferences = _preferences_for(db, user)
+    threshold = preferences.match_threshold or 85
+
+    # Enforce score threshold — human review needed for low-score jobs
+    if job.match_score is not None and job.match_score < threshold:
+        return {
+            "status": "requires_review",
+            "message": f"Score {job.match_score} is below threshold {threshold}. Please review manually before applying.",
+            "steps": [],
+            "match_score": job.match_score,
+            "threshold": threshold,
+        }
+
     # Get latest tailored resume for this job
     resume = db.scalar(
         select(ResumeVersion)
@@ -734,27 +747,31 @@ def auto_apply_job(job_id: int, db: Session = Depends(get_db)) -> dict:
         .order_by(ResumeVersion.created_at.desc())
     )
     if not resume:
-        # Fallback to base resume if no tailored version exists
-        pass # Handle properly below
-    
+        return {
+            "status": "error",
+            "message": "Please run 'Resume Decision' first to generate a tailored resume.",
+            "steps": [],
+        }
+
     answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.user_id == user.id)).all()
-    
+
     settings = get_settings()
     agent = SubmissionAgent(storage_root=settings.resolved_storage_root)
-    
-    # Ensure a resume exists
-    if not resume:
-         # Trigger decision if not done
-         return {"status": "error", "message": "Please run 'Resume Decision' first to generate a tailored resume."}
 
-    result = agent.auto_fill_linkedin(user, job, resume, list(answers))
-    
+    # Pass db so the agent can save new unanswered questions to the knowledge base
+    result = agent.auto_fill_linkedin(user, job, resume, list(answers), db=db)
+
     # Update application status
-    app = db.scalar(select(Application).where(Application.job_id == job.id))
-    if app:
-        app.status = "Auto-fill prepared"
+    app_record = db.scalar(select(Application).where(Application.job_id == job.id, Application.user_id == user.id))
+    if app_record:
+        if result.get("status") == "ready_to_submit":
+            app_record.status = "Auto-apply ready"
+        elif result.get("status") == "requires_review":
+            app_record.status = "Requires review"
+        else:
+            app_record.status = "Auto-fill prepared"
         db.commit()
-        
+
     return result
 
 
