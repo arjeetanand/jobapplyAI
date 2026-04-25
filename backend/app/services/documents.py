@@ -139,3 +139,137 @@ def write_pdf(path: Path, title: str, paragraphs: list[str]) -> None:
         f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode()
     )
     path.write_bytes(b"".join(output))
+
+
+# ---------------------------------------------------------------------------
+# LaTeX writer (uses user's Overleaf template)
+# ---------------------------------------------------------------------------
+
+def write_latex(
+    path: Path,
+    template_source: str,
+    user_name: str,
+    skills: list[str],
+    experience: list[dict],
+    projects: list[dict],
+    job_title: str,
+    company: str,
+) -> None:
+    """Generate a tailored LaTeX resume from the user's Overleaf template.
+
+    Replaces the Technical Skills, Experience, and Projects sections with
+    the AI-tailored content while keeping the rest of the template intact.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tex = template_source
+
+    # ---- Replace Technical Skills section ----
+    skills_block = _latex_skills_block(skills)
+    tex = _replace_section(tex, "Technical Skills", skills_block)
+
+    # ---- Replace Experience section ----
+    exp_block = _latex_experience_block(experience)
+    tex = _replace_section(tex, "Experience", exp_block)
+
+    # ---- Replace Projects section ----
+    proj_block = _latex_projects_block(projects)
+    tex = _replace_section(tex, "Projects", proj_block)
+
+    path.write_text(tex, encoding="utf-8")
+
+
+def _replace_section(tex: str, section_name: str, new_content: str) -> str:
+    """Replace a \\section{Name}...next section block with new content."""
+    import re
+    pattern = (
+        r"(\\section\{" + re.escape(section_name) + r"\})"
+        r"(.*?)"
+        r"(?=\\section\{|\\end\{document\})"
+    )
+    match = re.search(pattern, tex, re.DOTALL)
+    if match:
+        replacement = match.group(1) + "\n" + new_content + "\n"
+        tex = tex[:match.start()] + replacement + tex[match.end():]
+    return tex
+
+
+def _latex_escape(text: str) -> str:
+    """Escape special LaTeX characters."""
+    replacements = {
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    for char, escaped in replacements.items():
+        text = text.replace(char, escaped)
+    return text
+
+
+def _latex_skills_block(skills: list[str]) -> str:
+    """Generate the Technical Skills section content."""
+    skills_line = ", ".join(_latex_escape(s) for s in skills)
+    return (
+        r" \begin{itemize}[leftmargin=0.1in, label={}]" "\n"
+        r"    \small{\item{" "\n"
+        r"    \textbf{Technical Skills:} " + skills_line + r"\\" "\n"
+        r"    }}" "\n"
+        r" \end{itemize}" "\n"
+        r"\vspace{-18pt}"
+    )
+
+
+def _latex_experience_block(experience: list[dict]) -> str:
+    """Generate the Experience section content."""
+    lines = [r"  \resumeSubHeadingListStart"]
+    for exp in experience[:4]:
+        company = _latex_escape(exp.get("company", ""))
+        role = _latex_escape(exp.get("role", ""))
+        duration = _latex_escape(exp.get("duration", ""))
+        location = _latex_escape(exp.get("location", ""))
+        lines.append(f"    \\resumeSubheading")
+        lines.append(f"      {{{company}}}{{{duration}}}")
+        lines.append(f"      {{{role}}}{{{location}}}")
+        lines.append(r"      \resumeItemListStart")
+        for bullet in exp.get("bullets", [])[:5]:
+            lines.append(f"        \\resumeItem {{{_latex_escape(bullet)}}}")
+        lines.append(r"    \resumeItemListEnd")
+        lines.append("")
+    lines.append(r"  \resumeSubHeadingListEnd")
+    lines.append(r"\vspace{-16pt}")
+    return "\n".join(lines)
+
+
+def _latex_projects_block(projects: list[dict]) -> str:
+    """Generate the Projects section content."""
+    lines = [r"    \vspace{-6pt}", r"    \resumeSubHeadingListStart"]
+    for proj in projects[:5]:
+        name = _latex_escape(proj.get("name", ""))
+        url = proj.get("url", "")
+        gh_link = ""
+        if url:
+            gh_link = r"{\href{" + url + r"}{\faGithub}}"
+        lines.append(f"    \\resumeProjectHeading")
+        lines.append(f"          {{\\textbf{{{name}   }}{gh_link}}}{{}}")
+        lines.append(r"          \resumeItemListStart")
+        summary = proj.get("summary", "")
+        if summary:
+            for part in summary.split(";"):
+                part = part.strip()
+                if part:
+                    lines.append(f"            \\resumeItem{{{_latex_escape(part)}}}")
+        skills_list = proj.get("skills", [])
+        if skills_list:
+            skills_str = ", ".join(_latex_escape(s) for s in skills_list)
+            lines.append(f"            \\resumeItem{{Technologies Used: {skills_str}}}")
+        lines.append(r"          \resumeItemListEnd")
+        lines.append(r"          \vspace{-14pt}")
+        lines.append("")
+    lines.append(r"    \resumeSubHeadingListEnd")
+    lines.append(r"\vspace{3pt}")
+    return "\n".join(lines)
+

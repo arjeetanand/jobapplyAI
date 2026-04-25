@@ -16,7 +16,7 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.models.entities import Job, ResumeVersion, User
-from app.services.documents import write_docx_rich, write_pdf
+from app.services.documents import write_docx_rich, write_latex, write_pdf
 from app.services.text import extract_keywords, keyword_overlap, normalize
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class TailoredResume:
     metadata: dict
     docx_path: Path
     pdf_path: Path
+    tex_path: Path | None
     metadata_path: Path
     ai_generated: bool = False
 
@@ -201,6 +202,21 @@ class ResumeTailoringAgent:
         write_docx_rich(docx_path, title, paragraphs)
         write_pdf(pdf_path, title, plain_paragraphs)
 
+        # Generate LaTeX version if template is available
+        tex_path: Path | None = None
+        if user.latex_template_source:
+            tex_path = version_dir / f"{resume_id}.tex"
+            write_latex(
+                path=tex_path,
+                template_source=user.latex_template_source,
+                user_name=user.name or "Candidate",
+                skills=emphasized or user.skills[:15],
+                experience=user.experience or [],
+                projects=user.projects or [],
+                job_title=job.title,
+                company=job.company,
+            )
+
         metadata = {
             "resume_id": resume_id,
             "company": job.company,
@@ -225,6 +241,7 @@ class ResumeTailoringAgent:
             metadata=metadata,
             docx_path=docx_path,
             pdf_path=pdf_path,
+            tex_path=tex_path,
             metadata_path=metadata_path,
             ai_generated=ai_generated,
         )
