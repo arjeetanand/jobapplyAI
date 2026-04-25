@@ -722,7 +722,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
       setResultFor(job.id, [
         `Status: ${res.status}`,
         res.message,
-        ...res.steps.map(s => `→ ${s}`)
+        ...(res.steps ?? []).map(s => `→ ${s}`)
       ]);
       if (res.fill_plan) {
         onNotice("Automated form filling prepared. Reviewing plan...");
@@ -926,6 +926,12 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                   className="flex items-center gap-1.5 rounded border border-moss px-3 py-1.5 text-xs font-medium text-moss hover:bg-field"
                 >
                   <Download size={12} /> Download DOCX
+                </button>
+                <button
+                  onClick={() => api.downloadResumeTex(res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
+                  className="flex items-center gap-1.5 rounded border border-indigo-400 px-3 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-50"
+                >
+                  <Download size={12} /> Download LaTeX
                 </button>
               </div>
             )}

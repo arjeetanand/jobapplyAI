@@ -655,6 +655,7 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
         file_path=str(tailored.pdf_path),
         docx_path=str(tailored.docx_path),
         pdf_path=str(tailored.pdf_path),
+        tex_path=str(tailored.tex_path) if tailored.tex_path else None,
         metadata_path=str(tailored.metadata_path),
         skills_emphasized=tailored.skills_emphasized,
         similarity_group="-".join(tailored.skills_emphasized[:4]) or None,
@@ -687,6 +688,7 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
         "recommended_projects_to_build": tailored.recommended_projects,
         "reasons": score.reasons,
         "concerns": score.concerns,
+        "tex_path": str(tailored.tex_path) if tailored.tex_path else None,
     }
 
 
@@ -1028,6 +1030,24 @@ def download_resume_docx(version_id: int, db: Session = Depends(get_db)) -> File
     return FileResponse(
         path=str(docx_path),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+    )
+
+
+@router.get("/resume-versions/{version_id}/download/tex")
+def download_resume_tex(version_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    version = db.get(ResumeVersion, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Resume version not found.")
+    if not version.tex_path:
+        raise HTTPException(status_code=404, detail="LaTeX file was not generated for this version.")
+    tex_path = Path(version.tex_path)
+    if not tex_path.exists():
+        raise HTTPException(status_code=404, detail="LaTeX file not found on disk.")
+    filename = f"{version.role}_{version.company}.tex".replace(" ", "_")[:120]
+    return FileResponse(
+        path=str(tex_path),
+        media_type="application/x-tex",
         filename=filename,
     )
 

@@ -280,4 +280,18 @@ export const api = {
     a.click();
     URL.revokeObjectURL(url);
   },
+  downloadResumeTex: async (versionId: number): Promise<void> => {
+    const response = await fetch(`${API_URL}/resume-versions/${versionId}/download/tex`);
+    if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
+    const blob = await response.blob();
+    const cd = response.headers.get("content-disposition") ?? "";
+    const match = cd.match(/filename="?([^"]+)"?/);
+    const filename = match?.[1] ?? `resume_${versionId}.tex`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
 };
