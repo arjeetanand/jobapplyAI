@@ -152,6 +152,9 @@ def test_latex_tailoring_preserves_uploaded_resume_and_reports_changes(tmp_path)
 Original summary should be replaced.
 }
 \vspace{-10pt}
+
+
+% ---------- EXPERIENCE ----------
 \section{Experience}
 KEEP_ORACLE_EXPERIENCE Python FastAPI RAG systems.
 \section{Technical Skills}
@@ -181,6 +184,9 @@ KEEP_DATAMIND_PROJECT
     assert "KEEP_ORACLE_EXPERIENCE" in tex
     assert "KEEP_DATAMIND_PROJECT" in tex
     assert "Original summary should be replaced" not in tex
+    assert r"\small{" in tex
+    assert r"\vspace{-10pt}" in tex
+    assert "% ---------- EXPERIENCE ----------" in tex
     assert "Data Scientist - Artificial Intelligence" in tex
     assert r"\textbf{Targeted Focus:}" in tex
     assert "PyTorch" in tex
@@ -605,10 +611,27 @@ def test_import_scores_job_and_resume_lab_tracks_refinement_history(tmp_path, mo
     assert preview.json()["base_source_type"] == "uploaded_latex_template"
     assert preview.json()["tailored_source_type"] == "latex"
     assert preview.json()["diff"]
+    assert preview.json()["pdf_preview"]["tailored_pdf_url"] == f"/resume-versions/{body['resume_version_id']}/preview/pdf"
+
+    visual_pdf = client.get(f"/resume-versions/{body['resume_version_id']}/preview/pdf")
+    assert visual_pdf.status_code == 200
+    assert visual_pdf.content.startswith(b"%PDF")
+
+    auto_refined = client.post(
+        f"/jobs/{job_id}/refine-resume",
+        json={
+            "user_id": user_id,
+            "instructions": "",
+        },
+    )
+    assert auto_refined.status_code == 200
+    assert auto_refined.json()["auto_refined"] is True
+    assert "job description" in auto_refined.json()["message"].lower()
+    assert auto_refined.json()["comparison"]["tailored_resume_score"] is not None
 
     debug = client.get(f"/jobs/{job_id}/debug")
     assert debug.status_code == 200
-    assert debug.json()["resume_versions"][0]["id"] == body["resume_version_id"]
+    assert body["resume_version_id"] in {version["id"] for version in debug.json()["resume_versions"]}
     assert debug.json()["diagnosis"]
 
 

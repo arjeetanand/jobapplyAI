@@ -90,6 +90,14 @@ export type ResumePreview = {
   tailored_preview: string;
   diff: string[];
   diff_truncated: boolean;
+  pdf_preview: {
+    base_pdf_url: string | null;
+    tailored_pdf_url: string | null;
+    base_pdf_available: boolean;
+    tailored_pdf_available: boolean;
+    pdf_generation?: string | null;
+    note: string;
+  };
   metadata: {
     resume_changes: string[];
     score_report: Record<string, unknown>;
@@ -554,6 +562,8 @@ export const api = {
       message: string;
       resume_version_id: number;
       version: ResumeVersion;
+      auto_refined?: boolean;
+      instructions_used?: string;
       comparison: {
         original_match_score: number;
         tailored_resume_score: number;

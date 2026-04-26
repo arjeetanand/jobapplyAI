@@ -804,14 +804,14 @@ def _persist_resume_score_report(
 def _pdf_generation_note(metadata: dict) -> str:
     mode = metadata.get("pdf_generation")
     if mode == "latex_compiler":
-        return "Prepared tailored PDF by compiling the LaTeX resume."
+        return "Tailored PDF was compiled from the edited LaTeX resume."
     if mode == "base_pdf_fallback":
         return (
-            "No local LaTeX compiler was found; SeekApply kept your uploaded PDF format for application upload "
-            "and generated tailored LaTeX for review."
+            "Application PDF keeps your original Overleaf formatting. Tailored LaTeX edits are saved for review; "
+            "install a local LaTeX compiler to render those edits into the same PDF format."
         )
     if mode == "styled_pdf_fallback":
-        return "No local LaTeX compiler or uploaded base PDF was available, so SeekApply generated a simple styled PDF."
+        return "SeekApply generated a simple PDF because no uploaded PDF or local LaTeX compiler was available."
     return "PDF status will be finalized when you download or queue this resume."
 
 
@@ -955,7 +955,7 @@ def _resume_lab_payload(db: Session, *, user: User, preferences: JobPreference, 
         "latex_compiler_available": latex_compiler_available(),
         "versions": versions_payload,
         "pdf_note": (
-            "Install a local LaTeX compiler to turn tailored .tex edits into a tailored PDF automatically."
+            "Tailored LaTeX edits are ready. Install a local LaTeX compiler to render them into the same Overleaf PDF format."
             if ResumeTailoringAgent().has_latex_template(user) and not latex_compiler_available()
             else "Tailored PDF generation is available."
         ),
@@ -1119,6 +1119,8 @@ def _resume_preview_payload(db: Session, version: ResumeVersion) -> dict:
     job = db.get(Job, version.job_id) if version.job_id else None
     agent = ResumeTailoringAgent()
     tex_path = agent.ensure_latex_export(user, version, job, force=False)
+    pdf_path = agent.ensure_pdf_export(user, version, job, force=False)
+    base_pdf_path = agent.base_pdf_path(user)
     metadata = _resume_version_metadata(version.metadata_path)
     source_type, base_source = _base_resume_preview_source(user)
     tailored_source = tex_path.read_text(encoding="utf-8", errors="ignore") if tex_path.exists() else ""
@@ -1139,6 +1141,14 @@ def _resume_preview_payload(db: Session, version: ResumeVersion) -> dict:
         "tailored_preview": _preview_excerpt(tailored_source),
         "diff": [_preview_excerpt(line, limit=600) for line in diff_lines[:240]],
         "diff_truncated": len(diff_lines) > 240,
+        "pdf_preview": {
+            "base_pdf_url": "/resumes/base/preview-pdf" if base_pdf_path else None,
+            "tailored_pdf_url": f"/resume-versions/{version.id}/preview/pdf" if pdf_path.exists() else None,
+            "base_pdf_available": bool(base_pdf_path),
+            "tailored_pdf_available": pdf_path.exists(),
+            "pdf_generation": metadata.get("pdf_generation"),
+            "note": _pdf_generation_note(metadata),
+        },
         "metadata": {
             "resume_changes": metadata.get("resume_changes", []),
             "score_report": metadata.get("score_report", {}),
@@ -1801,6 +1811,20 @@ def download_base_resume(db: Session = Depends(get_db)) -> FileResponse:
         ".md": "text/markdown",
     }
     return FileResponse(path=str(path), media_type=media_types.get(path.suffix.lower(), "application/octet-stream"), filename=path.name)
+
+
+@router.get("/resumes/base/preview-pdf")
+def preview_base_resume_pdf(db: Session = Depends(get_db)) -> FileResponse:
+    user = _default_user(db)
+    path = ResumeTailoringAgent().base_pdf_path(user)
+    if not path or not path.exists():
+        raise HTTPException(status_code=404, detail="No uploaded base PDF is available for visual preview.")
+    return FileResponse(
+        path=str(path),
+        media_type="application/pdf",
+        filename=path.name,
+        headers={"Content-Disposition": f'inline; filename="{path.name}"'},
+    )
 
 
 @router.post("/resumes/upload-base")
@@ -2698,13 +2722,21 @@ def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = De
     job.score_reasons = base_score.reasons
     job.score_concerns = base_score.concerns
 
-    suffix = f"refine-{datetime.now().strftime('%H%M%S%f')}" if payload.force_new_version else "refine"
-    tailored = ResumeTailoringAgent().tailor(
+    agent = ResumeTailoringAgent()
+    instructions = (payload.instructions or "").strip()
+    auto_refined = not instructions
+    if auto_refined:
+        instructions = agent.auto_refinement_instructions(user, job)
+
+    suffix_prefix = "auto-jd" if auto_refined else "refine"
+    suffix = f"{suffix_prefix}-{datetime.now().strftime('%H%M%S%f')}" if payload.force_new_version else suffix_prefix
+    tailored = agent.tailor(
         user,
         job,
         base_score.score,
-        manual_instructions=payload.instructions,
+        manual_instructions=instructions,
         resume_id_suffix=suffix,
+        auto_refined=auto_refined,
     )
     score_payload = _score_tailored_resume_payload(
         user=user,
@@ -2745,7 +2777,7 @@ def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = De
     job.status = "Resume tailored"
     db.add(
         AgentRun(
-            agent_name="Resume Refinement Agent",
+            agent_name="Resume Auto-Refinement Agent" if auto_refined else "Resume Refinement Agent",
             input_summary=f"job_id={job.id}",
             output_summary=(
                 f"Created resume version {version.id}; score "
@@ -2756,11 +2788,17 @@ def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = De
     lab = _resume_lab_payload(db, user=user, preferences=preferences, job=job)
     db.commit()
     return {
-        "message": "Created a refined LaTeX-backed resume version and rescored it.",
+        "message": (
+            "Automatically refined the LaTeX-backed resume from the job description and rescored it."
+            if auto_refined
+            else "Created a refined LaTeX-backed resume version and rescored it."
+        ),
         "resume_version_id": version.id,
         "version": _resume_version_payload(db, version, user=user, job=job, selected=True),
         "comparison": score_payload,
         "lab": lab,
+        "auto_refined": auto_refined,
+        "instructions_used": instructions,
     }
 
 
@@ -3509,6 +3547,28 @@ def download_resume_pdf(version_id: int, db: Session = Depends(get_db)) -> FileR
         raise HTTPException(status_code=404, detail="PDF file not found on disk.")
     filename = f"{version.role}_{version.company}.pdf".replace(" ", "_")[:120]
     return FileResponse(path=str(pdf_path), media_type="application/pdf", filename=filename)
+
+
+@router.get("/resume-versions/{version_id}/preview/pdf")
+def preview_resume_pdf(version_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    version = db.get(ResumeVersion, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Resume version not found.")
+    user = db.get(User, version.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Resume owner not found.")
+    job = db.get(Job, version.job_id) if version.job_id else None
+    pdf_path = ResumeTailoringAgent().ensure_pdf_export(user, version, job, force=False)
+    db.commit()
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="PDF file not found on disk.")
+    filename = f"{version.role}_{version.company}.pdf".replace(" ", "_")[:120]
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
 
 
 @router.get("/resume-versions/{version_id}/download/docx")

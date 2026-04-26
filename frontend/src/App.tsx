@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
+  ArrowDownWideNarrow,
   Bot,
   Bug,
   CheckCircle2,
@@ -181,7 +182,7 @@ function AgentCockpit({ onNotice, onRefresh }: { onNotice: (message: string) => 
   const [busy, setBusy] = useState<string | null>(null);
   const [latestRun, setLatestRun] = useState<AgentRunResult | null>(null);
   const [debugRun, setDebugRun] = useState<AgentRunResult | null>(null);
-  const [previewMode, setPreviewMode] = useState<"diff" | "before" | "after">("diff");
+  const [previewMode, setPreviewMode] = useState<"pdf" | "diff" | "before" | "after">("pdf");
 
   const load = async () => {
     const [catalogData, pipelineData] = await Promise.all([api.agentCatalog(), api.agentPipelineStatus()]);
@@ -374,9 +375,9 @@ function AgentCockpit({ onNotice, onRefresh }: { onNotice: (message: string) => 
                   {builderComparison?.resume_changes && builderComparison.resume_changes.length > 0 && (
                     <div className="md:col-span-3">
                       <div className="font-semibold uppercase text-slate-500">Changes</div>
-                      <div className="mt-2 grid gap-1">
-                        {builderComparison.resume_changes.slice(0, 5).map((change) => (
-                          <div key={change} className="rounded bg-field px-2 py-1 text-slate-700">Changed: {change}</div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {compactResumeChanges(builderComparison.resume_changes).slice(0, 5).map((change) => (
+                          <span key={change} className="rounded bg-field px-2 py-1 text-slate-700">{change}</span>
                         ))}
                       </div>
                     </div>
@@ -423,24 +424,26 @@ function AgentCockpit({ onNotice, onRefresh }: { onNotice: (message: string) => 
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              {(["diff", "before", "after"] as const).map((mode) => (
+              {(["pdf", "diff", "before", "after"] as const).map((mode) => (
                 <button
                   key={mode}
                   onClick={() => setPreviewMode(mode)}
                   className={`rounded border px-3 py-1.5 text-xs font-semibold ${previewMode === mode ? "border-cobalt bg-cobalt text-white" : "border-line bg-white text-ink hover:bg-field"}`}
                 >
-                  {mode === "diff" ? "Diff" : mode === "before" ? "Before" : "After"}
+                  {mode === "pdf" ? "PDF" : mode === "diff" ? "Difference" : mode === "before" ? "Before Text" : "After Text"}
                 </button>
               ))}
             </div>
           </div>
-          <pre className="mt-4 max-h-[52vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
-            {previewMode === "diff"
-              ? (preview.diff.length ? preview.diff.join("\n") : "No textual difference was detected.")
-              : previewMode === "before"
-                ? preview.base_preview
-                : preview.tailored_preview}
-          </pre>
+          {previewMode === "pdf" ? (
+            <PdfPreviewGrid preview={preview} />
+          ) : previewMode === "diff" ? (
+            <ResumeDifferenceView preview={preview} />
+          ) : (
+            <pre className="mt-4 max-h-[52vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
+              {previewMode === "before" ? preview.base_preview : preview.tailored_preview}
+            </pre>
+          )}
         </Panel>
       )}
 
@@ -1332,15 +1335,184 @@ function DebugModal({ title, data, onClose }: { title: string; data: JobDebug | 
   );
 }
 
+function previewUrl(path: string | null | undefined) {
+  if (!path) return null;
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  return `${API_URL}${path}`;
+}
+
+function resumePdfStatusLabel(mode?: string | null) {
+  if (mode === "latex_compiler") return "Tailored PDF compiled from LaTeX";
+  if (mode === "base_pdf_fallback") return "Uploaded PDF kept for apply";
+  if (mode === "styled_pdf_fallback") return "Simple PDF generated";
+  return "PDF pending";
+}
+
+function resumePdfStatusNote(mode?: string | null, fallback?: string | null) {
+  if (mode === "latex_compiler") return "The visual PDF preview includes the latest tailored LaTeX edits.";
+  if (mode === "base_pdf_fallback") {
+    return "Your application PDF keeps the original Overleaf formatting. Open Difference to see the saved LaTeX edits; install a local LaTeX compiler to render those edits into the same PDF format.";
+  }
+  if (mode === "styled_pdf_fallback") return "SeekApply generated a simple preview PDF because no uploaded PDF or local LaTeX compiler was available.";
+  return fallback || "Run Resume Decision or Auto Refine to prepare a resume PDF.";
+}
+
+function resumePdfStatusClass(mode?: string | null) {
+  if (mode === "latex_compiler") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (mode === "base_pdf_fallback") return "border-amber-200 bg-amber-50 text-amber-800";
+  if (mode === "styled_pdf_fallback") return "border-sky-200 bg-sky-50 text-sky-800";
+  return "border-line bg-field text-slate-700";
+}
+
+function compactResumeChange(change: string) {
+  const clean = change.replace(/^Changed:\s*/i, "").replace(/\.$/, "").trim();
+  if (/Kept the uploaded LaTeX resume template/i.test(clean)) return "Kept your Overleaf layout";
+  if (/Updated the Profile\/Summary section/i.test(clean)) return "Retargeted Profile/Summary";
+  if (/Added a compact Targeted Focus line/i.test(clean)) return "Updated Targeted Focus skills";
+  if (/Generated a clean LaTeX resume/i.test(clean)) return "Generated a LaTeX resume template";
+  if (/Emphasized verified overlap:/i.test(clean)) return clean.replace("Emphasized verified overlap:", "Emphasized verified skills:");
+  if (/Kept verified skills visible:/i.test(clean)) return clean.replace("Kept verified skills visible:", "Kept verified skills:");
+  if (/Auto-refined from the job description using verified overlap:/i.test(clean)) {
+    return clean.replace("Auto-refined from the job description using verified overlap:", "Auto-refined from JD:");
+  }
+  if (/Auto-refined from the job description/i.test(clean)) return "Auto-refined from JD without unsupported skills";
+  if (/Applied your refinement comments/i.test(clean)) return clean.replace("Applied your refinement comments where they matched verified skills:", "Applied your notes:");
+  return clean;
+}
+
+function compactResumeChanges(changes?: string[] | null) {
+  const seen = new Set<string>();
+  return (changes || [])
+    .map(compactResumeChange)
+    .filter((change) => {
+      const key = change.toLowerCase();
+      if (!change || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function PdfPreviewGrid({ preview }: { preview: ResumePreview }) {
+  const baseUrl = previewUrl(preview.pdf_preview?.base_pdf_url);
+  const tailoredUrl = previewUrl(preview.pdf_preview?.tailored_pdf_url);
+  const mode = preview.pdf_preview?.pdf_generation ?? preview.version.pdf_generation;
+  const usesUploadedPdf = mode === "base_pdf_fallback";
+  return (
+    <div className="mt-4 grid gap-3">
+      <div className={`rounded border p-3 text-xs leading-5 ${resumePdfStatusClass(mode)}`}>
+        <div className="font-semibold">{resumePdfStatusLabel(mode)}</div>
+        <div className="mt-1">{resumePdfStatusNote(mode, preview.pdf_preview?.note)}</div>
+      </div>
+      <div className="grid gap-3 xl:grid-cols-2">
+        <div className="grid gap-2">
+          <div className="text-xs font-semibold uppercase text-slate-500">Original Uploaded PDF</div>
+          {baseUrl ? (
+            <iframe className="h-[62vh] w-full rounded border border-line bg-white" src={baseUrl} title="Uploaded resume PDF preview" />
+          ) : (
+            <div className="grid h-[62vh] place-items-center rounded border border-line bg-white p-6 text-center text-sm text-slate-500">
+              No uploaded base PDF is available. Upload the original Overleaf PDF along with the LaTeX source to compare visually.
+            </div>
+          )}
+        </div>
+        <div className="grid gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold uppercase text-slate-500">
+              {usesUploadedPdf ? "Application PDF" : "Tailored PDF"}
+            </div>
+            {usesUploadedPdf && <span className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">Same visual PDF</span>}
+          </div>
+          {tailoredUrl ? (
+            <iframe className="h-[62vh] w-full rounded border border-line bg-white" src={tailoredUrl} title="Tailored resume PDF preview" />
+          ) : (
+            <div className="grid h-[62vh] place-items-center rounded border border-line bg-white p-6 text-center text-sm text-slate-500">
+              Tailored PDF is not ready yet. Run Resume Decision or Auto Refine first.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function scoreValue(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function ResumeDifferenceView({ preview }: { preview: ResumePreview }) {
+  const report = preview.metadata.score_report || {};
+  const baseScore = scoreValue(preview.version.base_score) ?? scoreValue(report.base_score) ?? scoreValue(report.original_match_score);
+  const tailoredScore = scoreValue(preview.version.tailored_score) ?? scoreValue(report.tailored_score) ?? scoreValue(report.tailored_resume_score);
+  const delta = scoreValue(preview.version.score_delta) ?? scoreValue(report.score_delta);
+  const changes = compactResumeChanges(preview.metadata.resume_changes);
+  const mode = preview.pdf_preview?.pdf_generation ?? preview.version.pdf_generation;
+
+  const diffClass = (line: string) => {
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) return "bg-slate-100 text-slate-600";
+    if (line.startsWith("+")) return "bg-emerald-50 text-emerald-800";
+    if (line.startsWith("-")) return "bg-red-50 text-red-800";
+    return "bg-white text-slate-700";
+  };
+
+  return (
+    <div className="grid gap-3">
+      {mode === "base_pdf_fallback" && (
+        <div className="rounded border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+          The PDF panes look the same because no local LaTeX compiler is installed. These differences show the actual saved LaTeX edits that will render into a tailored PDF once LaTeX compilation is available.
+        </div>
+      )}
+      <div className="grid gap-2 md:grid-cols-3">
+        <div className="rounded border border-line bg-field p-3">
+          <div className="text-[11px] font-semibold uppercase text-slate-500">Uploaded Resume Score</div>
+          <div className="mt-1 text-lg font-semibold text-ink">{baseScore !== null ? `${baseScore}/100` : "Not scored"}</div>
+        </div>
+        <div className="rounded border border-line bg-field p-3">
+          <div className="text-[11px] font-semibold uppercase text-slate-500">Tailored Resume Score</div>
+          <div className="mt-1 text-lg font-semibold text-ink">{tailoredScore !== null ? `${tailoredScore}/100` : "Not scored"}</div>
+        </div>
+        <div className="rounded border border-line bg-field p-3">
+          <div className="text-[11px] font-semibold uppercase text-slate-500">Score Change</div>
+          <div className={`mt-1 text-lg font-semibold ${delta !== null && delta > 0 ? "text-emerald-700" : delta !== null && delta < 0 ? "text-red-700" : "text-ink"}`}>
+            {delta !== null ? `${delta >= 0 ? "+" : ""}${delta}` : "Pending"}
+          </div>
+        </div>
+      </div>
+      {changes.length > 0 && (
+        <div className="rounded border border-line bg-field p-3 text-xs text-slate-700">
+          <div className="mb-2 text-[11px] font-semibold uppercase text-slate-500">What changed</div>
+          <div className="flex flex-wrap gap-2">
+            {changes.map((change) => (
+              <span key={change} className="rounded border border-line bg-white px-2 py-1">{change}</span>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="overflow-hidden rounded border border-line bg-white">
+        <div className="border-b border-line bg-field px-3 py-2 text-xs font-semibold uppercase text-slate-500">Detailed LaTeX Difference</div>
+        {preview.diff.length ? (
+          <div className="max-h-[52vh] overflow-auto font-mono text-xs leading-5">
+            {preview.diff.map((line, index) => (
+              <div key={`${index}-${line}`} className={`px-3 ${diffClass(line)}`}>{line || " "}</div>
+            ))}
+          </div>
+        ) : (
+          <div className="p-4 text-sm text-slate-500">No textual difference was detected for this resume version.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => void; onRefresh: () => Promise<void> }) {
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [busy, setBusy] = useState<Record<number, boolean>>({});
+  const [scoreAllBusy, setScoreAllBusy] = useState(false);
+  const [sortMode, setSortMode] = useState<"recent" | "score_desc">("recent");
   const [results, setResults] = useState<Record<number, { lines: string[]; versionId?: number; aiGenerated?: boolean }>>({});
   const [labs, setLabs] = useState<Record<number, ResumeLab>>({});
   const [selectedVersions, setSelectedVersions] = useState<Record<number, number>>({});
   const [refineNotes, setRefineNotes] = useState<Record<number, string>>({});
   const [preview, setPreview] = useState<ResumePreview | null>(null);
-  const [previewMode, setPreviewMode] = useState<"diff" | "before" | "after">("diff");
+  const [previewMode, setPreviewMode] = useState<"pdf" | "diff" | "before" | "after">("pdf");
   const [debugData, setDebugData] = useState<JobDebug | null>(null);
   const [appStatus, setAppStatus] = useState<Record<number, string>>({});
 
@@ -1372,6 +1544,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     setBusyFor(job.id, true);
     try {
       const score = await api.scoreJob(job.id);
+      setJobs((prev) => prev.map((item) => item.id === job.id ? { ...item, match_score: score.match_score } : item));
       setResultFor(job.id, [
         `${score.match_score}/100 — ${score.recommendation}`,
         ...score.reason,
@@ -1385,6 +1558,34 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     }
   };
 
+  const handleScoreAll = async () => {
+    setScoreAllBusy(true);
+    let scored = 0;
+    try {
+      for (const job of jobs) {
+        setBusyFor(job.id, true);
+        try {
+          const score = await api.scoreJob(job.id);
+          scored += 1;
+          setJobs((prev) => prev.map((item) => item.id === job.id ? { ...item, match_score: score.match_score } : item));
+          setResultFor(job.id, [
+            `${score.match_score}/100 — ${score.recommendation}`,
+            ...score.reason.slice(0, 4),
+            ...score.concerns.slice(0, 3),
+          ]);
+        } finally {
+          setBusyFor(job.id, false);
+        }
+      }
+      setSortMode("score_desc");
+      await loadJobs();
+      await onRefresh();
+      onNotice(`Scored ${scored} job${scored !== 1 ? "s" : ""} and sorted highest first.`);
+    } finally {
+      setScoreAllBusy(false);
+    }
+  };
+
   const handleDecision = async (job: JobRow) => {
     setBusyFor(job.id, true);
     try {
@@ -1395,18 +1596,17 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         blocked: "Blocked by safety settings",
       };
       const lines = [
-        `Match score: ${decision.match_score}/100. Queue threshold: ${decision.threshold}.`,
+        `Match score: ${decision.match_score}/100. Queue threshold: ${decision.threshold}/100.`,
         `Resume decision: ${actionLabels[decision.action] ?? decision.action}`,
         decision.original_match_score !== undefined ? `Original resume score: ${decision.original_match_score}/100` : "",
         decision.tailored_resume_score !== undefined
           ? `Tailored resume score: ${decision.tailored_resume_score}/100 (${decision.score_delta && decision.score_delta > 0 ? "+" : ""}${decision.score_delta ?? 0})`
           : "",
-        decision.minimal_latex_edit ? "PDF is based on your uploaded LaTeX resume with minimal targeted edits." : "",
-        decision.pdf_generation ? `PDF generation: ${decision.pdf_generation}` : "",
+        decision.pdf_generation ? `PDF: ${resumePdfStatusLabel(decision.pdf_generation)}` : "",
         decision.message,
         decision.resume_path ? `Base resume: ${decision.resume_path}` : "",
         decision.ai_generated ? "AI-generated tailored resume" : "",
-        ...(decision.resume_changes ?? []).map((change) => `Changed: ${change}`),
+        ...compactResumeChanges(decision.resume_changes).map((change) => `Changed: ${change}`),
         ...(decision.reasons ?? []),
         ...(decision.concerns ?? []),
       ].filter(Boolean);
@@ -1467,20 +1667,18 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
 
   const handleRefine = async (job: JobRow) => {
     const instructions = (refineNotes[job.id] || "").trim();
-    if (!instructions) {
-      onNotice("Add a short comment about what to improve, for example: emphasize GCP, Vertex AI, MLOps if already true.");
-      return;
-    }
     setBusyFor(job.id, true);
     try {
-      const result = await api.refineResume(job.id, { instructions, force_new_version: true });
+      const result = await api.refineResume(job.id, { instructions: instructions || null, force_new_version: true });
       setLabs((prev) => ({ ...prev, [job.id]: result.lab }));
       setSelectedVersions((prev) => ({ ...prev, [job.id]: result.resume_version_id }));
       setResultFor(job.id, [
         result.message,
+        result.auto_refined ? "Refinement source: job description and verified resume evidence." : "Refinement source: your notes and verified resume evidence.",
         `Original resume score: ${result.comparison.original_match_score}/100`,
         `Refined resume score: ${result.comparison.tailored_resume_score}/100 (${result.comparison.score_delta > 0 ? "+" : ""}${result.comparison.score_delta})`,
-        ...(result.comparison.resume_changes ?? []).map((change) => `Changed: ${change}`),
+        result.comparison.pdf_generation ? `PDF: ${resumePdfStatusLabel(result.comparison.pdf_generation)}` : "",
+        ...compactResumeChanges(result.comparison.resume_changes).map((change) => `Changed: ${change}`),
       ], result.resume_version_id);
       setRefineNotes((prev) => ({ ...prev, [job.id]: "" }));
       await loadJobs();
@@ -1493,7 +1691,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
   const handlePreview = async (versionId: number) => {
     const data = await api.resumePreview(versionId);
     setPreview(data);
-    setPreviewMode("diff");
+    setPreviewMode("pdf");
   };
 
   const handleDebug = async (jobId: number) => {
@@ -1517,7 +1715,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         task?.message || "",
         result.skipped.length ? `Skipped: ${JSON.stringify(result.skipped)}` : "",
         task?.resume?.id ? `Queued resume version: ${task.resume.id}` : "",
-        task?.resume?.pdf_generation ? `PDF generation: ${task.resume.pdf_generation}` : "",
+        task?.resume?.pdf_generation ? `PDF: ${resumePdfStatusLabel(task.resume.pdf_generation)}` : "",
       ].filter(Boolean));
       onNotice(task ? `Queued ${job.title} for supervised apply.` : "Job was not queued. Check source details.");
       await loadJobs();
@@ -1541,6 +1739,25 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     return "text-slate-500";
   };
 
+  const effectiveScore = (job: JobRow) => {
+    const lab = labs[job.id];
+    const selectedVersionId = selectedVersions[job.id] ?? lab?.selected_resume_version_id ?? results[job.id]?.versionId ?? job.resume_version_id ?? null;
+    const selectedVersion = lab?.versions.find((version) => version.id === selectedVersionId) ?? lab?.versions[0];
+    return selectedVersion?.tailored_score ?? job.match_score ?? -1;
+  };
+
+  const sortedJobs = useMemo(() => {
+    const list = [...jobs];
+    if (sortMode === "score_desc") {
+      list.sort((a, b) => {
+        const scoreDiff = effectiveScore(b) - effectiveScore(a);
+        if (scoreDiff !== 0) return scoreDiff;
+        return a.title.localeCompare(b.title);
+      });
+    }
+    return list;
+  }, [jobs, labs, selectedVersions, results, sortMode]);
+
   if (jobs.length === 0) {
     return (
       <Panel className="p-8 text-center text-slate-500 text-sm">
@@ -1558,6 +1775,19 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         </h2>
         <div className="flex items-center gap-3">
           <button
+            disabled={scoreAllBusy}
+            onClick={() => handleScoreAll().catch((err) => onNotice(err.message))}
+            className="flex items-center gap-1 rounded border border-line bg-white px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-field disabled:opacity-50"
+          >
+            <Gauge size={14} /> {scoreAllBusy ? "Scoring..." : "Score All"}
+          </button>
+          <button
+            onClick={() => setSortMode((current) => current === "score_desc" ? "recent" : "score_desc")}
+            className={`flex items-center gap-1 rounded border px-3 py-1.5 text-sm font-medium ${sortMode === "score_desc" ? "border-cobalt bg-cobalt text-white" : "border-line bg-white text-slate-600 hover:bg-field"}`}
+          >
+            <ArrowDownWideNarrow size={14} /> {sortMode === "score_desc" ? "Highest First" : "Sort by Score"}
+          </button>
+          <button
             onClick={() => loadJobs().catch((err) => onNotice(err.message))}
             className="flex items-center gap-1 text-sm text-slate-500 hover:text-cobalt"
           >
@@ -1566,7 +1796,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         </div>
       </div>
 
-      {jobs.map((job) => {
+      {sortedJobs.map((job) => {
         const res = results[job.id];
         const isBusy = busy[job.id] ?? false;
         const lab = labs[job.id];
@@ -1646,6 +1876,14 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
               >
                 <History size={13} /> Compare
+              </button>
+              <button
+                disabled={isBusy}
+                onClick={() => handleRefine(job).catch((e) => onNotice(e.message))}
+                className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
+                title="Automatically refine from this job description using only verified resume evidence."
+              >
+                <Sparkles size={13} /> Auto Refine
               </button>
               <button
                 disabled={isBusy}
@@ -1736,7 +1974,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                   onClick={() => handlePreview(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
                   className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field"
                 >
-                  <FileText size={12} /> Preview Diff
+                  <FileText size={12} /> Preview PDF
                 </button>
               </div>
             )}
@@ -1769,17 +2007,20 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                   <div className="rounded border border-line bg-[#fffdf7] p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
-                        <div className="text-xs font-semibold uppercase text-slate-500">Selected Resume Version</div>
+                        <div className="text-xs font-semibold uppercase text-slate-500">Resume Ready For This Job</div>
                         <div className="mt-1 text-sm font-semibold text-ink">#{selectedVersion.id} · {selectedVersion.role}</div>
                       </div>
-                      <span className="rounded bg-field px-2 py-1 text-xs text-slate-600">
-                        {selectedVersion.pdf_generation || "pdf pending"}
+                      <span className={`rounded border px-2 py-1 text-xs font-semibold ${resumePdfStatusClass(selectedVersion.pdf_generation)}`}>
+                        {resumePdfStatusLabel(selectedVersion.pdf_generation)}
                       </span>
                     </div>
-                    <div className="mt-2 text-xs text-slate-600">{selectedVersion.pdf_note}</div>
+                    <div className="mt-2 text-xs leading-5 text-slate-600">
+                      {resumePdfStatusNote(selectedVersion.pdf_generation, selectedVersion.pdf_note)}
+                    </div>
                     {selectedVersion.resume_changes && selectedVersion.resume_changes.length > 0 && (
                       <div className="mt-2 grid gap-1">
-                        {selectedVersion.resume_changes.slice(0, 5).map((change) => (
+                        <div className="text-[11px] font-semibold uppercase text-slate-500">What changed</div>
+                        {compactResumeChanges(selectedVersion.resume_changes).slice(0, 5).map((change) => (
                           <div key={change} className="text-xs text-slate-700">Changed: {change}</div>
                         ))}
                       </div>
@@ -1824,17 +2065,17 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 )}
 
                 <div className="grid gap-2">
-                  <Field label="Refine this resume with comments">
+                  <Field label="Manual tweak request (optional)">
                     <textarea
                       className={textareaClass}
-                      placeholder="Example: emphasize Vertex AI, MLOps, TensorFlow, PyTorch, and production GenAI if already present in my resume."
+                      placeholder="Leave blank for automatic JD-based refinement. Add notes only when you want a specific truthful emphasis."
                       value={refineNotes[job.id] || ""}
                       onChange={(event) => setRefineNotes((prev) => ({ ...prev, [job.id]: event.target.value }))}
                     />
                   </Field>
                   <div className="flex flex-wrap gap-2">
                     <Button disabled={isBusy} onClick={() => handleRefine(job).catch((e) => onNotice(e.message))}>
-                      <Sparkles size={15} /> Refine &amp; Rescore
+                      <Sparkles size={15} /> Auto Refine &amp; Rescore
                     </Button>
                     <Button variant="secondary" disabled={isBusy} onClick={() => handleQueue(job).catch((e) => onNotice(e.message))}>
                       <Send size={15} /> Queue Selected Resume
@@ -1859,42 +2100,58 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
       })}
       {preview && (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
-          <div className="flex max-h-[88vh] w-full max-w-5xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
+          <div className="flex max-h-[92vh] w-full max-w-7xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <h3 className="text-base font-semibold">Resume Preview</h3>
-                <div className="mt-1 text-sm text-slate-500">
-                  Version #{preview.version.id} · {preview.version.role} · {preview.version.tailored_score ?? "?"}/100
+                <h3 className="flex items-center gap-2 text-base font-semibold">
+                  <Eye size={17} className="text-cobalt" /> Resume PDF Preview
+                </h3>
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500">
+                  <span>Version #{preview.version.id}</span>
+                  <span>·</span>
+                  <span>{preview.version.role}</span>
+                  <span>·</span>
+                  <span>{preview.version.tailored_score ?? "?"}/100</span>
+                  {preview.version.score_delta !== null && preview.version.score_delta !== undefined && (
+                    <span className={preview.version.score_delta >= 0 ? "text-emerald-700" : "text-red-700"}>
+                      ({preview.version.score_delta >= 0 ? "+" : ""}{preview.version.score_delta})
+                    </span>
+                  )}
                 </div>
               </div>
               <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setPreview(null)}>Close</button>
             </div>
             <div className="mt-4 flex flex-wrap gap-2">
-              {(["diff", "before", "after"] as const).map((mode) => (
+              {(["pdf", "diff", "before", "after"] as const).map((mode) => (
                 <button
                   key={mode}
                   onClick={() => setPreviewMode(mode)}
                   className={`rounded border px-3 py-1.5 text-xs font-semibold ${previewMode === mode ? "border-cobalt bg-cobalt text-white" : "border-line bg-white text-ink hover:bg-field"}`}
                 >
-                  {mode === "diff" ? "Diff" : mode === "before" ? "Before" : "After"}
+                  {mode === "pdf" ? "PDF" : mode === "diff" ? "Difference" : mode === "before" ? "Before Text" : "After Text"}
                 </button>
               ))}
             </div>
             <div className="mt-4 grid gap-2 overflow-auto">
-              {preview.metadata.resume_changes.length > 0 && (
+              {compactResumeChanges(preview.metadata.resume_changes).length > 0 && (
                 <div className="rounded border border-line bg-field p-3 text-xs text-slate-700">
-                  {preview.metadata.resume_changes.map((change) => (
-                    <div key={change}>Changed: {change}</div>
-                  ))}
+                  <div className="mb-2 text-[11px] font-semibold uppercase text-slate-500">What changed</div>
+                  <div className="flex flex-wrap gap-2">
+                    {compactResumeChanges(preview.metadata.resume_changes).map((change) => (
+                      <span key={change} className="rounded border border-line bg-white px-2 py-1">{change}</span>
+                    ))}
+                  </div>
                 </div>
               )}
-              <pre className="max-h-[56vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
-                {previewMode === "diff"
-                  ? (preview.diff.length ? preview.diff.join("\n") : "No textual difference was detected.")
-                  : previewMode === "before"
-                    ? preview.base_preview
-                    : preview.tailored_preview}
-              </pre>
+              {previewMode === "pdf" ? (
+                <PdfPreviewGrid preview={preview} />
+              ) : previewMode === "diff" ? (
+                <ResumeDifferenceView preview={preview} />
+              ) : (
+                <pre className="max-h-[56vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
+                  {previewMode === "before" ? preview.base_preview : preview.tailored_preview}
+                </pre>
+              )}
               {preview.diff_truncated && <div className="text-xs text-slate-500">Diff preview truncated. Download LaTeX for the full file.</div>}
             </div>
           </div>
@@ -2033,7 +2290,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                         <span className="text-slate-500">
                           Resume #{task.resume.id}
                           {task.resume.tailored_score !== null && task.resume.tailored_score !== undefined ? ` · ${task.resume.tailored_score}/100` : ""}
-                          {task.resume.pdf_generation ? ` · ${task.resume.pdf_generation}` : ""}
+                          {task.resume.pdf_generation ? ` · ${resumePdfStatusLabel(task.resume.pdf_generation)}` : ""}
                         </span>
                       )}
                       <a href={task.job.job_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-cobalt hover:underline">

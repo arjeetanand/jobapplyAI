@@ -143,7 +143,7 @@ class ResumeProfileUpdateIn(BaseModel):
 
 class ResumeRefineIn(BaseModel):
     user_id: int | None = None
-    instructions: str = Field(min_length=1, max_length=2000)
+    instructions: str | None = Field(default=None, max_length=2000)
     force_new_version: bool = True
 
 

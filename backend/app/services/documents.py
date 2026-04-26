@@ -397,16 +397,21 @@ def _replace_section_preserving_wrappers(tex: str, section_name: str, new_conten
 
     block = match.group(2)
 
-    small_pattern = r"(\\small\s*\{)(.*?)(\}\s*(?:\\vspace\{[^}]+\}\s*)?)$"
-    small_match = re.search(small_pattern, block, re.DOTALL)
+    small_match = re.search(r"\\small\s*\{", block)
     if small_match:
+        open_brace = block.find("{", small_match.start())
+        close_brace = _find_latex_group_end(block, open_brace)
+    else:
+        open_brace = -1
+        close_brace = -1
+
+    if small_match and open_brace >= 0 and close_brace >= 0:
         replacement_block = (
-            block[: small_match.start()]
-            + small_match.group(1)
+            block[: open_brace + 1]
             + "\n"
             + new_content
             + "\n"
-            + small_match.group(3)
+            + block[close_brace:]
         )
     else:
         leading_match = re.match(r"(\s*(?:\\vspace\{[^}]+\}\s*)*)", block)
@@ -417,6 +422,28 @@ def _replace_section_preserving_wrappers(tex: str, section_name: str, new_conten
 
     replacement = match.group(1) + replacement_block
     return tex[: match.start()] + replacement + tex[match.end():]
+
+
+def _find_latex_group_end(text: str, open_brace_index: int) -> int:
+    """Return the matching closing brace for a LaTeX group."""
+    if open_brace_index < 0 or open_brace_index >= len(text) or text[open_brace_index] != "{":
+        return -1
+
+    depth = 0
+    index = open_brace_index
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
 
 
 def _tune_user_template_skills(tex: str, skills: list[str]) -> str:

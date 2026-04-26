@@ -174,6 +174,7 @@ class ResumeTailoringAgent:
         *,
         manual_instructions: str | None = None,
         resume_id_suffix: str | None = None,
+        auto_refined: bool = False,
     ) -> TailoredResume:
         latex_template_source = self._latex_template_source(user)
         verified_skills = self._verified_resume_skills(user)
@@ -260,11 +261,13 @@ class ResumeTailoringAgent:
                 ordered_skills,
                 requested_focus,
                 bool(manual_instructions and manual_instructions.strip()),
+                auto_refined,
             ),
             "ordered_verified_skills": ordered_skills,
             "verified_skills_source": "uploaded_resume_and_profile",
             "recommended_projects_to_build": recommended_projects,
             "manual_refinement_notes": manual_instructions.strip() if manual_instructions else None,
+            "auto_refined_from_job_description": auto_refined,
             "requested_focus_skills": requested_focus,
         }
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,14 +433,23 @@ class ResumeTailoringAgent:
                 return text
         return None
 
-    @staticmethod
-    def _base_pdf_path(user: User) -> Path | None:
+    def base_pdf_path(self, user: User) -> Path | None:
+        return self._base_pdf_path(user)
+
+    def _base_pdf_path(self, user: User) -> Path | None:
         base_path_value = getattr(user, "base_resume_path", None)
         if not base_path_value:
-            return None
-        base_path = Path(base_path_value).expanduser()
-        if base_path.exists() and base_path.suffix.lower() == ".pdf":
+            base_path = None
+        else:
+            base_path = Path(base_path_value).expanduser()
+        if base_path and base_path.exists() and base_path.suffix.lower() == ".pdf":
             return base_path
+
+        base_resume_dir = self.storage_root / "base_resumes"
+        if base_resume_dir.exists():
+            pdfs = sorted(base_resume_dir.glob("*.pdf"), key=lambda path: path.stat().st_mtime, reverse=True)
+            if pdfs:
+                return pdfs[0]
         return None
 
     @staticmethod
@@ -552,6 +564,7 @@ class ResumeTailoringAgent:
         ordered_skills: list[str],
         requested_focus: list[str] | None = None,
         manual_refinement: bool = False,
+        auto_refinement: bool = False,
     ) -> list[str]:
         changes = []
         if has_latex_template:
@@ -564,12 +577,39 @@ class ResumeTailoringAgent:
             changes.append(f"Emphasized verified overlap: {', '.join(emphasized[:8])}.")
         elif ordered_skills:
             changes.append(f"Kept verified skills visible: {', '.join(ordered_skills[:8])}.")
-        if manual_refinement:
+        if auto_refinement:
+            if requested_focus:
+                changes.append(f"Auto-refined from the job description using verified overlap: {', '.join(requested_focus[:8])}.")
+            else:
+                changes.append("Auto-refined from the job description without adding unsupported skills.")
+        elif manual_refinement:
             if requested_focus:
                 changes.append(f"Applied your refinement comments where they matched verified skills: {', '.join(requested_focus[:8])}.")
             else:
                 changes.append("Saved your refinement comments for review; no unsupported new skills were added.")
         return changes
+
+    def auto_refinement_instructions(self, user: User, job: Job) -> str:
+        verified_skills = self._verified_resume_skills(user)
+        overlap = self._emphasized_verified_skills(verified_skills, job)
+        job_keywords = self._job_keywords(job)
+        focus = overlap[:10] or [skill for skill in verified_skills[:10] if normalize(str(skill)) in normalize(job.description or "")]
+        weak = [
+            skill
+            for skill in job_keywords[:12]
+            if normalize(str(skill)) not in {normalize(str(item)) for item in verified_skills}
+        ]
+        parts = [
+            "AUTO_FROM_JD: Use the target job description to truthfully improve ATS alignment.",
+            "Preserve the uploaded LaTeX format and make minimal targeted edits only.",
+            "Rewrite the summary/profile and targeted skills focus for this exact role.",
+        ]
+        if focus:
+            parts.append("Emphasize verified overlap already present in the resume: " + ", ".join(focus) + ".")
+        if weak:
+            parts.append("Do not claim missing skills; keep these only as gaps or recommended learning if needed: " + ", ".join(weak[:8]) + ".")
+        parts.append("Do not invent companies, metrics, titles, projects, or tools.")
+        return " ".join(parts)
 
     def find_reusable(self, existing: list[ResumeVersion], job: Job) -> ResumeVersion | None:
         best: tuple[float, ResumeVersion] | None = None
