@@ -210,6 +210,34 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload)
     }),
+  currentResume: () =>
+    request<{
+      user_id: number | null;
+      base_resume: any;
+      profile: any;
+      preferences: any;
+      missing_questions: string[];
+      answers: any[];
+    }>("/resumes/current"),
+  bulkAnswers: (payload: { user_id?: number, answers: any[] }) =>
+    request<{ user_id: number; saved_count: number; message: string; missing_questions: string[] }>("/answers/bulk", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  downloadBaseResume: async (): Promise<void> => {
+    const response = await fetch(`${API_URL}/resumes/base/download`);
+    if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
+    const blob = await response.blob();
+    const cd = response.headers.get("content-disposition") ?? "";
+    const match = cd.match(/filename="?([^"]+)"?/);
+    const filename = match?.[1] ?? `base_resume.pdf`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
   importJob: (payload: unknown) =>
     request<{ job_id: number; message: string }>("/jobs/import-url", {
       method: "POST",

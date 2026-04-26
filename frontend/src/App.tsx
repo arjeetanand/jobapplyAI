@@ -354,13 +354,30 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
             <Upload size={18} className="text-cobalt" />
             <h2 className="text-base font-semibold">Upload Resume</h2>
           </div>
-          <input
-            className={inputClass}
-            type="file"
-            accept=".pdf,.docx,.txt,.md"
-            disabled={busy}
-            onChange={(event) => upload(event.target.files?.[0]).catch((error) => onNotice(error.message))}
-          />
+          <div className="relative mt-2">
+            <input
+              id="resume-upload"
+              type="file"
+              accept=".pdf,.docx,.txt,.md"
+              disabled={busy}
+              className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
+              onChange={(event) => upload(event.target.files?.[0]).catch((error) => onNotice(error.message))}
+            />
+            <label
+              htmlFor="resume-upload"
+              className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed ${busy ? 'border-slate-300 bg-slate-50' : 'border-[#c6d79e] bg-[#f8fcf0] hover:bg-[#effbcf]'} px-6 py-10 transition-colors`}
+            >
+              <div className={`rounded-full p-3 ${busy ? 'bg-slate-200 text-slate-500' : 'bg-[#d6eba0] text-[#3f5a0a]'}`}>
+                {busy ? <RefreshCcw size={24} className="animate-spin" /> : <Upload size={24} />}
+              </div>
+              <div className={`mt-4 font-semibold ${busy ? 'text-slate-600' : 'text-[#2f3f13]'}`}>
+                {busy ? "Extracting profile and questions..." : "Click or drag to upload base resume"}
+              </div>
+              <div className="mt-1 text-sm text-[#5f574b]">
+                PDF, DOCX, TXT, or Markdown
+              </div>
+            </label>
+          </div>
           {baseResume ? (
             <div className="mt-4 grid gap-3 border-t border-line pt-4 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -383,11 +400,7 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
                 </Button>
               )}
             </div>
-          ) : (
-            <div className="mt-4 rounded border border-line bg-field p-3 text-sm text-slate-500">
-              Upload a resume to create the verified base profile.
-            </div>
-          )}
+          ) : null}
         </Panel>
         <Panel className="p-5">
           <h2 className="mb-4 text-base font-semibold">Extracted Profile And Preferences</h2>
