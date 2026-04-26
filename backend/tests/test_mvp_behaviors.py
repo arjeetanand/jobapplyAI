@@ -1,5 +1,13 @@
 from types import SimpleNamespace
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from app.api.routes import router
+from app.db.session import Base, get_db
+from app.models.entities import ApplicationAnswer
 from app.services.email_outreach import EmailOutreachAgent
 from app.services.application_packet import ApplicationPacketAgent
 from app.services.linkedin_assist import LinkedInAssistAgent
@@ -12,6 +20,25 @@ from app.services.safety import SafetyComplianceAgent
 
 def obj(**kwargs):
     return SimpleNamespace(**kwargs)
+
+
+def make_test_client(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'seekapply_test.db'}", connect_args={"check_same_thread": False})
+    testing_session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    def override_db():
+        db = testing_session()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_db] = override_db
+    monkeypatch.setattr("app.api.routes.get_settings", lambda: obj(resolved_storage_root=tmp_path))
+    return TestClient(app), testing_session
 
 
 def sample_user():
@@ -211,3 +238,98 @@ def test_profile_corrections_payload_shape():
     )
     assert payload.skills == ["Python", "FastAPI"]
     assert payload.excluded_companies == ["BadCo"]
+
+
+def test_current_resume_empty_without_profile(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+    response = client.get("/resumes/current")
+    assert response.status_code == 200
+    assert response.json() == {
+        "user_id": None,
+        "base_resume": None,
+        "profile": None,
+        "preferences": None,
+        "missing_questions": [],
+        "answers": [],
+    }
+
+
+def test_upload_resume_current_state_and_download(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+    content = b"Arjeet Anand\narjeet@example.com\nhttps://linkedin.com/in/arjeet\nPython FastAPI RAG LLMs"
+
+    uploaded = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", content, "text/plain")},
+    )
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["user_id"]
+    assert "What phone number" in " ".join(body["missing_questions"])
+
+    current = client.get("/resumes/current")
+    assert current.status_code == 200
+    current_body = current.json()
+    assert current_body["base_resume"]["filename"] == "resume.txt"
+    assert "Python FastAPI" in current_body["base_resume"]["text_preview"]
+    assert current_body["profile"]["email"] == "arjeet@example.com"
+    assert current_body["profile"]["linkedin_url"] == "https://linkedin.com/in/arjeet"
+
+    downloaded = client.get("/resumes/base/download")
+    assert downloaded.status_code == 200
+    assert downloaded.content == content
+
+
+def test_bulk_answers_upsert_and_sync_profile_preferences(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", b"Arjeet Anand\narjeet@example.com\nPython FastAPI", "text/plain")},
+    )
+    user_id = upload.json()["user_id"]
+
+    first = client.post(
+        "/answers/bulk",
+        json={
+            "user_id": user_id,
+            "answers": [
+                {
+                    "question_text": "What phone number should be used for job applications?",
+                    "answer_text": "7004253767",
+                },
+                {"question_text": "What is your notice period?", "answer_text": "Immediate"},
+                {"question_text": "What is your expected compensation?", "answer_text": "18-28 LPA"},
+                {"question_text": "What locations or remote preferences should be used?", "answer_text": "India, Remote"},
+            ],
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["saved_count"] == 4
+
+    current = client.get("/resumes/current").json()
+    assert current["profile"]["phone"] == "7004253767"
+    assert current["profile"]["notice_period"] == "Immediate"
+    assert current["preferences"]["preferred_salary"] == "18-28 LPA"
+    assert current["preferences"]["preferred_locations"] == ["India", "Remote"]
+    assert "What phone number should be used for job applications?" not in current["missing_questions"]
+    assert "What is your notice period?" not in current["missing_questions"]
+
+    second = client.post(
+        "/answers/bulk",
+        json={
+            "user_id": user_id,
+            "answers": [
+                {
+                    "question_key": "phone",
+                    "question_text": "What phone number should be used for job applications?",
+                    "answer_text": "9999999999",
+                }
+            ],
+        },
+    )
+    assert second.status_code == 200
+
+    with session_factory() as db:
+        phone_answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.question_key == "phone")).all()
+        assert len(phone_answers) == 1
+        assert phone_answers[0].answer_text == "9999999999"

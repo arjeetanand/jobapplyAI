@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
+export const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
 export type Analytics = {
   total_jobs: number;
@@ -44,6 +44,16 @@ export type LinkedInPlan = {
   safety_notes: string[];
 };
 
+export type DiscoveryPreferences = {
+  user_id: number | null;
+  keywords: string[];
+  location: string | null;
+  date_since_posted: string;
+  work_mode: string;
+  easy_apply: string;
+  limit: number;
+};
+
 export type Answer = {
   id: number;
   question_key: string;
@@ -52,6 +62,41 @@ export type Answer = {
   source: string;
   sensitive: boolean;
   approved: boolean;
+};
+
+export type CurrentResume = {
+  user_id: number | null;
+  base_resume: {
+    filename: string;
+    path: string;
+    exists: boolean;
+    size_bytes: number | null;
+    download_url: string | null;
+    text_preview: string;
+    uploaded_at: string;
+  } | null;
+  profile: {
+    name: string;
+    email: string;
+    phone: string | null;
+    location: string | null;
+    linkedin_url: string | null;
+    github_url: string | null;
+    work_authorization: string | null;
+    skills: string[];
+    notice_period: string | null;
+  } | null;
+  preferences: {
+    preferred_salary: string | null;
+    preferred_locations: string[];
+    remote_preference: string;
+    excluded_companies: string[];
+    match_threshold: number;
+    auto_apply_enabled: boolean;
+    auto_email_enabled: boolean;
+  } | null;
+  missing_questions: string[];
+  answers: Answer[];
 };
 
 export type Claim = {
@@ -127,6 +172,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
+  currentResume: () => request<CurrentResume>("/resumes/current"),
   uploadBaseResume: async (file: File) => {
     const data = new FormData();
     data.append("file", file);
@@ -140,9 +186,24 @@ export const api = {
     return response.json() as Promise<{
       user_id: number;
       base_resume_path: string;
+      base_resume: CurrentResume["base_resume"];
       extracted: { name: string; email: string; phone: string | null; linkedin_url: string | null; github_url: string | null; skills: string[] };
       missing_questions: string[];
     }>;
+  },
+  downloadBaseResume: async (): Promise<void> => {
+    const response = await fetch(`${API_URL}/resumes/base/download`);
+    if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
+    const blob = await response.blob();
+    const cd = response.headers.get("content-disposition") ?? "";
+    const match = cd.match(/filename="?([^"]+)"?/);
+    const filename = match?.[1] ?? "base_resume";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
   },
   updateResumeProfile: (payload: unknown) =>
     request<{ user_id: number; message: string; profile: Record<string, unknown> }>("/resumes/profile", {
@@ -155,8 +216,14 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   linkedinAssist: (payload: unknown) =>
-    request<{ mode: string; plans: LinkedInPlan[]; checklist: string[] }>("/linkedin/assist/search", {
+    request<{ mode: string; preferences: DiscoveryPreferences; plans: LinkedInPlan[]; checklist: string[] }>("/linkedin/assist/search", {
       method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  linkedinPreferences: () => request<DiscoveryPreferences>("/linkedin/assist/preferences"),
+  saveLinkedinPreferences: (payload: unknown) =>
+    request<{ message: string; preferences: DiscoveryPreferences }>("/linkedin/assist/preferences", {
+      method: "PATCH",
       body: JSON.stringify(payload)
     }),
   linkedinImportVisible: (payload: unknown) =>
@@ -181,6 +248,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
+  bulkAnswers: (payload: unknown) =>
+    request<{ user_id: number; saved_count: number; answers: Answer[]; missing_questions: string[]; message: string }>(
+      "/answers/bulk",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
   answers: () => request<{ answers: Answer[] }>("/answers"),
   approveAnswer: (answerId: number) =>
     request<{ answer_id: number; approved: boolean }>(`/answers/${answerId}/approve`, { method: "POST" }),

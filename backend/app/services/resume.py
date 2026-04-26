@@ -204,11 +204,12 @@ class ResumeTailoringAgent:
 
         # Generate LaTeX version if template is available
         tex_path: Path | None = None
-        if user.latex_template_source:
+        latex_template_source = getattr(user, "latex_template_source", None)
+        if latex_template_source:
             tex_path = version_dir / f"{resume_id}.tex"
             write_latex(
                 path=tex_path,
-                template_source=user.latex_template_source,
+                template_source=latex_template_source,
                 user_name=user.name or "Candidate",
                 skills=emphasized or user.skills[:15],
                 experience=user.experience or [],

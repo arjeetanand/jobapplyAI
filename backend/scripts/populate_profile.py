@@ -281,7 +281,7 @@ def populate():
                 "Bengaluru",
                 "Bangalore",
                 "India",
-                "Remote",
+                "hybrid",
             ]
             prefs.remote_preference = "hybrid"
             print(f"Target roles: {prefs.target_roles}")

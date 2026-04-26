@@ -21,7 +21,7 @@ import {
   Zap
 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, Analytics, Answer, Claim, JobRow, LinkedInPlan, ResumeVersion, TrackerRow } from "./lib/api";
+import { api, API_URL, Analytics, Answer, Claim, CurrentResume, DiscoveryPreferences, JobRow, LinkedInPlan, ResumeVersion, TrackerRow } from "./lib/api";
 import { Button, Field, inputClass, Panel, textareaClass } from "./components/ui";
 import { SectionId, Sidebar } from "./components/Sidebar";
 import { StatCard } from "./components/StatCard";
@@ -170,127 +170,317 @@ export default function App() {
 
 function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
   const [userId, setUserId] = useState<number | null>(null);
+  const [baseResume, setBaseResume] = useState<CurrentResume["base_resume"]>(null);
   const [extracted, setExtracted] = useState<{
     name: string;
     email: string;
     phone: string | null;
+    location: string | null;
     linkedin_url: string | null;
     github_url: string | null;
+    work_authorization: string | null;
     skills: string[];
   } | null>(null);
   const [skillsText, setSkillsText] = useState("");
   const [noticePeriod, setNoticePeriod] = useState("");
+  const [workAuthorization, setWorkAuthorization] = useState("");
   const [preferredSalary, setPreferredSalary] = useState("");
   const [preferredLocations, setPreferredLocations] = useState("");
   const [remotePreference, setRemotePreference] = useState("remote");
   const [excludedCompanies, setExcludedCompanies] = useState("");
   const [missing, setMissing] = useState<string[]>([]);
+  const [missingAnswers, setMissingAnswers] = useState<Record<string, string>>({});
+  const [missingModalOpen, setMissingModalOpen] = useState(false);
+  const [answers, setAnswers] = useState<Answer[]>([]);
   const [busy, setBusy] = useState(false);
   const [saveStatus, setSaveStatus] = useState<string>("");
+
+  const applyCurrentResume = (data: CurrentResume) => {
+    setUserId(data.user_id);
+    setBaseResume(data.base_resume);
+    setMissing(data.missing_questions);
+    setAnswers(data.answers);
+    if (data.profile) {
+      setExtracted({
+        name: data.profile.name || "",
+        email: data.profile.email || "",
+        phone: data.profile.phone,
+        location: data.profile.location,
+        linkedin_url: data.profile.linkedin_url,
+        github_url: data.profile.github_url,
+        work_authorization: data.profile.work_authorization,
+        skills: data.profile.skills || []
+      });
+      setSkillsText((data.profile.skills || []).join(", "));
+      setNoticePeriod(data.profile.notice_period || "");
+      setWorkAuthorization(data.profile.work_authorization || "");
+    }
+    if (data.preferences) {
+      setPreferredSalary(data.preferences.preferred_salary || "");
+      setPreferredLocations((data.preferences.preferred_locations || []).join(", "));
+      setRemotePreference(data.preferences.remote_preference || "remote");
+      setExcludedCompanies((data.preferences.excluded_companies || []).join(", "));
+    }
+  };
+
+  const loadCurrent = async () => {
+    const data = await api.currentResume();
+    applyCurrentResume(data);
+  };
+
+  useEffect(() => {
+    loadCurrent().catch((error) => onNotice(error.message));
+  }, []);
+
+  const openMissingModal = (questions: string[]) => {
+    const nextAnswers: Record<string, string> = {};
+    for (const question of questions) {
+      const saved = answers.find((answer) => answer.question_text === question);
+      nextAnswers[question] = saved?.answer_text === "[NEEDS HUMAN REVIEW]" ? "" : saved?.answer_text ?? "";
+    }
+    setMissingAnswers(nextAnswers);
+    setMissingModalOpen(questions.length > 0);
+  };
 
   const upload = async (file: File | undefined) => {
     if (!file) return;
     setBusy(true);
     try {
       const result = await api.uploadBaseResume(file);
-      setUserId(result.user_id);
-      setExtracted(result.extracted);
-      setSkillsText(result.extracted.skills.join(", "));
-      setMissing(result.missing_questions);
+      const current = await api.currentResume();
+      applyCurrentResume(current);
+      openMissingModal(current.missing_questions.length ? current.missing_questions : result.missing_questions);
       onNotice(`Resume extracted and saved for user ${result.user_id}.`);
     } finally {
       setBusy(false);
     }
   };
 
+  const profileAnswerItems = () => {
+    if (!extracted) return [];
+    const items: Array<{ question_key: string; question_text: string; answer_text: string; approved: boolean; sensitive: boolean; source: string }> = [];
+    const add = (question_key: string, question_text: string, answer_text: string | null | undefined, sensitive = true) => {
+      const clean = (answer_text || "").trim();
+      if (clean) {
+        items.push({
+          question_key,
+          question_text,
+          answer_text: clean,
+          approved: true,
+          sensitive,
+          source: "resume_intake_profile_save"
+        });
+      }
+    };
+    add("phone", "What phone number should be used for job applications?", extracted.phone);
+    add("linkedin_url", "What is your LinkedIn profile URL?", extracted.linkedin_url);
+    add("github_url", "What is your GitHub profile URL, if relevant?", extracted.github_url);
+    add("verified_skills", "Which skills should be treated as verified for matching?", skillsText, false);
+    add("notice_period", "What is your notice period?", noticePeriod);
+    add("work_authorization", "What work authorization answer should be used?", workAuthorization);
+    add("expected_ctc", "What is your expected compensation?", preferredSalary);
+    add("preferred_locations", "What locations or remote preferences should be used?", preferredLocations);
+    add("excluded_companies", "Are there companies or industries that must be excluded?", excludedCompanies);
+    return items;
+  };
+
   const saveCorrections = async () => {
     if (!extracted || !userId) return;
     setBusy(true);
     setSaveStatus("");
-    const result = await api.updateResumeProfile({
-      user_id: userId,
-      ...extracted,
-      name: extracted.name.trim(),
-      email: extracted.email.trim(),
-      phone: extracted.phone?.trim() || null,
-      linkedin_url: extracted.linkedin_url?.trim() || null,
-      github_url: extracted.github_url?.trim() || null,
-      skills: split(skillsText),
-      notice_period: noticePeriod,
-      preferred_salary: preferredSalary,
-      preferred_locations: split(preferredLocations),
-      remote_preference: remotePreference,
-      excluded_companies: split(excludedCompanies)
-    });
-    setBusy(false);
-    setSaveStatus("Saved");
-    setExtracted({
-      name: String(result.profile.name || extracted.name),
-      email: String(result.profile.email || extracted.email),
-      phone: (result.profile.phone as string | null) ?? null,
-      linkedin_url: (result.profile.linkedin_url as string | null) ?? null,
-      github_url: (result.profile.github_url as string | null) ?? null,
-      skills: (result.profile.skills as string[]) || split(skillsText)
-    });
-    onNotice(result.message);
+    try {
+      const result = await api.updateResumeProfile({
+        user_id: userId,
+        ...extracted,
+        name: extracted.name.trim(),
+        email: extracted.email.trim(),
+        phone: extracted.phone?.trim() || null,
+        location: extracted.location?.trim() || null,
+        linkedin_url: extracted.linkedin_url?.trim() || null,
+        github_url: extracted.github_url?.trim() || null,
+        work_authorization: workAuthorization.trim() || null,
+        skills: split(skillsText),
+        notice_period: noticePeriod,
+        preferred_salary: preferredSalary,
+        preferred_locations: split(preferredLocations),
+        remote_preference: remotePreference,
+        excluded_companies: split(excludedCompanies)
+      });
+      const answerItems = profileAnswerItems();
+      if (answerItems.length) {
+        await api.bulkAnswers({ user_id: userId, answers: answerItems });
+      }
+      await loadCurrent();
+      setSaveStatus("Saved");
+      onNotice(result.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveMissingAnswers = async () => {
+    if (!userId) return;
+    const answerItems = missing
+      .map((question) => ({
+        question_text: question,
+        answer_text: missingAnswers[question] || "",
+        approved: true,
+        sensitive: true,
+        source: "resume_intake_missing_question"
+      }))
+      .filter((item) => item.answer_text.trim());
+
+    if (!answerItems.length) {
+      setMissingModalOpen(false);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const result = await api.bulkAnswers({ user_id: userId, answers: answerItems });
+      await loadCurrent();
+      setMissingModalOpen(false);
+      onNotice(result.message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[420px_1fr]">
+    <div className="grid gap-4">
+      <div className="grid gap-4 lg:grid-cols-[420px_1fr]">
+        <Panel className="p-5">
+          <div className="mb-4 flex items-center gap-2">
+            <Upload size={18} className="text-cobalt" />
+            <h2 className="text-base font-semibold">Upload Resume</h2>
+          </div>
+          <input
+            className={inputClass}
+            type="file"
+            accept=".pdf,.docx,.txt,.md"
+            disabled={busy}
+            onChange={(event) => upload(event.target.files?.[0]).catch((error) => onNotice(error.message))}
+          />
+          {baseResume ? (
+            <div className="mt-4 grid gap-3 border-t border-line pt-4 text-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="font-semibold text-ink">{baseResume.filename}</div>
+                  <div className="text-xs text-slate-500">{formatBytes(baseResume.size_bytes)} · verified base resume</div>
+                </div>
+                <Button variant="secondary" onClick={() => api.downloadBaseResume().catch((error) => onNotice(error.message))}>
+                  <Download size={15} /> Download
+                </Button>
+              </div>
+              {baseResume.text_preview && (
+                <pre className="max-h-[300px] overflow-auto rounded border border-line bg-field p-3 text-xs leading-5 text-slate-700 whitespace-pre-wrap">
+                  {baseResume.text_preview}
+                </pre>
+              )}
+              {missing.length > 0 && (
+                <Button disabled={busy} onClick={() => openMissingModal(missing)}>
+                  <ListChecks size={15} /> Answer Missing Questions
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="mt-4 rounded border border-line bg-field p-3 text-sm text-slate-500">
+              Upload a resume to create the verified base profile.
+            </div>
+          )}
+        </Panel>
+        <Panel className="p-5">
+          <h2 className="mb-4 text-base font-semibold">Extracted Profile And Preferences</h2>
+          {extracted ? (
+            <div className="grid gap-4 text-sm">
+              <div className="grid gap-4 md:grid-cols-2">
+                <Field label="Name"><input className={inputClass} value={extracted.name} onChange={(e) => setExtracted({ ...extracted, name: e.target.value })} /></Field>
+                <Field label="Email"><input className={inputClass} value={extracted.email} onChange={(e) => setExtracted({ ...extracted, email: e.target.value })} /></Field>
+                <Field label="Phone"><input className={inputClass} value={extracted.phone || ""} onChange={(e) => setExtracted({ ...extracted, phone: e.target.value })} /></Field>
+                <Field label="Location"><input className={inputClass} value={extracted.location || ""} onChange={(e) => setExtracted({ ...extracted, location: e.target.value })} /></Field>
+                <Field label="LinkedIn"><input className={inputClass} value={extracted.linkedin_url || ""} onChange={(e) => setExtracted({ ...extracted, linkedin_url: e.target.value })} /></Field>
+                <Field label="GitHub"><input className={inputClass} value={extracted.github_url || ""} onChange={(e) => setExtracted({ ...extracted, github_url: e.target.value })} /></Field>
+                <Field label="Notice period"><input className={inputClass} value={noticePeriod} onChange={(e) => setNoticePeriod(e.target.value)} placeholder="Immediate / 30 days / 60 days" /></Field>
+                <Field label="Work authorization"><input className={inputClass} value={workAuthorization} onChange={(e) => setWorkAuthorization(e.target.value)} placeholder="Country / visa / sponsorship status" /></Field>
+                <Field label="Expected compensation"><input className={inputClass} value={preferredSalary} onChange={(e) => setPreferredSalary(e.target.value)} placeholder="Example: 18-28 LPA" /></Field>
+                <Field label="Remote preference">
+                  <select className={inputClass} value={remotePreference} onChange={(e) => setRemotePreference(e.target.value)}>
+                    <option value="remote">Remote</option>
+                    <option value="hybrid">Hybrid</option>
+                    <option value="onsite">Onsite</option>
+                    <option value="any">Any</option>
+                  </select>
+                </Field>
+              </div>
+              <Field label="Skills"><textarea className={textareaClass} value={skillsText} onChange={(e) => setSkillsText(e.target.value)} /></Field>
+              <Field label="Preferred locations"><input className={inputClass} value={preferredLocations} onChange={(e) => setPreferredLocations(e.target.value)} placeholder="India, Remote, Bengaluru" /></Field>
+              <Field label="Excluded companies"><input className={inputClass} value={excludedCompanies} onChange={(e) => setExcludedCompanies(e.target.value)} placeholder="Company names separated by commas" /></Field>
+              <div className="flex items-center gap-3">
+                <Button disabled={busy} onClick={() => saveCorrections().catch((error) => { setBusy(false); setSaveStatus(""); onNotice(error.message); })}>
+                  <Save size={16} /> {busy ? "Saving..." : "Save Profile And KB"}
+                </Button>
+                {saveStatus && <span className="text-sm text-moss">{saveStatus}</span>}
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm text-slate-500">Upload a resume to see extracted fields and missing questions.</div>
+          )}
+        </Panel>
+      </div>
       <Panel className="p-5">
         <div className="mb-4 flex items-center gap-2">
-          <Upload size={18} className="text-cobalt" />
-          <h2 className="text-base font-semibold">Upload Resume</h2>
+          <ListChecks size={18} className="text-moss" />
+          <h2 className="text-base font-semibold">Shared Application Answers</h2>
         </div>
-        <input
-          className={inputClass}
-          type="file"
-          accept=".pdf,.docx,.txt,.md"
-          disabled={busy}
-          onChange={(event) => upload(event.target.files?.[0]).catch((error) => onNotice(error.message))}
-        />
-        <p className="mt-3 text-sm text-slate-500">
-          The app extracts name, email, phone, links, skills, and missing application questions. It uses this as the verified base profile.
-        </p>
-      </Panel>
-      <Panel className="p-5">
-        <h2 className="mb-4 text-base font-semibold">Edit Extracted Profile</h2>
-        {extracted ? (
-          <div className="grid gap-4 text-sm">
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Name"><input className={inputClass} value={extracted.name} onChange={(e) => setExtracted({ ...extracted, name: e.target.value })} /></Field>
-              <Field label="Email"><input className={inputClass} value={extracted.email} onChange={(e) => setExtracted({ ...extracted, email: e.target.value })} /></Field>
-              <Field label="Phone"><input className={inputClass} value={extracted.phone || ""} onChange={(e) => setExtracted({ ...extracted, phone: e.target.value })} /></Field>
-              <Field label="LinkedIn"><input className={inputClass} value={extracted.linkedin_url || ""} onChange={(e) => setExtracted({ ...extracted, linkedin_url: e.target.value })} /></Field>
-              <Field label="GitHub"><input className={inputClass} value={extracted.github_url || ""} onChange={(e) => setExtracted({ ...extracted, github_url: e.target.value })} /></Field>
-              <Field label="Notice period"><input className={inputClass} value={noticePeriod} onChange={(e) => setNoticePeriod(e.target.value)} placeholder="Immediate / 30 days / 60 days" /></Field>
-              <Field label="Expected compensation"><input className={inputClass} value={preferredSalary} onChange={(e) => setPreferredSalary(e.target.value)} placeholder="Example: 18-28 LPA" /></Field>
-              <Field label="Remote preference">
-                <select className={inputClass} value={remotePreference} onChange={(e) => setRemotePreference(e.target.value)}>
-                  <option value="remote">Remote</option>
-                  <option value="hybrid">Hybrid</option>
-                  <option value="onsite">Onsite</option>
-                  <option value="any">Any</option>
-                </select>
-              </Field>
-            </div>
-            <Field label="Skills"><textarea className={textareaClass} value={skillsText} onChange={(e) => setSkillsText(e.target.value)} /></Field>
-            <Field label="Preferred locations"><input className={inputClass} value={preferredLocations} onChange={(e) => setPreferredLocations(e.target.value)} placeholder="India, Remote, Bengaluru" /></Field>
-            <Field label="Excluded companies"><input className={inputClass} value={excludedCompanies} onChange={(e) => setExcludedCompanies(e.target.value)} placeholder="Company names separated by commas" /></Field>
-            <div className="mt-2 grid gap-2">
-              {missing.map((question) => <div key={question} className="border border-line bg-field p-3">{question}</div>)}
-            </div>
-            <div className="flex items-center gap-3">
-              <Button disabled={busy} onClick={() => saveCorrections().catch((error) => { setBusy(false); setSaveStatus(""); onNotice(error.message); })}>
-                <Save size={16} /> {busy ? "Saving..." : "Save Corrections"}
-              </Button>
-              {saveStatus && <span className="text-sm text-moss">{saveStatus}</span>}
-            </div>
+        {answers.length ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            {answers.slice(0, 8).map((answer) => (
+              <div key={answer.id} className="rounded border border-line bg-white p-3 text-sm">
+                <div className="font-medium text-ink">{answer.question_text}</div>
+                <div className="mt-1 text-slate-600">{answer.answer_text}</div>
+              </div>
+            ))}
           </div>
         ) : (
-          <div className="text-sm text-slate-500">Upload a resume to see extracted fields and missing questions.</div>
+          <div className="rounded border border-line bg-field p-3 text-sm text-slate-500">
+            Saved answers will appear here after missing questions are completed.
+          </div>
         )}
       </Panel>
+      {missingModalOpen && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-lg border border-line bg-white p-5 shadow-float">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <ListChecks size={18} className="text-cobalt" />
+                <h2 className="text-base font-semibold">Missing Application Questions</h2>
+              </div>
+              <button className="text-sm font-medium text-slate-500 hover:text-ink" onClick={() => setMissingModalOpen(false)}>
+                Skip for now
+              </button>
+            </div>
+            <div className="max-h-[60vh] overflow-auto pr-1">
+              <div className="grid gap-4">
+                {missing.map((question) => (
+                  <Field key={question} label={question}>
+                    <textarea
+                      className={textareaClass}
+                      value={missingAnswers[question] || ""}
+                      onChange={(e) => setMissingAnswers((prev) => ({ ...prev, [question]: e.target.value }))}
+                    />
+                  </Field>
+                ))}
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="secondary" disabled={busy} onClick={() => setMissingModalOpen(false)}>Cancel</Button>
+              <Button disabled={busy} onClick={() => saveMissingAnswers().catch((error) => { setBusy(false); onNotice(error.message); })}>
+                <Save size={16} /> {busy ? "Saving..." : "Save Answers"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -622,19 +812,6 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     setJobs(data.jobs);
   };
 
-  const handleDiscover = async () => {
-    setBusy(prev => ({ ...prev, [0]: true }));
-    try {
-      const res = await api.discoverJobs("Software Engineer", "India");
-      onNotice(res.message);
-      await loadJobs();
-    } catch (e: any) {
-      onNotice(e.message);
-    } finally {
-      setBusy(prev => ({ ...prev, [0]: false }));
-    }
-  };
-
   useEffect(() => {
     loadJobs().catch((err) => onNotice(err.message));
   }, []);
@@ -715,26 +892,6 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     }
   };
 
-  const handleAutoApply = async (job: JobRow) => {
-    setBusyFor(job.id, true);
-    try {
-      const res = await api.autoApply(job.id);
-      setResultFor(job.id, [
-        `Status: ${res.status}`,
-        res.message,
-        ...(res.steps ?? []).map(s => `→ ${s}`)
-      ]);
-      if (res.fill_plan) {
-        onNotice("Automated form filling prepared. Reviewing plan...");
-      }
-      await loadJobs();
-    } catch (e: any) {
-      onNotice(e.message);
-    } finally {
-      setBusyFor(job.id, false);
-    }
-  };
-
   const handleEmail = async (job: JobRow) => {
     setBusyFor(job.id, true);
     try {
@@ -776,13 +933,6 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
           Match &amp; Resume — {jobs.length} job{jobs.length !== 1 ? "s" : ""}
         </h2>
         <div className="flex items-center gap-3">
-          <button
-            disabled={busy[0]}
-            onClick={handleDiscover}
-            className="flex items-center gap-1.5 rounded-full bg-cobalt px-4 py-1.5 text-xs font-semibold text-white hover:bg-opacity-90 disabled:opacity-50"
-          >
-            <Sparkles size={14} /> {busy[0] ? "Searching..." : "Automate Job Discovery"}
-          </button>
           <button
             onClick={() => loadJobs().catch((err) => onNotice(err.message))}
             className="flex items-center gap-1 text-sm text-slate-500 hover:text-cobalt"
@@ -867,15 +1017,6 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
               >
                 <MailPlus size={13} /> Draft Email
               </button>
-              {(job.match_score ?? 0) >= 85 || job.status === "Resume tailored" ? (
-                <button
-                  disabled={isBusy}
-                  onClick={() => handleAutoApply(job).catch((e) => onNotice(e.message))}
-                  className="flex items-center gap-1.5 rounded border-2 border-emerald-500 bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
-                >
-                  <Shield size={13} /> Auto-Apply (AI)
-                </button>
-              ) : null}
             </div>
 
             {/* Application status controls — shown once an application record exists */}
@@ -1047,4 +1188,11 @@ function SettingsView({ safety, oci }: { safety: string[]; oci: string }) {
 
 function split(value: string) {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function formatBytes(value: number | null | undefined) {
+  if (!value) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }

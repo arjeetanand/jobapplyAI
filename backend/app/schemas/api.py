@@ -87,6 +87,16 @@ class LinkedInAssistIn(BaseModel):
     user_id: int | None = None
 
 
+class DiscoveryPreferencesIn(BaseModel):
+    keywords: list[str] = Field(default_factory=list)
+    location: str | None = None
+    date_since_posted: str = "past_week"
+    work_mode: str = "any"
+    easy_apply: str = "any"
+    limit: int = 6
+    user_id: int | None = None
+
+
 class LinkedInImportIn(BaseModel):
     job_url: HttpUrl
     visible_text: str
@@ -98,8 +108,10 @@ class ResumeProfileUpdateIn(BaseModel):
     name: str | None = None
     email: EmailStr | None = None
     phone: str | None = None
+    location: str | None = None
     linkedin_url: str | None = None
     github_url: str | None = None
+    work_authorization: str | None = None
     skills: list[str] | None = None
     notice_period: str | None = None
     preferred_salary: str | None = None
@@ -130,6 +142,20 @@ class ApplicationAnswerIn(BaseModel):
     sensitive: bool = True
     approved: bool = False
     user_id: int | None = None
+
+
+class BulkApplicationAnswerItem(BaseModel):
+    question_key: str | None = None
+    question_text: str
+    answer_text: str
+    source: str = "resume_intake_missing_question"
+    sensitive: bool = True
+    approved: bool = True
+
+
+class BulkApplicationAnswersIn(BaseModel):
+    user_id: int | None = None
+    answers: list[BulkApplicationAnswerItem] = Field(default_factory=list)
 
 
 class ClaimLedgerIn(BaseModel):

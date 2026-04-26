@@ -67,6 +67,19 @@ class JobPreference(Base, TimestampMixin):
     user: Mapped[User] = relationship(back_populates="preferences")
 
 
+class DiscoveryPreference(Base, TimestampMixin):
+    __tablename__ = "discovery_preferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
+    location: Mapped[str | None] = mapped_column(String(250), nullable=True)
+    date_since_posted: Mapped[str] = mapped_column(String(80), default="past_week")
+    work_mode: Mapped[str] = mapped_column(String(80), default="any")
+    easy_apply: Mapped[str] = mapped_column(String(80), default="any")
+    limit: Mapped[int] = mapped_column(Integer, default=6)
+
+
 class Job(Base, TimestampMixin):
     __tablename__ = "jobs"
 

@@ -1,8 +1,12 @@
 from datetime import datetime, timedelta
+from html import escape
+import json
 from pathlib import Path
+import re
+from urllib.parse import parse_qs, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,6 +20,7 @@ from app.models.entities import (
     BrowserImport,
     ClaimLedgerItem,
     Contact,
+    DiscoveryPreference,
     Email,
     ExcludedCompany,
     Job,
@@ -27,7 +32,9 @@ from app.models.entities import (
 from app.schemas.api import (
     ApplicationAnswerIn,
     BrowserImportIn,
+    BulkApplicationAnswersIn,
     ClaimLedgerIn,
+    DiscoveryPreferencesIn,
     JobImportIn,
     JobSearchIn,
     LinkedInAssistIn,
@@ -77,11 +84,356 @@ def _preferences_for(db: Session, user: User) -> JobPreference:
     return preferences
 
 
+def _discovery_preferences_for(db: Session, user: User) -> DiscoveryPreference:
+    preferences = db.scalar(select(DiscoveryPreference).where(DiscoveryPreference.user_id == user.id))
+    if not preferences:
+        job_preferences = _preferences_for(db, user)
+        preferences = DiscoveryPreference(
+            user_id=user.id,
+            keywords=job_preferences.target_roles or [],
+            location=(job_preferences.preferred_locations or [None])[0],
+            work_mode=job_preferences.remote_preference or "any",
+            date_since_posted="past_week",
+            easy_apply="any",
+            limit=6,
+        )
+        db.add(preferences)
+        db.flush()
+    return preferences
+
+
 def _job_or_404(db: Session, job_id: int) -> Job:
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
+
+
+def _split_answer_list(value: str) -> list[str]:
+    lowered = value.strip().lower()
+    if lowered in {"", "none", "n/a", "na", "no", "no exclusions", "not applicable"}:
+        return []
+    return [item.strip() for item in re.split(r"[,;\n]+", value) if item.strip()]
+
+
+def _canonical_question_key(question_text: str, explicit_key: str | None = None) -> str:
+    if explicit_key:
+        return re.sub(r"[^a-z0-9_]+", "_", explicit_key.lower()).strip("_")[:160]
+
+    text = question_text.lower()
+    if "email" in text:
+        return "email"
+    if "phone" in text or "mobile" in text:
+        return "phone"
+    if "linkedin" in text:
+        return "linkedin_url"
+    if "github" in text:
+        return "github_url"
+    if "skill" in text:
+        return "verified_skills"
+    if "notice" in text:
+        return "notice_period"
+    if "expected" in text and ("compensation" in text or "salary" in text or "ctc" in text):
+        return "expected_ctc"
+    if "current ctc" in text or "current compensation" in text:
+        return "current_ctc"
+    if "location" in text or "remote" in text or "hybrid" in text or "onsite" in text:
+        return "preferred_locations"
+    if "excluded" in text or "avoid" in text:
+        return "excluded_companies"
+    if "authorization" in text or "visa" in text or "sponsor" in text:
+        return "work_authorization"
+    if "relocat" in text:
+        return "relocation"
+
+    key = re.sub(r"[^a-z0-9]+", "_", question_text.lower()).strip("_")
+    return key[:160] or "application_question"
+
+
+def _sync_profile_answer(db: Session, user: User, preferences: JobPreference, key: str, answer_text: str) -> None:
+    value = answer_text.strip()
+    if not value:
+        return
+
+    if key == "email" and "@" in value:
+        existing = db.scalar(select(User).where(User.email == value))
+        if existing and existing.id != user.id:
+            raise HTTPException(status_code=409, detail="Another local profile already uses this email.")
+        user.email = value
+    elif key == "phone":
+        user.phone = value
+    elif key == "linkedin_url":
+        user.linkedin_url = value
+    elif key == "github_url":
+        user.github_url = value
+    elif key == "verified_skills":
+        user.skills = _split_answer_list(value)
+    elif key == "notice_period":
+        user.notice_period = value
+    elif key == "work_authorization":
+        user.work_authorization = value
+    elif key in {"expected_ctc", "expected_compensation", "expected_salary"}:
+        preferences.preferred_salary = value
+    elif key == "preferred_locations":
+        items = _split_answer_list(value)
+        preferences.preferred_locations = items
+        normalized = {item.lower() for item in items}
+        if "remote" in normalized:
+            preferences.remote_preference = "remote"
+        elif "hybrid" in normalized:
+            preferences.remote_preference = "hybrid"
+        elif "onsite" in normalized or "on-site" in normalized:
+            preferences.remote_preference = "onsite"
+    elif key == "excluded_companies":
+        companies = _split_answer_list(value)
+        preferences.excluded_companies = companies
+        db.query(ExcludedCompany).filter(ExcludedCompany.user_id == user.id).delete()
+        for company in companies:
+            db.add(ExcludedCompany(user_id=user.id, company_name=company, reason="Resume intake answer"))
+
+
+def _answers_for_user(db: Session, user: User) -> list[ApplicationAnswer]:
+    return db.scalars(
+        select(ApplicationAnswer).where(ApplicationAnswer.user_id == user.id).order_by(ApplicationAnswer.updated_at.desc())
+    ).all()
+
+
+def _missing_profile_questions(user: User, preferences: JobPreference, answers: list[ApplicationAnswer]) -> list[str]:
+    approved_keys = {
+        answer.question_key
+        for answer in answers
+        if answer.approved and answer.answer_text.strip() and answer.answer_text != "[NEEDS HUMAN REVIEW]"
+    }
+    missing = []
+    if (not user.email or user.email.endswith("@local.seekapply")) and "email" not in approved_keys:
+        missing.append("What email should be used for job applications?")
+    if not user.phone and "phone" not in approved_keys:
+        missing.append("What phone number should be used for job applications?")
+    if not user.linkedin_url and "linkedin_url" not in approved_keys:
+        missing.append("What is your LinkedIn profile URL?")
+    if not user.github_url and "github_url" not in approved_keys:
+        missing.append("What is your GitHub profile URL, if relevant?")
+    if not user.skills and "verified_skills" not in approved_keys:
+        missing.append("Which skills should be treated as verified for matching?")
+    if not user.notice_period and "notice_period" not in approved_keys:
+        missing.append("What is your notice period?")
+    if not preferences.preferred_salary and "expected_ctc" not in approved_keys:
+        missing.append("What is your expected compensation?")
+    if not preferences.preferred_locations and "preferred_locations" not in approved_keys:
+        missing.append("What locations or remote preferences should be used?")
+    if not preferences.excluded_companies and "excluded_companies" not in approved_keys:
+        missing.append("Are there companies or industries that must be excluded?")
+    return missing
+
+
+def _base_resume_metadata(user: User) -> dict | None:
+    if not user.base_resume_path:
+        return None
+    path = Path(user.base_resume_path).expanduser()
+    exists = path.exists()
+    return {
+        "filename": path.name,
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": path.stat().st_size if exists else None,
+        "download_url": "/resumes/base/download" if exists else None,
+        "text_preview": (user.base_resume_text or "")[:5000],
+        "uploaded_at": user.updated_at,
+    }
+
+
+def _profile_payload(user: User) -> dict:
+    return {
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "location": user.location,
+        "linkedin_url": user.linkedin_url,
+        "github_url": user.github_url,
+        "work_authorization": user.work_authorization,
+        "skills": user.skills,
+        "notice_period": user.notice_period,
+    }
+
+
+def _preferences_payload(preferences: JobPreference) -> dict:
+    return {
+        "preferred_salary": preferences.preferred_salary,
+        "preferred_locations": preferences.preferred_locations,
+        "remote_preference": preferences.remote_preference,
+        "excluded_companies": preferences.excluded_companies,
+        "match_threshold": preferences.match_threshold,
+        "auto_apply_enabled": preferences.auto_apply_enabled,
+        "auto_email_enabled": preferences.auto_email_enabled,
+    }
+
+
+def _discovery_preferences_payload(preferences: DiscoveryPreference | None) -> dict:
+    if not preferences:
+        return {
+            "user_id": None,
+            "keywords": [],
+            "location": "India",
+            "date_since_posted": "past_week",
+            "work_mode": "remote",
+            "easy_apply": "any",
+            "limit": 6,
+        }
+    return {
+        "user_id": preferences.user_id,
+        "keywords": preferences.keywords,
+        "location": preferences.location,
+        "date_since_posted": preferences.date_since_posted,
+        "work_mode": preferences.work_mode,
+        "easy_apply": preferences.easy_apply,
+        "limit": preferences.limit,
+    }
+
+
+def _save_discovery_preferences(db: Session, user: User, payload: DiscoveryPreferencesIn | LinkedInAssistIn) -> DiscoveryPreference:
+    discovery_preferences = _discovery_preferences_for(db, user)
+    job_preferences = _preferences_for(db, user)
+    keywords = [item.strip() for item in payload.keywords if item.strip()]
+    location = payload.location.strip() if payload.location else None
+    work_mode = payload.work_mode or "any"
+
+    discovery_preferences.keywords = keywords
+    discovery_preferences.location = location
+    discovery_preferences.date_since_posted = payload.date_since_posted or "past_week"
+    discovery_preferences.work_mode = work_mode
+    discovery_preferences.easy_apply = payload.easy_apply or "any"
+    discovery_preferences.limit = payload.limit or 6
+
+    if keywords:
+        job_preferences.target_roles = keywords
+    if location:
+        job_preferences.preferred_locations = [location]
+    if work_mode:
+        job_preferences.remote_preference = work_mode
+
+    db.add(
+        AgentRun(
+            agent_name="Discovery Preferences",
+            input_summary=f"user_id={user.id}",
+            output_summary=f"Saved {len(keywords)} keyword(s), location={location or 'not set'}, work_mode={work_mode}",
+        )
+    )
+    db.flush()
+    return discovery_preferences
+
+
+def _answer_payload(answer: ApplicationAnswer) -> dict:
+    return {
+        "id": answer.id,
+        "question_key": answer.question_key,
+        "question_text": answer.question_text,
+        "answer_text": answer.answer_text,
+        "source": answer.source,
+        "sensitive": answer.sensitive,
+        "approved": answer.approved,
+    }
+
+
+def _source_site_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    return host or "browser_assist"
+
+
+def _import_visible_job_payload(
+    db: Session,
+    *,
+    user: User | None,
+    page_url: str,
+    source_site: str,
+    title: str | None,
+    company: str | None,
+    location: str | None,
+    description: str | None,
+    visible_text: str | None,
+    apply_url: str | None = None,
+    salary: str | None = None,
+    skills: list[str] | None = None,
+    agent_name: str = "Browser Assist Agent",
+) -> dict:
+    visible = visible_text or ""
+    if "linkedin.com" in source_site and visible and (not title or not company):
+        parsed = LinkedInAssistAgent().parse_visible_job_text(visible)
+        title = title or parsed["title"]
+        company = company or parsed["company"]
+        location = location or parsed["location"]
+        skills = skills or parsed["skills"]
+
+    description_text = description or visible
+    title_text = title or "Browser Imported Role"
+    company_text = company or "Unknown Company"
+    source = source_site or _source_site_from_url(page_url)
+    missing = [
+        label
+        for label, value in {
+            "title": title,
+            "company": company,
+            "description": description_text,
+        }.items()
+        if not value
+    ]
+
+    existing = db.scalar(select(Job).where(Job.job_url == page_url))
+    if existing:
+        job = existing
+        deduped = True
+    else:
+        job = Job(
+            title=title_text[:300],
+            company=company_text[:250],
+            location=location,
+            salary=salary,
+            description=description_text[:12000],
+            skills=skills or extract_keywords(description_text, limit=16),
+            job_url=page_url,
+            apply_url=apply_url or page_url,
+            source=f"browser_assist:{source}",
+            status="Found",
+        )
+        db.add(job)
+        db.flush()
+        deduped = False
+
+    import_row = BrowserImport(
+        user_id=user.id if user else None,
+        job_id=job.id,
+        source_site=source,
+        page_url=page_url,
+        parser_confidence="high" if not missing else "medium",
+        raw_payload={
+            "page_url": page_url,
+            "source_site": source,
+            "title": title,
+            "company": company,
+            "location": location,
+            "description": description_text[:12000],
+            "apply_url": apply_url,
+            "salary": salary,
+            "skills": skills or [],
+        },
+        missing_fields=missing,
+    )
+    db.add(import_row)
+    db.add(
+        AgentRun(
+            agent_name=agent_name,
+            input_summary=f"{source}: {page_url}",
+            output_summary=f"Imported job {job.id} with missing fields: {', '.join(missing) or 'none'}",
+        )
+    )
+    db.commit()
+    return {
+        "job_id": job.id,
+        "browser_import_id": import_row.id,
+        "deduped": deduped,
+        "parser_confidence": import_row.parser_confidence,
+        "missing_fields": missing,
+        "message": "Visible job page imported for review.",
+    }
 
 
 @router.post("/onboarding/profile")
@@ -114,12 +466,57 @@ def save_onboarding(payload: OnboardingIn, db: Session = Depends(get_db)) -> dic
     return {"user_id": user.id, "message": "Onboarding profile saved.", "review_first": True}
 
 
+@router.get("/resumes/current")
+def current_resume(db: Session = Depends(get_db)) -> dict:
+    user = db.scalar(select(User).order_by(User.id.desc()))
+    if not user:
+        return {
+            "user_id": None,
+            "base_resume": None,
+            "profile": None,
+            "preferences": None,
+            "missing_questions": [],
+            "answers": [],
+        }
+
+    preferences = _preferences_for(db, user)
+    answers = _answers_for_user(db, user)
+    return {
+        "user_id": user.id,
+        "base_resume": _base_resume_metadata(user),
+        "profile": _profile_payload(user),
+        "preferences": _preferences_payload(preferences),
+        "missing_questions": _missing_profile_questions(user, preferences, answers),
+        "answers": [_answer_payload(answer) for answer in answers],
+    }
+
+
+@router.get("/resumes/base/download")
+def download_base_resume(db: Session = Depends(get_db)) -> FileResponse:
+    user = _default_user(db)
+    if not user.base_resume_path:
+        raise HTTPException(status_code=404, detail="No base resume has been uploaded.")
+
+    path = Path(user.base_resume_path).expanduser()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Base resume file not found on disk.")
+
+    media_types = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+    }
+    return FileResponse(path=str(path), media_type=media_types.get(path.suffix.lower(), "application/octet-stream"), filename=path.name)
+
+
 @router.post("/resumes/upload-base")
 async def upload_base_resume(file: UploadFile, user_id: int | None = None, db: Session = Depends(get_db)) -> dict:
     settings = get_settings()
     target_dir = settings.resolved_storage_root / "base_resumes"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / file.filename
+    filename = Path(file.filename or "resume").name
+    target = target_dir / filename
     content = await file.read()
     target.write_bytes(content)
     extraction = ResumeExtractionService().extract(target, content, file.content_type)
@@ -164,7 +561,7 @@ async def upload_base_resume(file: UploadFile, user_id: int | None = None, db: S
     db.add(
         AgentRun(
             agent_name="Resume Extraction Agent",
-            input_summary=file.filename,
+            input_summary=filename,
             output_summary=f"Extracted {len(extraction.skills)} skills and {len(extraction.missing_questions)} missing questions",
         )
     )
@@ -172,6 +569,7 @@ async def upload_base_resume(file: UploadFile, user_id: int | None = None, db: S
     return {
         "user_id": user.id,
         "base_resume_path": str(target),
+        "base_resume": _base_resume_metadata(user),
         "extracted": {
             "name": extraction.name,
             "email": extraction.email,
@@ -193,7 +591,7 @@ def update_resume_profile(payload: ResumeProfileUpdateIn, db: Session = Depends(
             raise HTTPException(status_code=409, detail="Another local profile already uses this email.")
         user.email = payload.email
 
-    for field in ["name", "phone", "linkedin_url", "github_url", "notice_period"]:
+    for field in ["name", "phone", "location", "linkedin_url", "github_url", "notice_period", "work_authorization"]:
         value = getattr(payload, field)
         if value is not None:
             setattr(user, field, value)
@@ -228,8 +626,10 @@ def update_resume_profile(payload: ResumeProfileUpdateIn, db: Session = Depends(
             "name": user.name,
             "email": user.email,
             "phone": user.phone,
+            "location": user.location,
             "linkedin_url": user.linkedin_url,
             "github_url": user.github_url,
+            "work_authorization": user.work_authorization,
             "skills": user.skills,
             "notice_period": user.notice_period,
             "preferred_salary": preferences.preferred_salary,
@@ -304,37 +704,41 @@ def search_jobs(payload: JobSearchIn, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/jobs/discover")
 def discover_jobs(payload: dict, db: Session = Depends(get_db)) -> dict:
-    """Trigger automated LinkedIn job discovery."""
-    query = payload.get("query", "Software Engineer")
-    location = payload.get("location", "India")
-    limit = payload.get("limit", 3)
-    
-    agent = JobSearchAgent()
-    discovered = agent.search_linkedin(query=query, location=location, limit=limit)
-    
-    new_jobs = []
-    for d in discovered:
-        existing = db.scalar(select(Job).where(Job.job_url == d.job_url))
-        if not existing:
-            job = Job(
-                title=d.title,
-                company=d.company,
-                location=d.location,
-                description=d.description,
-                job_url=d.job_url,
-                apply_url=d.apply_url,
-                source=d.source,
-                status="Found",
-                skills=d.skills
-            )
-            db.add(job)
-            new_jobs.append(job)
-    
+    """LinkedIn browser-assist replaces headless automated discovery in this slice."""
+    db.add(
+        AgentRun(
+            agent_name="LinkedIn Discovery Guard",
+            input_summary=str(payload),
+            output_summary="Headless LinkedIn discovery is disabled; use browser-assist search links.",
+            status="blocked",
+        )
+    )
     db.commit()
     return {
-        "message": f"Discovery complete. Added {len(new_jobs)} new jobs.",
-        "jobs_found": len(discovered),
-        "jobs_added": len(new_jobs)
+        "mode": "browser_assist_review_first",
+        "message": "Automated LinkedIn discovery is disabled. Use LinkedIn Assist search links and import visible job text.",
+        "jobs_found": 0,
+        "jobs_added": 0,
+        "assist_endpoint": "/linkedin/assist/search",
+    }
+
+
+@router.get("/linkedin/assist/preferences")
+def get_linkedin_assist_preferences(db: Session = Depends(get_db)) -> dict:
+    user = db.scalar(select(User).order_by(User.id.desc()))
+    if not user:
+        return _discovery_preferences_payload(None)
+    return _discovery_preferences_payload(_discovery_preferences_for(db, user))
+
+
+@router.patch("/linkedin/assist/preferences")
+def save_linkedin_assist_preferences(payload: DiscoveryPreferencesIn, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, payload.user_id) if payload.user_id else _default_user(db)
+    saved = _save_discovery_preferences(db, user, payload)
+    db.commit()
+    return {
+        "message": "Discovery preferences saved.",
+        "preferences": _discovery_preferences_payload(saved),
     }
 
 
@@ -342,17 +746,20 @@ def discover_jobs(payload: dict, db: Session = Depends(get_db)) -> dict:
 def linkedin_assist_search(payload: LinkedInAssistIn, db: Session = Depends(get_db)) -> dict:
     user = db.get(User, payload.user_id) if payload.user_id else _default_user(db)
     preferences = _preferences_for(db, user)
+    discovery_preferences = _save_discovery_preferences(db, user, payload)
     plans = LinkedInAssistAgent().build_search_plans(
         preferences=preferences,
-        keywords=payload.keywords or None,
-        location=payload.location,
-        date_since_posted=payload.date_since_posted,
-        work_mode=payload.work_mode,
-        easy_apply=payload.easy_apply,
-        limit=payload.limit,
+        keywords=discovery_preferences.keywords or None,
+        location=discovery_preferences.location,
+        date_since_posted=discovery_preferences.date_since_posted,
+        work_mode=discovery_preferences.work_mode,
+        easy_apply=discovery_preferences.easy_apply,
+        limit=discovery_preferences.limit,
     )
+    db.commit()
     return {
         "mode": "browser_assist_review_first",
+        "preferences": _discovery_preferences_payload(discovery_preferences),
         "plans": [plan.__dict__ for plan in plans],
         "checklist": LinkedInAssistAgent().application_checklist(user),
     }
@@ -416,64 +823,79 @@ def browser_assist_site_rules() -> dict:
 @router.post("/browser-assist/import-current-page")
 def browser_assist_import(payload: BrowserImportIn, db: Session = Depends(get_db)) -> dict:
     user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
-    description = payload.description or payload.visible_text or ""
-    title = payload.title or "Browser Imported Role"
-    company = payload.company or "Unknown Company"
-    missing = [
-        label
-        for label, value in {
-            "title": payload.title,
-            "company": payload.company,
-            "description": description,
-        }.items()
-        if not value
-    ]
-    existing = db.scalar(select(Job).where(Job.job_url == str(payload.page_url)))
-    if existing:
-        job = existing
-        deduped = True
-    else:
-        job = Job(
-            title=title,
-            company=company,
-            location=payload.location,
-            salary=payload.salary,
-            description=description,
-            skills=payload.skills or extract_keywords(description),
-            job_url=str(payload.page_url),
-            apply_url=payload.apply_url or str(payload.page_url),
-            source=f"browser_assist:{payload.source_site}",
-            status="Found",
-        )
-        db.add(job)
-        db.flush()
-        deduped = False
-    import_row = BrowserImport(
-        user_id=user.id if user else None,
-        job_id=job.id,
-        source_site=payload.source_site,
+    return _import_visible_job_payload(
+        db,
+        user=user,
         page_url=str(payload.page_url),
-        parser_confidence="high" if not missing else "medium",
-        raw_payload=payload.model_dump(mode="json"),
-        missing_fields=missing,
+        source_site=payload.source_site,
+        title=payload.title,
+        company=payload.company,
+        location=payload.location,
+        description=payload.description,
+        visible_text=payload.visible_text,
+        apply_url=payload.apply_url,
+        salary=payload.salary,
+        skills=payload.skills,
     )
-    db.add(import_row)
-    db.add(
-        AgentRun(
-            agent_name="Browser Assist Agent",
-            input_summary=f"{payload.source_site}: {payload.page_url}",
-            output_summary=f"Imported job {job.id} with missing fields: {', '.join(missing) or 'none'}",
-        )
+
+
+@router.post("/browser-assist/import-bookmarklet")
+async def browser_assist_import_bookmarklet(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
+    body = await request.body()
+    payload_text = ""
+    try:
+        form = await request.form()
+        payload_text = str(form.get("payload") or "")
+    except Exception:
+        payload_text = ""
+    if not payload_text and body:
+        decoded = body.decode("utf-8", errors="ignore")
+        parsed = parse_qs(decoded)
+        payload_text = parsed.get("payload", [decoded])[0]
+    if not payload_text:
+        raise HTTPException(status_code=400, detail="Missing bookmarklet payload.")
+
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid bookmarklet payload.") from exc
+
+    page_url = str(payload.get("page_url") or "")
+    if not page_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Bookmarklet payload is missing page_url.")
+
+    user = db.scalar(select(User).order_by(User.id.desc()))
+    source_site = str(payload.get("source_site") or _source_site_from_url(page_url))
+    result = _import_visible_job_payload(
+        db,
+        user=user,
+        page_url=page_url,
+        source_site=source_site,
+        title=payload.get("title"),
+        company=payload.get("company"),
+        location=payload.get("location"),
+        description=payload.get("description"),
+        visible_text=payload.get("visible_text"),
+        apply_url=payload.get("apply_url") or page_url,
+        salary=payload.get("salary"),
+        skills=payload.get("skills") or [],
+        agent_name="Browser Assist Bookmarklet",
     )
-    db.commit()
-    return {
-        "job_id": job.id,
-        "browser_import_id": import_row.id,
-        "deduped": deduped,
-        "parser_confidence": import_row.parser_confidence,
-        "missing_fields": missing,
-        "message": "Visible job page imported for review.",
-    }
+
+    status = "Already imported" if result["deduped"] else "Imported"
+    html = f"""
+    <!doctype html>
+    <html>
+      <head><title>SeekApply Import</title></head>
+      <body style="font-family: system-ui, sans-serif; margin: 32px; color: #111;">
+        <h1>{escape(status)} job {result["job_id"]}</h1>
+        <p>{escape(result["message"])}</p>
+        <p>Parser confidence: {escape(result["parser_confidence"])}</p>
+        <p><a href="http://127.0.0.1:5173/">Open SeekApply</a></p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 
 @router.post("/jobs/{job_id}/score", response_model=ScoreOut)
@@ -716,63 +1138,30 @@ def required_questions_for_job(job_id: int, user_id: int | None = None, db: Sess
 
 @router.post("/jobs/{job_id}/auto-apply")
 def auto_apply_job(job_id: int, db: Session = Depends(get_db)) -> dict:
-    """Trigger automated application submission with knowledge base integration."""
-    from app.services.submission import SubmissionAgent
-
-    job = db.get(Job, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
-
-    user = db.scalar(select(User).order_by(User.id.desc()))
-    if not user:
-        raise HTTPException(status_code=400, detail="User profile not found. Please complete onboarding.")
-
-    preferences = _preferences_for(db, user)
-    threshold = preferences.match_threshold or 85
-
-    # Enforce score threshold — human review needed for low-score jobs
-    if job.match_score is not None and job.match_score < threshold:
-        return {
-            "status": "requires_review",
-            "message": f"Score {job.match_score} is below threshold {threshold}. Please review manually before applying.",
-            "steps": [],
-            "match_score": job.match_score,
-            "threshold": threshold,
-        }
-
-    # Get latest tailored resume for this job
-    resume = db.scalar(
-        select(ResumeVersion)
-        .where(ResumeVersion.job_id == job.id)
-        .order_by(ResumeVersion.created_at.desc())
+    """Guardrail endpoint until supervised browser automation is implemented."""
+    job = _job_or_404(db, job_id)
+    _default_user(db)
+    db.add(
+        AgentRun(
+            agent_name="Application Automation Guard",
+            input_summary=f"job_id={job.id}",
+            output_summary="Unsupervised auto-apply is disabled; prepare a packet and submit manually.",
+            status="blocked",
+        )
     )
-    if not resume:
-        return {
-            "status": "error",
-            "message": "Please run 'Resume Decision' first to generate a tailored resume.",
-            "steps": [],
-        }
-
-    answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.user_id == user.id)).all()
-
-    settings = get_settings()
-    agent = SubmissionAgent(storage_root=settings.resolved_storage_root)
-
-    # Pass db so the agent can save new unanswered questions to the knowledge base
-    result = agent.auto_fill_linkedin(user, job, resume, list(answers), db=db)
-
-    # Update application status
-    app_record = db.scalar(select(Application).where(Application.job_id == job.id, Application.user_id == user.id))
-    if app_record:
-        if result.get("status") == "ready_to_submit":
-            app_record.status = "Auto-apply ready"
-        elif result.get("status") == "requires_review":
-            app_record.status = "Requires review"
-        else:
-            app_record.status = "Auto-fill prepared"
-        db.commit()
-
-    return result
+    db.commit()
+    return {
+        "status": "supervised_required",
+        "message": "Unsupervised auto-apply is disabled. Prepare the application packet, review the resume and answers, then submit in the browser yourself.",
+        "steps": [
+            "Run Resume Decision for this job.",
+            "Prepare the application packet.",
+            "Open the job portal in your browser.",
+            "Pause for login, CAPTCHA, sensitive questions, and final submit.",
+        ],
+        "job_id": job.id,
+        "auto_submit": False,
+    }
 
 
 @router.post("/jobs/{job_id}/draft-email")
@@ -819,6 +1208,67 @@ def create_answer(payload: ApplicationAnswerIn, db: Session = Depends(get_db)) -
     db.commit()
     db.refresh(answer)
     return {"answer_id": answer.id, "message": "Application answer saved.", "approved": answer.approved}
+
+
+@router.post("/answers/bulk")
+def bulk_upsert_answers(payload: BulkApplicationAnswersIn, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, payload.user_id) if payload.user_id else _default_user(db)
+    preferences = _preferences_for(db, user)
+    saved: list[ApplicationAnswer] = []
+
+    for item in payload.answers:
+        key = _canonical_question_key(item.question_text, item.question_key)
+        answer_text = item.answer_text.strip()
+        if not answer_text:
+            continue
+
+        existing = db.scalar(
+            select(ApplicationAnswer).where(
+                ApplicationAnswer.user_id == user.id,
+                ApplicationAnswer.question_key == key,
+            )
+        )
+        if existing:
+            existing.question_text = item.question_text
+            existing.answer_text = answer_text
+            existing.source = item.source
+            existing.sensitive = item.sensitive
+            existing.approved = item.approved
+            answer = existing
+        else:
+            answer = ApplicationAnswer(
+                user_id=user.id,
+                question_key=key,
+                question_text=item.question_text,
+                answer_text=answer_text,
+                source=item.source,
+                sensitive=item.sensitive,
+                approved=item.approved,
+            )
+            db.add(answer)
+
+        _sync_profile_answer(db, user, preferences, key, answer_text)
+        saved.append(answer)
+
+    db.add(
+        AgentRun(
+            agent_name="Application Answer Bank",
+            input_summary=f"user_id={user.id}",
+            output_summary=f"Bulk saved {len(saved)} resume intake answers",
+        )
+    )
+    db.commit()
+    for answer in saved:
+        db.refresh(answer)
+
+    answers = _answers_for_user(db, user)
+    return {
+        "user_id": user.id,
+        "saved_count": len(saved),
+        "answers": [_answer_payload(answer) for answer in saved],
+        "missing_questions": _missing_profile_questions(user, preferences, answers),
+        "message": f"Saved {len(saved)} answer(s) to the knowledge base.",
+    }
 
 
 @router.get("/answers")
@@ -1129,11 +1579,9 @@ def analytics(db: Session = Depends(get_db)) -> dict:
 
 @router.get("/settings/safety", response_model=SafetySettingsOut)
 def safety_settings(db: Session = Depends(get_db)) -> SafetySettingsOut:
-    user = db.scalar(select(User).order_by(User.id.desc()))
-    preferences = _preferences_for(db, user) if user else None
     return SafetySettingsOut(
-        auto_apply_enabled=False if not preferences else preferences.auto_apply_enabled,
-        auto_email_enabled=False if not preferences else preferences.auto_email_enabled,
+        auto_apply_enabled=False,
+        auto_email_enabled=False,
         rules=[
             "Applications require user review in v1.",
             "Emails are drafts only in v1.",
