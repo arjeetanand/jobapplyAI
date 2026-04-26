@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     match_threshold: int = 60
     latex_template_path: Path | None = None
     docx_template_path: Path | None = None
+    apply_browser: str = "chromium"
+    apply_browser_executable_path: Path | None = None
 
     oci_config_file: str = "~/.oci/config"
     oci_profile: str = "DEFAULT"

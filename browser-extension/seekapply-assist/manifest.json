@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "SeekApply Assist",
+  "version": "0.1.0",
+  "description": "Fill visible job application fields from the local SeekApply knowledge base and pause before submit.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*",
+    "https://www.linkedin.com/*",
+    "https://in.linkedin.com/*",
+    "https://*.greenhouse.io/*",
+    "https://*.lever.co/*",
+    "https://*.ashbyhq.com/*",
+    "https://*.workdayjobs.com/*",
+    "https://*.smartrecruiters.com/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_title": "SeekApply Assist",
+    "default_popup": "popup.html"
+  }
+}

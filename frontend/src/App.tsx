@@ -1304,6 +1304,12 @@ function DebugModal({ title, data, onClose }: { title: string; data: JobDebug | 
   const trace = "trace" in data ? data.trace : data.queue_tasks.flatMap((task) => task.trace ?? []);
   const diagnosis = data.diagnosis ?? [];
   const runs = data.agent_runs ?? [];
+  const fillReport = "fill_report" in data ? data.fill_report : null;
+  const automationDebug = fillReport && Array.isArray(fillReport.automation_debug) ? fillReport.automation_debug : [];
+  const debugSummary = (value: unknown) => {
+    const text = JSON.stringify(value, null, 2) || "";
+    return text.length > 1600 ? `${text.slice(0, 1600)}\n...` : text;
+  };
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
       <div className="flex max-h-[88vh] w-full max-w-5xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
@@ -1325,36 +1331,66 @@ function DebugModal({ title, data, onClose }: { title: string; data: JobDebug | 
             </div>
           </div>
 
-          {"fill_report" in data && data.fill_report && (
+          {fillReport && (
             <div className="rounded border border-line bg-white p-3">
               <div className="text-xs font-semibold uppercase text-slate-500">Browser Snapshot</div>
               <div className="mt-2 grid gap-2 text-xs text-slate-700">
-                {typeof data.fill_report.page_title === "string" && data.fill_report.page_title && (
-                  <div><span className="font-semibold text-ink">Title:</span> {data.fill_report.page_title}</div>
+                {typeof fillReport.page_title === "string" && fillReport.page_title && (
+                  <div><span className="font-semibold text-ink">Title:</span> {fillReport.page_title}</div>
                 )}
-                {typeof data.fill_report.current_url === "string" && data.fill_report.current_url && (
-                  <div className="break-all"><span className="font-semibold text-ink">URL:</span> {data.fill_report.current_url}</div>
+                {typeof fillReport.current_url === "string" && fillReport.current_url && (
+                  <div className="break-all"><span className="font-semibold text-ink">URL:</span> {fillReport.current_url}</div>
                 )}
-                {Array.isArray(data.fill_report.buttons_seen) && data.fill_report.buttons_seen.length > 0 && (
+                {typeof fillReport.last_click_blocker === "string" && fillReport.last_click_blocker && (
+                  <div><span className="font-semibold text-ink">Last click blocker:</span> {fillReport.last_click_blocker}</div>
+                )}
+                {Array.isArray(fillReport.disabled_buttons_seen) && fillReport.disabled_buttons_seen.length > 0 && (
+                  <div>
+                    <div className="font-semibold text-ink">Disabled buttons</div>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {fillReport.disabled_buttons_seen.slice(0, 12).map((button: unknown, index: number) => (
+                        <span key={`${String(button)}-${index}`} className="rounded bg-amber-50 px-2 py-1 text-amber-800">{String(button)}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {Array.isArray(fillReport.buttons_seen) && fillReport.buttons_seen.length > 0 && (
                   <div>
                     <div className="font-semibold text-ink">Visible buttons</div>
                     <div className="mt-1 flex flex-wrap gap-1">
-                      {data.fill_report.buttons_seen.slice(0, 16).map((button: unknown, index: number) => (
+                      {fillReport.buttons_seen.slice(0, 16).map((button: unknown, index: number) => (
                         <span key={`${String(button)}-${index}`} className="rounded bg-field px-2 py-1">{String(button)}</span>
                       ))}
                     </div>
                   </div>
                 )}
-                {Array.isArray(data.fill_report.fields_seen) && data.fill_report.fields_seen.length > 0 && (
+                {Array.isArray(fillReport.fields_seen) && fillReport.fields_seen.length > 0 && (
                   <div>
                     <div className="font-semibold text-ink">Visible fields</div>
                     <div className="mt-1 flex flex-wrap gap-1">
-                      {data.fill_report.fields_seen.slice(0, 16).map((field: unknown, index: number) => (
+                      {fillReport.fields_seen.slice(0, 16).map((field: unknown, index: number) => (
                         <span key={`${String(field)}-${index}`} className="rounded bg-field px-2 py-1">{String(field)}</span>
                       ))}
                     </div>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {automationDebug.length > 0 && (
+            <div className="rounded border border-line bg-white p-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">Automation Debug Timeline</div>
+              <div className="mt-2 grid gap-2">
+                {automationDebug.slice(-12).map((entry: unknown, index: number) => {
+                  const item = entry as { event?: string; data?: unknown };
+                  return (
+                    <details key={`${item.event || "event"}-${index}`} className="rounded border border-line bg-field p-2 text-xs">
+                      <summary className="cursor-pointer font-semibold text-ink">{item.event || "automation_event"}</summary>
+                      <pre className="mt-2 max-h-52 overflow-auto whitespace-pre-wrap text-slate-700">{debugSummary(item.data ?? item)}</pre>
+                    </details>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -1456,9 +1492,9 @@ function ApplyInterventionModal({
   const report = snapshot.fill_report || {};
   const buttons = Array.isArray(report.buttons_seen) ? report.buttons_seen.slice(0, 10) : [];
   const fields = Array.isArray(report.fields_seen) ? report.fields_seen.slice(0, 10) : [];
-  const currentUrl = typeof report.current_url === "string" ? report.current_url : "";
+  const currentUrl = typeof report.current_url === "string" ? report.current_url : typeof report.active_browser_url === "string" ? report.active_browser_url : "";
   const canAnswer = snapshot.missing_questions.length > 0 || snapshot.status === "needs_answers";
-  const canSubmit = snapshot.status === "ready_for_submit";
+  const canSubmit = ["ready_for_submit", "needs_user_action", "failed"].includes(snapshot.status);
   const canResume = ["needs_login", "needs_user_action", "failed"].includes(snapshot.status);
 
   return (
@@ -1480,7 +1516,7 @@ function ApplyInterventionModal({
         </div>
         <div className="grid gap-4 overflow-auto p-5">
           <div className="rounded border border-blue-200 bg-blue-50 p-3 text-xs leading-5 text-blue-900">
-            SeekApply is not randomly searching LinkedIn here. It opens the saved job URL, clicks the top-card apply action, fills visible fields from your profile/KB, uploads the selected resume, and stops before final submit.
+            SeekApply opens only the saved job URL, clicks the top-card apply action, fills visible fields from your profile/KB, uploads the selected resume, and tracks the visible browser. After you submit in the browser, the next run can detect the submitted confirmation and release the session.
           </div>
           <div className="rounded border border-line bg-field p-3 text-sm leading-6 text-slate-700">
             {snapshot.action_required || snapshot.message}
@@ -1579,7 +1615,7 @@ function ApplyAgentProgress({ task }: { task: ApplyQueueTask }) {
     { label: "Browser", detail: hasBrowser ? applyModeLabelFromTask(task) : "Not opened", done: hasBrowser },
     { label: "Fill", detail: resumeUploaded || filledCount ? `${resumeUploaded ? "resume" : ""}${resumeUploaded && filledCount ? " + " : ""}${filledCount || ""} field${filledCount === 1 ? "" : "s"}` : "Waiting", done: resumeUploaded || filledCount > 0 },
     { label: "Input", detail: needsInput ? "Required" : "Clear", done: !needsInput },
-    { label: "Submit", detail: task.status === "submitted_by_user" ? "Confirmed" : finalReady ? "Review" : "Manual final", done: finalReady },
+    { label: "Submit", detail: task.status === "submitted_by_user" ? "Confirmed" : finalReady ? "Review" : "Awaiting confirm", done: finalReady },
   ];
 
   return (
@@ -2691,6 +2727,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
   const [tasks, setTasks] = useState<ApplyQueueTask[]>([]);
   const [busy, setBusy] = useState<Record<number, boolean>>({});
   const [queueBusy, setQueueBusy] = useState(false);
+  const [browserResetBusy, setBrowserResetBusy] = useState(false);
   const [answerTask, setAnswerTask] = useState<ApplyQueueTask | null>(null);
   const [intervention, setIntervention] = useState<ApplyRunSnapshot | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -2712,6 +2749,17 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
     setTasks(result.tasks);
     onNotice(`${result.message} Threshold: ${result.threshold}. Skipped: ${result.skipped.length}.`);
     await onRefresh();
+  };
+
+  const resetApplyBrowser = async () => {
+    setBrowserResetBusy(true);
+    try {
+      const result = await api.resetApplyBrowser();
+      onNotice(result.message);
+      await load();
+    } finally {
+      setBrowserResetBusy(false);
+    }
   };
 
   const runQueue = async () => {
@@ -2871,11 +2919,14 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-semibold">Supervised Apply Queue</h2>
-            <div className="mt-1 text-sm text-slate-500">LinkedIn Easy Apply first, then supervised external-site fallback. SeekApply pauses before Submit.</div>
+            <div className="mt-1 text-sm text-slate-500">LinkedIn Easy Apply first, then supervised external-site fallback. SeekApply fills known fields and keeps the browser session visible.</div>
           </div>
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" onClick={() => load().catch((error) => onNotice(error.message))}>
               <RefreshCcw size={15} /> Refresh
+            </Button>
+            <Button variant="secondary" disabled={browserResetBusy || queueBusy} onClick={() => resetApplyBrowser().catch((error) => onNotice(error.message))}>
+              <X size={15} /> {browserResetBusy ? "Resetting..." : "Reset Browser"}
             </Button>
             <Button onClick={() => buildQueue().catch((error) => onNotice(error.message))}>
               <Send size={15} /> Build Queue
@@ -2928,6 +2979,11 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                       <a href={task.job.job_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-cobalt hover:underline">
                         <ExternalLink size={12} /> Job
                       </a>
+                      {task.job.apply_url && task.job.apply_url !== task.job.job_url && (
+                        <a href={task.job.apply_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-cobalt hover:underline">
+                          <ExternalLink size={12} /> Apply Link
+                        </a>
+                      )}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -2937,7 +2993,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                     <Button variant="secondary" disabled={isBusy || !canResume} onClick={() => runTask(task, "resume").catch((error) => onNotice(error.message))}>
                       <RefreshCcw size={15} /> Resume Agent
                     </Button>
-                    <Button variant="secondary" disabled={isBusy || !["ready_for_submit", "needs_user_action"].includes(task.status)} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
+                    <Button variant="secondary" disabled={isBusy || !["ready_for_submit", "needs_user_action", "failed", "needs_login", "opening_browser"].includes(task.status)} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
                       <CheckCircle2 size={15} /> Mark Submitted
                     </Button>
                     {applyNeedsIntervention(task.status) && (

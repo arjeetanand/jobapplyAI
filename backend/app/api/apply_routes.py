@@ -208,6 +208,104 @@ def list_apply_queue(user_id: int | None = None, db: Session = Depends(get_db)) 
     return {"tasks": [_apply_queue_task_payload(db, task) for task in tasks], "auto_submit": False}
 
 
+@router.post("/apply-queue/browser/reset")
+def reset_apply_browser() -> dict:
+    _supervised_apply_agent_cls()(_api_settings().resolved_storage_root).close()
+    return {
+        "status": "reset",
+        "message": "Closed the active supervised apply browser session. Start or Resume a task to launch a fresh browser.",
+        "auto_submit": False,
+    }
+
+
+def _active_apply_browser_summary() -> dict:
+    agent_cls = _supervised_apply_agent_cls()
+    active_summary = getattr(agent_cls, "active_summary", None)
+    if not callable(active_summary):
+        return {"live": False}
+    try:
+        summary = active_summary()
+        return summary if isinstance(summary, dict) else {"live": False}
+    except Exception as exc:
+        return {"live": False, "error": str(exc)}
+
+
+def _record_apply_task_submitted(
+    db: Session,
+    *,
+    task: ApplyQueueTask,
+    user: User,
+    job: Job,
+    message: str,
+    output_summary: str,
+    close_browser: bool = True,
+    source: str = "user_confirmed",
+) -> Application:
+    application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
+    application.status = "Applied"
+    if not application.applied_at:
+        application.applied_at = datetime.utcnow()
+    task.application_id = application.id
+    task.status = "submitted_by_user"
+    task.message = message
+    task.last_error = None
+    task.missing_questions = []
+    task.auto_submit = False
+    _trace_task(
+        task,
+        "mark_submitted",
+        "completed",
+        message,
+        {"application_id": application.id, "source": source},
+    )
+    if close_browser:
+        _supervised_apply_agent_cls()(_api_settings().resolved_storage_root).close(task.id)
+    db.add(
+        AgentRun(
+            agent_name="Supervised Apply",
+            input_summary=f"task_id={task.id}, job_id={job.id}",
+            output_summary=output_summary,
+            status="submitted_by_user",
+        )
+    )
+    return application
+
+
+def _reconcile_active_apply_browser(db: Session) -> dict:
+    summary = _active_apply_browser_summary()
+    active_task_id = summary.get("task_id")
+    if not summary.get("live") or not active_task_id:
+        return summary
+    active_task = db.get(ApplyQueueTask, active_task_id)
+    if summary.get("submission_success"):
+        if active_task and active_task.status != "submitted_by_user":
+            user = db.get(User, active_task.user_id)
+            job = db.get(Job, active_task.job_id)
+            if user and job:
+                _record_apply_task_submitted(
+                    db,
+                    task=active_task,
+                    user=user,
+                    job=job,
+                    message="Detected the application submission in the visible browser and released the apply session.",
+                    output_summary="Browser showed an application-submitted confirmation; task was marked submitted automatically.",
+                    source="browser_submission_reconcile",
+                )
+                db.commit()
+                summary["reconciled_task_id"] = active_task.id
+                summary["reconciled_status"] = "submitted_by_user"
+                summary["live"] = False
+        else:
+            _supervised_apply_agent_cls()(_api_settings().resolved_storage_root).close(int(active_task_id))
+            summary["live"] = False
+        return summary
+    if active_task and active_task.status == "submitted_by_user":
+        _supervised_apply_agent_cls()(_api_settings().resolved_storage_root).close(active_task.id)
+        summary["released_task_id"] = active_task.id
+        summary["live"] = False
+    return summary
+
+
 @router.get("/apply-queue/{task_id}/debug")
 def debug_apply_queue_task(task_id: int, user_id: int | None = None, db: Session = Depends(get_db)) -> dict:
     task = db.get(ApplyQueueTask, task_id)
@@ -279,6 +377,7 @@ def debug_job(job_id: int, user_id: int | None = None, db: Session = Depends(get
 
 
 def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, resume_existing: bool = False) -> dict:
+    active_summary = _reconcile_active_apply_browser(db)
     task = db.get(ApplyQueueTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Apply queue task not found.")
@@ -286,6 +385,50 @@ def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, r
     if not user:
         raise HTTPException(status_code=404, detail="Apply queue user not found.")
     job = _job_or_404(db, task.job_id)
+    if task.status == "submitted_by_user":
+        application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
+        return {
+            "task": _apply_queue_task_payload(db, task),
+            "status": task.status,
+            "message": task.message or "Application is already marked submitted.",
+            "action_required": None,
+            "steps": [],
+            "errors": [],
+            "missing_questions": [],
+            "fill_report": task.fill_report or {},
+            "application_id": application.id,
+            "auto_submit": False,
+            "resumed": resume_existing,
+        }
+    active_task_id = active_summary.get("task_id")
+    if active_summary.get("live") and active_task_id and active_task_id != task.id:
+        active_task = db.get(ApplyQueueTask, active_task_id)
+        active_label = f"task #{active_task_id}"
+        if active_task:
+            active_job = db.get(Job, active_task.job_id)
+            if active_job:
+                active_label = f"{active_job.company} · {active_job.title}"
+        message = "Another supervised application browser is still open."
+        return {
+            "task": _apply_queue_task_payload(db, active_task or task),
+            "status": "needs_user_action",
+            "message": message,
+            "action_required": (
+                f"Finish or mark the active application first ({active_label}). "
+                "If you already submitted it in the browser, click Mark Submitted on that task or use Reset Browser."
+            ),
+            "steps": [],
+            "errors": [message],
+            "missing_questions": [],
+            "fill_report": {
+                "active_task_id": active_task_id,
+                "active_browser_url": active_summary.get("url"),
+                "active_browser_title": active_summary.get("title"),
+                "active_browser": active_summary.get("browser"),
+            },
+            "auto_submit": False,
+            "resumed": resume_existing,
+        }
     preferences = _preferences_for(db, user)
     application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
     task.application_id = application.id
@@ -450,21 +593,13 @@ def mark_apply_queue_submitted(task_id: int, payload: ApplyQueueActionIn | None 
     if not user:
         raise HTTPException(status_code=404, detail="Apply queue user not found.")
     job = _job_or_404(db, task.job_id)
-    application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
-    application.status = "Applied"
-    if not application.applied_at:
-        application.applied_at = datetime.utcnow()
-    task.status = "submitted_by_user"
-    task.message = "User confirmed the application was submitted manually."
-    task.auto_submit = False
-    _supervised_apply_agent_cls()(_api_settings().resolved_storage_root).close(task.id)
-    db.add(
-        AgentRun(
-            agent_name="Supervised Apply",
-            input_summary=f"task_id={task.id}, job_id={job.id}",
-            output_summary="User marked application as submitted.",
-            status="submitted_by_user",
-        )
+    application = _record_apply_task_submitted(
+        db,
+        task=task,
+        user=user,
+        job=job,
+        message="User confirmed the application was submitted manually.",
+        output_summary="User marked application as submitted.",
     )
     db.commit()
     return {"task": _apply_queue_task_payload(db, task), "application_id": application.id, "status": application.status, "auto_submit": False}

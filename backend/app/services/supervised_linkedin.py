@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from app.services.browser_config import resolve_apply_browser
 from app.services.linkedin_assist import LinkedInSearchPlan
 from app.services.text import extract_keywords
 
@@ -80,10 +81,13 @@ class SupervisedLinkedInImporter:
 
         try:
             with sync_playwright() as p:
+                browser_config = resolve_apply_browser()
                 browser = p.chromium.launch(
                     headless=False,
                     args=["--disable-blink-features=AutomationControlled"],
+                    **browser_config.kwargs(),
                 )
+                steps.append(f"Launched {browser_config.display_name} for supervised LinkedIn import.")
                 context = None
                 try:
                     context_options = {

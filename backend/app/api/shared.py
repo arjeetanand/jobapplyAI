@@ -752,6 +752,7 @@ def _apply_queue_task_payload(db: Session, task: ApplyQueueTask) -> dict:
             "company": job.company if job else "",
             "location": job.location if job else None,
             "job_url": job.job_url if job else "",
+            "apply_url": job.apply_url if job else None,
             "match_score": job.match_score if job else None,
             "experience_required": _job_experience_requirement(job).label if job else None,
             "experience_fit": _experience_requirement_payload(db.get(User, task.user_id), job) if job else None,

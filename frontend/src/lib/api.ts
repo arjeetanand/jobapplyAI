@@ -297,6 +297,7 @@ export type ApplyQueueTask = {
     company: string;
     location: string | null;
     job_url: string;
+    apply_url?: string | null;
     match_score: number | null;
     experience_required?: string | null;
     experience_fit?: ExperienceFit | null;
@@ -627,6 +628,8 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     ),
   applyQueue: () => request<{ tasks: ApplyQueueTask[]; auto_submit: false }>("/apply-queue"),
+  resetApplyBrowser: () =>
+    request<{ status: string; message: string; auto_submit: false }>("/apply-queue/browser/reset", { method: "POST" }),
   applyTaskDebug: (taskId: number) => request<ApplyTaskDebug>(`/apply-queue/${taskId}/debug`),
   startApplyTask: (taskId: number) =>
     request<{

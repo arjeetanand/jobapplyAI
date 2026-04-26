@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="mark">SA</div>
+        <div>
+          <h1>SeekApply Assist</h1>
+          <p>Fill known fields, then pause before submit.</p>
+        </div>
+      </header>
+
+      <label>
+        Backend URL
+        <input id="apiUrl" value="http://127.0.0.1:8000" />
+      </label>
+
+      <button id="fill">Autofill Current Page</button>
+      <button id="save" class="secondary">Save Backend URL</button>
+
+      <section id="status">Open a job application page, then click Autofill.</section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

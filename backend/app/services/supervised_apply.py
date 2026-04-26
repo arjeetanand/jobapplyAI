@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.models.entities import ApplicationAnswer, Job, User
+from app.services.browser_config import resolve_apply_browser
 from app.services.text import normalize
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,9 @@ class SupervisedLinkedInApplyAgent:
                 action_required="Install Playwright and Chromium, then retry.",
             )
 
+        if self.__class__._active and not self.__class__._active_is_live():
+            self.__class__._close_active_on_worker()
+
         if self.__class__._active and self.__class__._active.get("task_id") != task_id:
             return SupervisedApplyResult(
                 status="failed",
@@ -99,9 +103,11 @@ class SupervisedLinkedInApplyAgent:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            browser_config = resolve_apply_browser()
             resumed_active_browser = bool(self.__class__._active and self.__class__._active.get("task_id") == task_id)
             if not self.__class__._active:
                 playwright = sync_playwright().start()
+                launch_options = browser_config.kwargs()
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.profile_dir),
                     headless=False,
@@ -112,6 +118,7 @@ class SupervisedLinkedInApplyAgent:
                     ),
                     accept_downloads=True,
                     args=["--disable-blink-features=AutomationControlled"],
+                    **launch_options,
                 )
                 page = context.pages[0] if context.pages else context.new_page()
                 self.__class__._active = {
@@ -120,12 +127,15 @@ class SupervisedLinkedInApplyAgent:
                     "context": context,
                     "page": page,
                     "state_path": self.state_path,
+                    "browser": browser_config.display_name,
                 }
+                steps.append(f"Launched {browser_config.display_name} with SeekApply's saved apply profile.")
             else:
                 context = self.__class__._active["context"]
                 page = self.__class__._active["page"]
+                steps.append(f"Reusing active {self.__class__._active.get('browser') or 'browser'} session.")
 
-            start_url = job.job_url or job.apply_url
+            start_url = (job.job_url or job.apply_url) if is_linkedin else (job.apply_url or job.job_url)
             if resumed_active_browser and (page.url or "").lower().startswith(("http://", "https://")):
                 steps.append(f"Resuming visible browser at {page.url}.")
             else:
@@ -160,6 +170,7 @@ class SupervisedLinkedInApplyAgent:
                 "unanswered_questions": [],
                 "final_submit_detected": False,
                 "session_profile": str(self.profile_dir),
+                "browser": self.__class__._active.get("browser") if self.__class__._active else browser_config.display_name,
                 "mode": "linkedin_easy_apply" if is_linkedin else "external_site",
             }
 
@@ -217,7 +228,11 @@ class SupervisedLinkedInApplyAgent:
                 )
 
             if is_linkedin:
-                easy_apply = self._click_easy_apply(page, wait_seconds=min(wait_seconds, 30))
+                easy_apply = self._click_easy_apply(page, wait_seconds=min(wait_seconds, 30), context=context)
+                easy_apply_page = easy_apply.pop("_page", None) if isinstance(easy_apply, dict) else None
+                if easy_apply_page:
+                    page = easy_apply_page
+                    self.__class__._active["page"] = page
                 fill_report["easy_apply_detection"] = easy_apply
             else:
                 easy_apply = {"clicked": False, "reason": "not_linkedin_job"}
@@ -227,6 +242,26 @@ class SupervisedLinkedInApplyAgent:
                 steps.append(f"Opened the LinkedIn apply flow from: {clicked_text}.")
                 page.wait_for_timeout(2200)
                 if not self._application_form_present(page) and not self._final_submit_visible(page):
+                    continued_page = self._click_external_continue(page, steps, context=context)
+                    if continued_page:
+                        page = continued_page
+                        self.__class__._active["page"] = page
+                    if "linkedin.com" not in (page.url or "").lower():
+                        fill_report["mode"] = "external_from_linkedin"
+                        return self._fill_supervised_form(
+                            page=page,
+                            user=user,
+                            resume_path=resume_path,
+                            answer_lookup=answer_lookup,
+                            steps=steps,
+                            fill_report=fill_report,
+                            final_action_label="Review the visible external application form, submit manually, then mark submitted in SeekApply.",
+                            unsupported_message="Opened the external application site, but some steps need manual review.",
+                            unsupported_error="External portal controls vary; finish any unsupported fields in the visible browser.",
+                            next_step_label="Advanced to the next external application step.",
+                            context=context,
+                            allow_manual_finish=True,
+                        )
                     fill_report.update(self._page_snapshot(page))
                     fill_report["manual_review_reason"] = (
                         "SeekApply clicked the visible LinkedIn Apply button, but no Easy Apply form appeared. "
@@ -371,11 +406,61 @@ class SupervisedLinkedInApplyAgent:
         cls._executor.submit(cls._close_on_worker, task_id).result()
 
     @classmethod
-    def _close_on_worker(cls, task_id: int | None = None) -> None:
+    def active_summary(cls) -> dict:
+        return cls._executor.submit(cls._active_summary_on_worker).result()
+
+    @classmethod
+    def _active_summary_on_worker(cls) -> dict:
         active = cls._active
         if not active:
+            return {"live": False}
+        if not cls._active_is_live():
+            cls._close_active_on_worker()
+            return {"live": False, "released": True, "reason": "stale_browser"}
+
+        page = active.get("page")
+        summary = {
+            "live": True,
+            "task_id": active.get("task_id"),
+            "browser": active.get("browser"),
+            "url": getattr(page, "url", "") if page else "",
+            "submission_success": False,
+            "final_submit_visible": False,
+            "application_form_present": False,
+        }
+        if not page:
+            return summary
+
+        try:
+            title = page.title()
+            if title:
+                summary["title"] = title
+        except Exception:
+            pass
+        try:
+            summary["submission_success"] = cls._submission_success_visible(page)
+        except Exception:
+            summary["submission_success"] = False
+        try:
+            summary["final_submit_visible"] = cls._final_submit_visible(page)
+        except Exception:
+            summary["final_submit_visible"] = False
+        try:
+            summary["application_form_present"] = cls._application_form_present(page)
+        except Exception:
+            summary["application_form_present"] = False
+        return summary
+
+    @classmethod
+    def _close_on_worker(cls, task_id: int | None = None) -> None:
+        if task_id is not None and cls._active and cls._active.get("task_id") != task_id:
             return
-        if task_id is not None and active.get("task_id") != task_id:
+        cls._close_active_on_worker()
+
+    @classmethod
+    def _close_active_on_worker(cls) -> None:
+        active = cls._active
+        if not active:
             return
         context = active.get("context")
         try:
@@ -394,6 +479,27 @@ class SupervisedLinkedInApplyAgent:
         except Exception:
             pass
         cls._active = None
+
+    @classmethod
+    def _active_is_live(cls) -> bool:
+        active = cls._active
+        if not active:
+            return False
+        page = active.get("page")
+        context = active.get("context")
+        try:
+            if page is not None and hasattr(page, "is_closed") and page.is_closed():
+                return False
+            pages = getattr(context, "pages", None)
+            if pages is not None:
+                live_pages = [item for item in pages if not (hasattr(item, "is_closed") and item.is_closed())]
+                if not live_pages:
+                    return False
+                if page not in live_pages:
+                    active["page"] = live_pages[-1]
+        except Exception:
+            return False
+        return True
 
     def _save_state(self, context) -> None:
         try:
@@ -462,6 +568,147 @@ class SupervisedLinkedInApplyAgent:
         except Exception:
             return {}
 
+    @staticmethod
+    def _debug_value(value, *, depth: int = 0):
+        if depth > 4:
+            return str(value)[:500]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, list):
+            return [SupervisedLinkedInApplyAgent._debug_value(item, depth=depth + 1) for item in value[:30]]
+        if isinstance(value, tuple):
+            return [SupervisedLinkedInApplyAgent._debug_value(item, depth=depth + 1) for item in value[:30]]
+        if isinstance(value, dict):
+            clean = {}
+            for key, item in list(value.items())[:60]:
+                if key in {"page", "_page", "context", "playwright"}:
+                    continue
+                clean[str(key)] = SupervisedLinkedInApplyAgent._debug_value(item, depth=depth + 1)
+            return clean
+        return str(value)[:500]
+
+    @staticmethod
+    def _record_automation_debug(fill_report: dict, event: str, data: dict | None = None) -> None:
+        entries = fill_report.setdefault("automation_debug", [])
+        entry = {
+            "event": event,
+            "data": SupervisedLinkedInApplyAgent._debug_value(data or {}),
+        }
+        entries.append(entry)
+        if len(entries) > 80:
+            del entries[:-80]
+        logger.info("Apply automation debug: %s %s", event, entry["data"])
+
+    @staticmethod
+    def _automation_dom_snapshot(page) -> dict:
+        try:
+            snapshot = page.evaluate(
+                """
+                () => {
+                  function textFor(el) {
+                    const id = el.getAttribute('id');
+                    const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                    const wrapper = el.closest('label, fieldset, .jobs-easy-apply-form-section__grouping, .fb-dash-form-element, .jobs-document-upload, .jobs-resume-picker, .form-group, .field, footer, .artdeco-modal__actionbar');
+                    return [
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('title'),
+                      el.getAttribute('data-control-name'),
+                      el.getAttribute('placeholder'),
+                      el.getAttribute('name'),
+                      el.getAttribute('accept'),
+                      el.value,
+                      label && label.innerText,
+                      el.innerText,
+                      wrapper && wrapper.innerText,
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                  }
+                  function visible(el) {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && rect.width > 0
+                      && rect.height > 0
+                      && !el.closest('[aria-hidden="true"]');
+                  }
+                  function enabled(el) {
+                    return !(el.disabled
+                      || el.getAttribute('disabled') !== null
+                      || el.getAttribute('aria-disabled') === 'true'
+                      || /disabled/i.test(String(el.className || '')));
+                  }
+                  function buttonPayload(el) {
+                    const rect = el.getBoundingClientRect();
+                    const text = textFor(el).slice(0, 180);
+                    return {
+                      text,
+                      enabled: enabled(el),
+                      tag: el.tagName.toLowerCase(),
+                      type: (el.getAttribute('type') || '').toLowerCase(),
+                      role: el.getAttribute('role') || '',
+                      aria_disabled: el.getAttribute('aria-disabled') || '',
+                      data_control_name: el.getAttribute('data-control-name') || '',
+                      top: Math.round(rect.top),
+                      left: Math.round(rect.left),
+                    };
+                  }
+                  function inputPayload(el) {
+                    const rect = el.getBoundingClientRect();
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    return {
+                      label: textFor(el).slice(0, 180),
+                      type,
+                      tag: el.tagName.toLowerCase(),
+                      required: Boolean(el.required || el.getAttribute('aria-required') === 'true'),
+                      disabled: !enabled(el),
+                      value_present: type === 'file' ? false : Boolean((el.value || '').trim()),
+                      accept: el.getAttribute('accept') || '',
+                      top: Math.round(rect.top),
+                    };
+                  }
+                  const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal, [role="dialog"]');
+                  const root = modal || document;
+                  const buttons = Array.from(root.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a[href], label'))
+                    .filter(visible)
+                    .map(buttonPayload)
+                    .filter((item) => item.text)
+                    .slice(0, 50);
+                  const next_candidates = buttons.filter((item) => /(next|continue|review|save and continue)/i.test(item.text)
+                    && !/(submit|send|finish|cancel|close|discard|withdraw)/i.test(item.text));
+                  const submit_candidates = buttons.filter((item) => /(submit application|submit|send application|finish application)/i.test(item.text));
+                  const resume_buttons = buttons.filter((item) => /(resume|cv|upload|attach|choose|select)/i.test(item.text)
+                    && !/(delete|remove|preview|download)/i.test(item.text));
+                  const inputs = Array.from(root.querySelectorAll('input:not([type="hidden"]), textarea, select, [contenteditable="true"], [role="combobox"]'))
+                    .filter(visible)
+                    .map(inputPayload)
+                    .slice(0, 40);
+                  const file_inputs = Array.from(root.querySelectorAll('input[type="file"]'))
+                    .filter(visible)
+                    .map(inputPayload)
+                    .slice(0, 10);
+                  return {
+                    title: document.title || '',
+                    url: location.href,
+                    modal_present: Boolean(modal),
+                    modal_text_head: modal && modal.innerText ? modal.innerText.replace(/\\s+/g, ' ').slice(0, 700) : '',
+                    buttons,
+                    next_candidates,
+                    submit_candidates,
+                    resume_buttons,
+                    inputs,
+                    file_inputs,
+                    visible_file_inputs: file_inputs.length,
+                    form_count: root.querySelectorAll('form').length,
+                  };
+                }
+                """
+            )
+            return snapshot if isinstance(snapshot, dict) else {}
+        except Exception as exc:
+            return {"error": str(exc)}
+
     def _wait_for_login(self, page, job_url: str, wait_seconds: int, steps: list[str]) -> bool:
         steps.append("Application site asked for login or verification; waiting in the visible browser.")
         deadline = time.monotonic() + max(wait_seconds, 15)
@@ -494,12 +741,32 @@ class SupervisedLinkedInApplyAgent:
         context,
         allow_manual_finish: bool = False,
     ) -> SupervisedApplyResult:
-        for _ in range(10):
+        fill_report.setdefault("automation_debug", [])
+        for iteration in range(10):
             fill_report["current_url"] = page.url
             fill_report.update(self._page_snapshot(page))
+            self._record_automation_debug(
+                fill_report,
+                "form_iteration_start",
+                {
+                    "iteration": iteration + 1,
+                    "url": page.url,
+                    "page_snapshot": self._page_snapshot(page),
+                    "dom_snapshot": self._automation_dom_snapshot(page),
+                },
+            )
             if self._needs_user_login(page):
                 logged_in = self._wait_for_login(page, page.url or "", 90, steps)
                 if not logged_in:
+                    self._record_automation_debug(
+                        fill_report,
+                        "login_required",
+                        {
+                            "iteration": iteration + 1,
+                            "url": page.url,
+                            "dom_snapshot": self._automation_dom_snapshot(page),
+                        },
+                    )
                     self._save_state(context)
                     return SupervisedApplyResult(
                         status="needs_login",
@@ -509,6 +776,15 @@ class SupervisedLinkedInApplyAgent:
                         action_required="Complete login or verification in the visible browser, then click Resume in SeekApply.",
                     )
             resume_state = self._ensure_resume_selected(page, resume_path)
+            self._record_automation_debug(
+                fill_report,
+                "resume_check",
+                {
+                    "iteration": iteration + 1,
+                    "resume_state": resume_state,
+                    "dom_snapshot": self._automation_dom_snapshot(page),
+                },
+            )
             fill_report["resume_uploaded"] = fill_report["resume_uploaded"] or bool(resume_state.get("uploaded"))
             fill_report["resume_selected"] = fill_report["resume_selected"] or bool(resume_state.get("selected"))
             resume_message = resume_state.get("message")
@@ -520,6 +796,18 @@ class SupervisedLinkedInApplyAgent:
             fill_report["profile_fields_filled"] += filled["profile_fields_filled"]
             fill_report["answers_filled"] += filled["answers_filled"] + custom_choice_filled["answers_filled"]
             fill_report["profile_fields_filled"] += custom_choice_filled["profile_fields_filled"]
+            self._record_automation_debug(
+                fill_report,
+                "field_fill",
+                {
+                    "iteration": iteration + 1,
+                    "profile_fields_filled_now": filled["profile_fields_filled"] + custom_choice_filled["profile_fields_filled"],
+                    "answers_filled_now": filled["answers_filled"] + custom_choice_filled["answers_filled"],
+                    "profile_fields_filled_total": fill_report["profile_fields_filled"],
+                    "answers_filled_total": fill_report["answers_filled"],
+                    "dom_snapshot": self._automation_dom_snapshot(page),
+                },
+            )
             previous_matched = set(fill_report.get("kb_matched_questions") or [])
             question_inventory = self._question_inventory(page, user, answer_lookup)
             for key in ["questions_seen", "kb_matched_questions", "unanswered_questions"]:
@@ -532,6 +820,16 @@ class SupervisedLinkedInApplyAgent:
                 )
             missing_questions = self._missing_questions(page, answer_lookup, user=user)
             if missing_questions:
+                self._record_automation_debug(
+                    fill_report,
+                    "missing_questions",
+                    {
+                        "iteration": iteration + 1,
+                        "missing_questions": missing_questions,
+                        "question_inventory": question_inventory,
+                        "dom_snapshot": self._automation_dom_snapshot(page),
+                    },
+                )
                 self._save_state(context)
                 return SupervisedApplyResult(
                     status="needs_answers",
@@ -543,6 +841,14 @@ class SupervisedLinkedInApplyAgent:
                 )
             if self._final_submit_visible(page):
                 fill_report["final_submit_detected"] = True
+                self._record_automation_debug(
+                    fill_report,
+                    "final_submit_detected",
+                    {
+                        "iteration": iteration + 1,
+                        "dom_snapshot": self._automation_dom_snapshot(page),
+                    },
+                )
                 self._save_state(context)
                 return SupervisedApplyResult(
                     status="ready_for_submit",
@@ -564,15 +870,55 @@ class SupervisedLinkedInApplyAgent:
                     page.wait_for_timeout(1500)
                     continue
             next_result = self._click_next_step(page, context=context)
+            self._record_automation_debug(
+                fill_report,
+                "next_click_attempt",
+                {
+                    "iteration": iteration + 1,
+                    "next_result": next_result,
+                    "dom_snapshot": self._automation_dom_snapshot(next_result.get("page") or page),
+                },
+            )
+
             if not next_result.get("clicked"):
                 fill_report["last_click_blocker"] = next_result.get("reason") or "no_next_or_continue_button"
+
                 if next_result.get("buttons_seen"):
                     fill_report["buttons_seen"] = next_result["buttons_seen"]
+
+                if next_result.get("disabled_buttons_seen"):
+                    fill_report["disabled_buttons_seen"] = next_result["disabled_buttons_seen"]
+
+                if next_result.get("error"):
+                    fill_report["last_click_error"] = next_result["error"]
+
+                self._record_automation_debug(
+                    fill_report,
+                    "next_click_blocked",
+                    {
+                        "iteration": iteration + 1,
+                        "reason": fill_report["last_click_blocker"],
+                        "buttons_seen": next_result.get("buttons_seen") or [],
+                        "disabled_buttons_seen": next_result.get("disabled_buttons_seen") or [],
+                        "error": next_result.get("error"),
+                    },
+                )
                 break
             page = next_result.get("page") or page
             if self.__class__._active:
                 self.__class__._active["page"] = page
             fill_report["easy_apply_steps_completed"] += 1
+            self._record_automation_debug(
+                fill_report,
+                "next_clicked",
+                {
+                    "iteration": iteration + 1,
+                    "button_text": next_result.get("text"),
+                    "easy_apply_steps_completed": fill_report["easy_apply_steps_completed"],
+                    "url_after_click": page.url,
+                    "dom_snapshot": self._automation_dom_snapshot(page),
+                },
+            )
             steps.append(
                 f"{next_step_label}"
                 f"{' Button: ' + next_result.get('text') if next_result.get('text') else ''}"
@@ -581,6 +927,11 @@ class SupervisedLinkedInApplyAgent:
 
         if self._final_submit_visible(page):
             fill_report["final_submit_detected"] = True
+            self._record_automation_debug(
+                fill_report,
+                "final_submit_detected_after_loop",
+                {"dom_snapshot": self._automation_dom_snapshot(page)},
+            )
             self._save_state(context)
             return SupervisedApplyResult(
                 status="ready_for_submit",
@@ -608,6 +959,15 @@ class SupervisedLinkedInApplyAgent:
                     "The portal may require a manual click, login, or a custom widget that needs review."
                 )
             fill_report["manual_review_reason"] = unsupported_error
+            self._record_automation_debug(
+                fill_report,
+                "manual_review_required",
+                {
+                    "reason": unsupported_error,
+                    "message": message,
+                    "dom_snapshot": self._automation_dom_snapshot(page),
+                },
+            )
             return SupervisedApplyResult(
                 status="needs_user_action",
                 message=message or unsupported_message,
@@ -621,6 +981,16 @@ class SupervisedLinkedInApplyAgent:
         if total_filled or resume_uploaded or fill_report.get("mode") == "linkedin_easy_apply":
             self._save_state(context)
             fill_report["manual_review_reason"] = unsupported_error
+            self._record_automation_debug(
+                fill_report,
+                "unsupported_form_state",
+                {
+                    "reason": unsupported_error,
+                    "total_filled": total_filled,
+                    "resume_uploaded": resume_uploaded,
+                    "dom_snapshot": self._automation_dom_snapshot(page),
+                },
+            )
             return SupervisedApplyResult(
                 status="needs_user_action",
                 message=unsupported_message,
@@ -629,6 +999,14 @@ class SupervisedLinkedInApplyAgent:
                 errors=[unsupported_error],
                 action_required="Continue in the visible browser or click Resume after handling the unsupported field.",
             )
+        self._record_automation_debug(
+            fill_report,
+            "automation_failed",
+            {
+                "reason": unsupported_error,
+                "dom_snapshot": self._automation_dom_snapshot(page),
+            },
+        )
         return SupervisedApplyResult(
             status="failed",
             message=unsupported_message,
@@ -642,13 +1020,20 @@ class SupervisedLinkedInApplyAgent:
     def _open_external_apply(page, job: Job, steps: list[str], context=None):
         apply_url = (getattr(job, "apply_url", None) or "").strip()
         current_url = (page.url or job.job_url or "").strip()
-        if apply_url and apply_url != current_url:
+        direct_apply_url_first = SupervisedLinkedInApplyAgent._should_open_apply_url_directly(
+            apply_url,
+            current_url=current_url,
+            job_url=getattr(job, "job_url", None),
+        )
+        if direct_apply_url_first and "linkedin." not in current_url.lower():
             try:
                 page.goto(apply_url, wait_until="domcontentloaded", timeout=45_000)
                 steps.append(f"Opened external apply URL: {apply_url}.")
                 return page
             except Exception:
                 steps.append("External apply URL could not be opened directly; trying the visible Apply button.")
+        elif apply_url and not direct_apply_url_first and SupervisedLinkedInApplyAgent._is_linkedin_job_url(apply_url):
+            steps.append("Captured apply_url is still a LinkedIn job page, so using the visible Apply button instead.")
 
         try:
             candidate = page.evaluate(
@@ -699,6 +1084,10 @@ class SupervisedLinkedInApplyAgent:
                   if (!target) return {found: false, visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10)};
                   document.querySelectorAll('[data-seekapply-external-target="1"]').forEach((el) => el.removeAttribute('data-seekapply-external-target'));
                   target.setAttribute('data-seekapply-external-target', '1');
+                  if (target.tagName === 'A' && target.href && !/^javascript:|^#/i.test(target.href)) {
+                    target.setAttribute('target', '_blank');
+                    target.setAttribute('rel', 'noopener noreferrer');
+                  }
                   return {
                     found: true,
                     text: textFor(target).slice(0, 160),
@@ -713,41 +1102,99 @@ class SupervisedLinkedInApplyAgent:
                     steps.append(f"No primary external Apply button was clickable. Visible apply actions: {', '.join(candidate['visible_apply_buttons'][:6])}.")
                 return None
 
+            before_url = page.url or ""
             href = str(candidate.get("href") or "")
-            if href and not href.lower().startswith(("javascript:", "#")):
-                page.goto(href, wait_until="domcontentloaded", timeout=45_000)
-                steps.append(f"Opened external apply link: {href}.")
-                continued_page = SupervisedLinkedInApplyAgent._click_external_continue(page, steps, context=context)
-                return continued_page or page
-
-            before_pages = set(context.pages) if context else set()
-            clicked_page = page
-            try:
-                if context:
-                    try:
-                        with context.expect_page(timeout=8000) as page_info:
-                            page.locator('[data-seekapply-external-target="1"]').first.click(timeout=6000)
-                        clicked_page = page_info.value
-                        clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
-                    except Exception:
-                        page.locator('[data-seekapply-external-target="1"]').first.click(timeout=6000)
-                        page.wait_for_timeout(2500)
-                        new_pages = [item for item in context.pages if item not in before_pages]
-                        if new_pages:
-                            clicked_page = new_pages[-1]
-                            clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
-                else:
-                    page.locator('[data-seekapply-external-target="1"]').first.click(timeout=6000)
-                    page.wait_for_timeout(2500)
+            click_result = SupervisedLinkedInApplyAgent._click_marked_target(
+                page,
+                '[data-seekapply-external-target="1"]',
+                context=context,
+                timeout=8000,
+            )
+            if click_result.get("clicked"):
+                clicked_page = click_result.get("page") or page
                 steps.append(f"Clicked external Apply button: {candidate.get('text') or 'Apply'}.")
                 continued_page = SupervisedLinkedInApplyAgent._click_external_continue(clicked_page, steps, context=context)
-                return continued_page or clicked_page
-            except Exception as exc:
-                steps.append(f"External Apply button click failed: {exc}")
-                return None
+                clicked_page = continued_page or clicked_page
+                current_after_click = clicked_page.url or ""
+                form_present = False
+                final_submit_visible = False
+                try:
+                    form_present = SupervisedLinkedInApplyAgent._application_form_present(clicked_page)
+                except Exception:
+                    form_present = False
+                try:
+                    final_submit_visible = SupervisedLinkedInApplyAgent._final_submit_visible(clicked_page)
+                except Exception:
+                    final_submit_visible = False
+                if (
+                    current_after_click
+                    and current_after_click != before_url
+                ) or form_present or final_submit_visible:
+                    return clicked_page
+
+            if direct_apply_url_first:
+                try:
+                    page.goto(apply_url, wait_until="domcontentloaded", timeout=45_000)
+                    steps.append(f"Opened captured external apply URL directly: {apply_url}.")
+                    continued_page = SupervisedLinkedInApplyAgent._click_external_continue(page, steps, context=context)
+                    return continued_page or page
+                except Exception as exc:
+                    steps.append(f"Captured external apply URL navigation failed: {exc}")
+
+            if href and not href.lower().startswith(("javascript:", "#")) and not SupervisedLinkedInApplyAgent._is_linkedin_job_url(href):
+                try:
+                    page.goto(href, wait_until="domcontentloaded", timeout=45_000)
+                    steps.append(f"Opened external apply link directly: {href}.")
+                    continued_page = SupervisedLinkedInApplyAgent._click_external_continue(page, steps, context=context)
+                    return continued_page or page
+                except Exception as exc:
+                    steps.append(f"External apply link navigation failed: {exc}")
+
+            if click_result.get("clicked"):
+                return click_result.get("page") or page
+            if click_result.get("error"):
+                steps.append(f"External Apply button click failed: {click_result.get('error')}")
+            return None
         except Exception as exc:
             steps.append(f"External Apply detection failed: {exc}")
             return None
+
+    @staticmethod
+    def _is_linkedin_job_url(url: str | None) -> bool:
+        value = str(url or "").lower()
+        return "linkedin." in value and "/jobs/view/" in value
+
+    @staticmethod
+    def _linkedin_job_id_from_url(url: str | None) -> str | None:
+        match = re.search(r"/jobs/view/(\d+)", str(url or ""))
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _same_linkedin_job_url(left: str | None, right: str | None) -> bool:
+        if not (SupervisedLinkedInApplyAgent._is_linkedin_job_url(left) and SupervisedLinkedInApplyAgent._is_linkedin_job_url(right)):
+            return False
+        left_id = SupervisedLinkedInApplyAgent._linkedin_job_id_from_url(left)
+        right_id = SupervisedLinkedInApplyAgent._linkedin_job_id_from_url(right)
+        return bool(left_id and right_id and left_id == right_id)
+
+    @staticmethod
+    def _should_open_apply_url_directly(apply_url: str | None, *, current_url: str | None, job_url: str | None) -> bool:
+        if not apply_url:
+            return False
+        apply_clean = str(apply_url).strip()
+        current_clean = str(current_url or "").strip()
+        job_clean = str(job_url or "").strip()
+        if apply_clean == current_clean:
+            return False
+        if SupervisedLinkedInApplyAgent._is_linkedin_job_url(apply_clean):
+            if (
+                SupervisedLinkedInApplyAgent._is_linkedin_job_url(current_clean)
+                or SupervisedLinkedInApplyAgent._is_linkedin_job_url(job_clean)
+                or SupervisedLinkedInApplyAgent._same_linkedin_job_url(apply_clean, current_clean)
+                or SupervisedLinkedInApplyAgent._same_linkedin_job_url(apply_clean, job_clean)
+            ):
+                return False
+        return True
 
     @staticmethod
     def _click_external_continue(page, steps: list[str], context=None):
@@ -790,7 +1237,7 @@ class SupervisedLinkedInApplyAgent:
                 page.goto(href, wait_until="domcontentloaded", timeout=45_000)
                 steps.append(f"Opened LinkedIn external handoff link: {href}.")
                 return page
-            before_pages = set(context.pages) if context else set()
+            before_pages = list(context.pages) if context else []
             if context:
                 try:
                     with context.expect_page(timeout=6000) as page_info:
@@ -802,7 +1249,11 @@ class SupervisedLinkedInApplyAgent:
                 except Exception:
                     page.locator('[data-seekapply-continue-target="1"]').first.click(timeout=5000)
                     page.wait_for_timeout(1800)
-                    new_pages = [item for item in context.pages if item not in before_pages]
+                    new_pages = [
+                        item
+                        for item in context.pages
+                        if not any(item is existing for existing in before_pages)
+                    ]
                     if new_pages:
                         return new_pages[-1]
             else:
@@ -891,114 +1342,429 @@ class SupervisedLinkedInApplyAgent:
         except Exception:
             return False
 
+    # @staticmethod
+    # def _click_easy_apply(page, wait_seconds: int = 15, context=None) -> dict:
+    #     deadline = time.monotonic() + max(3, min(wait_seconds, 30))
+    #     last_result: dict = {"clicked": False, "reason": "linkedin_apply_not_found", "visible_apply_buttons": []}
+    #     while time.monotonic() < deadline:
+    #         before_pages = list(context.pages) if context else []
+    #         result = page.evaluate(
+    #             """
+    #             () => {
+    #               // easy apply detector: keep this literal for lightweight tests and trace readability.
+    #               // LinkedIn sometimes labels Easy Apply as a blue "in Apply" button with no "Easy" text.
+    #               const PRIMARY_TOP_LIMIT = Math.max(760, Math.min(window.innerHeight + 80, 980));
+    #               function textFor(el) {
+    #                 const direct = [
+    #                   el.getAttribute('aria-label'),
+    #                   el.getAttribute('title'),
+    #                   el.getAttribute('data-control-name'),
+    #                   el.getAttribute('value'),
+    #                   el.innerText,
+    #                   el.textContent,
+    #                 ].filter(Boolean).join(' ');
+    #                 return direct.replace(/\\s+/g, ' ').trim();
+    #               }
+    #               function compactText(el) {
+    #                 return textFor(el).slice(0, 180);
+    #               }
+    #               function norm(value) {
+    #                 return (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    #               }
+    #               function visible(el) {
+    #                 const style = window.getComputedStyle(el);
+    #                 const rect = el.getBoundingClientRect();
+    #                 return style.visibility !== 'hidden'
+    #                   && style.display !== 'none'
+    #                   && rect.width > 0
+    #                   && rect.height > 0
+    #                   && rect.bottom >= -10
+    #                   && rect.top <= window.innerHeight + 120
+    #                   && !el.closest('[aria-hidden="true"]');
+    #               }
+    #               function enabled(el) {
+    #                 return !(el.disabled
+    #                   || el.getAttribute('disabled') !== null
+    #                   || el.getAttribute('aria-disabled') === 'true'
+    #                   || /disabled/i.test(el.className || ''));
+    #               }
+    #               function isPrimaryJobArea(el) {
+    #                 const rect = el.getBoundingClientRect();
+    #                 const topCard = el.closest(
+    #                   '.jobs-unified-top-card, .job-details-jobs-unified-top-card, .jobs-details-top-card, .top-card-layout'
+    #                 );
+    #                 if (topCard) return true;
+    #                 return rect.top >= 0
+    #                   && rect.top <= PRIMARY_TOP_LIMIT
+    #                   && rect.left < window.innerWidth * 0.72
+    #                   && !el.closest('aside, .jobs-details__right-rail, .job-card-container, .scaffold-layout__list');
+    #               }
+    #               function isLinkedInApplyButton(el) {
+    #                 const text = textFor(el);
+    #                 const n = norm(text);
+    #                 if (/company\\s+website|external\\s+apply|apply\\s+on\\s+company/i.test(text)) return false;
+    #                 const className = String(el.className || '');
+    #                 const control = String(el.getAttribute('data-control-name') || '');
+    #                 const looksLinkedInApply =
+    #                   /easy\\s*apply/i.test(text)
+    #                   || /apply\\s+to\\s+(this\\s+job|.+\\s+at\\s+)/i.test(text)
+    #                   || /linkedin\\s+apply|apply\\s+linkedin/i.test(text)
+    #                   || /jobs-apply-button/i.test(className)
+    #                   || /inapply|easyapply|jobdetails.*apply/i.test(control);
+    #                 const primaryApplyText = n === 'apply' || n === 'in apply' || n.startsWith('apply to ');
+    #                 return enabled(el) && isPrimaryJobArea(el) && (looksLinkedInApply || primaryApplyText);
+    #               }
+    #               const candidates = Array.from(document.querySelectorAll(
+    #                 'button, a[href], [role="button"], div[role="button"], span[role="button"], input[type="button"], input[type="submit"]'
+    #               )).filter(visible);
+    #               const visibleApplyButtons = candidates
+    #                 .map(compactText)
+    #                 .filter((text) => /(easy\\s*apply|\\bapply\\b|continue application|company website)/i.test(text))
+    #                 .filter((text) => text.length <= 180);
+    #               const easyApplyButtons = candidates.filter((el) => /easy\\s*apply/i.test(textFor(el)) && enabled(el));
+    #               const linkedinApplyButtons = candidates.filter(isLinkedInApplyButton);
+    #               const target = easyApplyButtons[0] || linkedinApplyButtons[0];
+    #               if (!target) {
+    #                 return {
+    #                   clicked: false,
+    #                   reason: candidates.some((el) => /easy\\s*apply/i.test(textFor(el))) ? 'linkedin_apply_disabled' : 'linkedin_apply_not_found',
+    #                   visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10),
+    #                 };
+    #               }
+    #               target.scrollIntoView({ block: 'center', inline: 'center' });
+    #               target.click();
+    #               return {
+    #                 clicked: true,
+    #                 reason: /easy\\s*apply/i.test(textFor(target)) ? 'clicked_easy_apply' : 'clicked_linkedin_apply_button',
+    #                 clicked_text: compactText(target),
+    #                 visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10),
+    #               };
+    #             }
+    #             """
+    #         )
+    #         if isinstance(result, bool):
+    #             return {"clicked": result, "reason": "legacy_detector", "visible_apply_buttons": []}
+    #         if isinstance(result, dict):
+    #             last_result = result
+    #             if result.get("clicked"):
+    #                 page.wait_for_timeout(1000)
+    #                 if context:
+    #                     new_pages = [
+    #                         item
+    #                         for item in context.pages
+    #                         if not any(item is existing for existing in before_pages)
+    #                     ]
+    #                     if new_pages:
+    #                         new_page = new_pages[-1]
+    #                         try:
+    #                             new_page.wait_for_load_state("domcontentloaded", timeout=45_000)
+    #                         except Exception:
+    #                             pass
+    #                         result["_page"] = new_page
+    #                         result["opened_new_page"] = True
+    #                         result["new_page_url"] = getattr(new_page, "url", "")
+    #                 return result
+    #         page.wait_for_timeout(1000)
+    #     return last_result
     @staticmethod
-    def _click_easy_apply(page, wait_seconds: int = 15) -> dict:
+    def _click_easy_apply(page, wait_seconds: int = 15, context=None) -> dict:
         deadline = time.monotonic() + max(3, min(wait_seconds, 30))
-        last_result: dict = {"clicked": False, "reason": "linkedin_apply_not_found", "visible_apply_buttons": []}
-        while time.monotonic() < deadline:
-            result = page.evaluate(
-                """
-                () => {
-                  // easy apply detector: keep this literal for lightweight tests and trace readability.
-                  // LinkedIn sometimes labels Easy Apply as a blue "in Apply" button with no "Easy" text.
-                  const PRIMARY_TOP_LIMIT = Math.max(760, Math.min(window.innerHeight + 80, 980));
-                  function textFor(el) {
-                    const direct = [
-                      el.getAttribute('aria-label'),
-                      el.getAttribute('title'),
-                      el.getAttribute('data-control-name'),
-                      el.getAttribute('value'),
-                      el.innerText,
-                      el.textContent,
-                    ].filter(Boolean).join(' ');
-                    return direct.replace(/\\s+/g, ' ').trim();
-                  }
-                  function compactText(el) {
-                    return textFor(el).slice(0, 180);
-                  }
-                  function norm(value) {
-                    return (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-                  }
-                  function visible(el) {
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.visibility !== 'hidden'
-                      && style.display !== 'none'
-                      && rect.width > 0
-                      && rect.height > 0
-                      && rect.bottom >= -10
-                      && rect.top <= window.innerHeight + 120
-                      && !el.closest('[aria-hidden="true"]');
-                  }
-                  function enabled(el) {
-                    return !(el.disabled
-                      || el.getAttribute('disabled') !== null
-                      || el.getAttribute('aria-disabled') === 'true'
-                      || /disabled/i.test(el.className || ''));
-                  }
-                  function isPrimaryJobArea(el) {
-                    const rect = el.getBoundingClientRect();
-                    const topCard = el.closest(
-                      '.jobs-unified-top-card, .job-details-jobs-unified-top-card, .jobs-details-top-card, .top-card-layout'
-                    );
-                    if (topCard) return true;
-                    return rect.top >= 0
-                      && rect.top <= PRIMARY_TOP_LIMIT
-                      && rect.left < window.innerWidth * 0.72
-                      && !el.closest('aside, .jobs-details__right-rail, .job-card-container, .scaffold-layout__list');
-                  }
-                  function isLinkedInApplyButton(el) {
-                    const text = textFor(el);
-                    const n = norm(text);
-                    if (/company\\s+website|external\\s+apply|apply\\s+on\\s+company/i.test(text)) return false;
-                    const className = String(el.className || '');
-                    const control = String(el.getAttribute('data-control-name') || '');
-                    const looksLinkedInApply =
-                      /easy\\s*apply/i.test(text)
-                      || /apply\\s+to\\s+(this\\s+job|.+\\s+at\\s+)/i.test(text)
-                      || /linkedin\\s+apply|apply\\s+linkedin/i.test(text)
-                      || /jobs-apply-button/i.test(className)
-                      || /inapply|easyapply|jobdetails.*apply/i.test(control);
-                    const primaryApplyText = n === 'apply' || n === 'in apply' || n.startsWith('apply to ');
-                    return enabled(el) && isPrimaryJobArea(el) && (looksLinkedInApply || primaryApplyText);
-                  }
-                  const candidates = Array.from(document.querySelectorAll(
-                    'button, a[href], [role="button"], div[role="button"], span[role="button"], input[type="button"], input[type="submit"]'
-                  )).filter(visible);
-                  const visibleApplyButtons = candidates
-                    .map(compactText)
-                    .filter((text) => /(easy\\s*apply|\\bapply\\b|continue application|company website)/i.test(text))
-                    .filter((text) => text.length <= 180);
-                  const easyApplyButtons = candidates.filter((el) => /easy\\s*apply/i.test(textFor(el)) && enabled(el));
-                  const linkedinApplyButtons = candidates.filter(isLinkedInApplyButton);
-                  const target = easyApplyButtons[0] || linkedinApplyButtons[0];
-                  if (!target) {
-                    return {
-                      clicked: false,
-                      reason: candidates.some((el) => /easy\\s*apply/i.test(textFor(el))) ? 'linkedin_apply_disabled' : 'linkedin_apply_not_found',
-                      visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10),
-                    };
-                  }
-                  target.scrollIntoView({ block: 'center', inline: 'center' });
-                  target.click();
-                  return {
-                    clicked: true,
-                    reason: /easy\\s*apply/i.test(textFor(target)) ? 'clicked_easy_apply' : 'clicked_linkedin_apply_button',
-                    clicked_text: compactText(target),
-                    visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10),
-                  };
-                }
-                """
-            )
-            if isinstance(result, bool):
-                return {"clicked": result, "reason": "legacy_detector", "visible_apply_buttons": []}
-            if isinstance(result, dict):
-                last_result = result
-                if result.get("clicked"):
-                    return result
-            page.wait_for_timeout(1000)
-        return last_result
+        last_result: dict = {
+            "clicked": False,
+            "reason": "linkedin_apply_not_found",
+            "visible_apply_buttons": [],
+        }
 
+        while time.monotonic() < deadline:
+            before_pages = list(context.pages) if context else []
+
+            try:
+                result = page.evaluate(
+                    """
+                    () => {
+                    // easy apply detector: keep this literal for lightweight tests and trace readability.
+                    // clicked_linkedin_apply_button
+                    const PRIMARY_TOP_LIMIT = Math.max(760, Math.min(window.innerHeight + 80, 980));
+
+                    function textFor(el) {
+                        const direct = [
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.getAttribute('data-control-name'),
+                        el.getAttribute('value'),
+                        el.innerText,
+                        el.textContent,
+                        ].filter(Boolean).join(' ');
+
+                        return direct.replace(/\\s+/g, ' ').trim();
+                    }
+
+                    function compactText(el) {
+                        return textFor(el).slice(0, 180);
+                    }
+
+                    function norm(value) {
+                        return String(value || '')
+                        .toLowerCase()
+                        .replace(/[^a-z0-9]+/g, ' ')
+                        .trim();
+                    }
+
+                    function visible(el) {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+
+                        return style.visibility !== 'hidden'
+                        && style.display !== 'none'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom >= -10
+                        && rect.top <= window.innerHeight + 160
+                        && !el.closest('[aria-hidden="true"]');
+                    }
+
+                    function enabled(el) {
+                        return !(el.disabled
+                        || el.getAttribute('disabled') !== null
+                        || el.getAttribute('aria-disabled') === 'true'
+                        || /disabled/i.test(String(el.className || '')));
+                    }
+
+                    function isPrimaryJobArea(el) {
+                        const rect = el.getBoundingClientRect();
+
+                        const topCard = el.closest(
+                        [
+                            '.jobs-unified-top-card',
+                            '.job-details-jobs-unified-top-card',
+                            '.jobs-details-top-card',
+                            '.top-card-layout',
+                            '.jobs-search__job-details--container',
+                            '.jobs-details',
+                        ].join(',')
+                        );
+
+                        if (topCard) return true;
+
+                        return rect.top >= 0
+                        && rect.top <= PRIMARY_TOP_LIMIT
+                        && rect.left < window.innerWidth * 0.75
+                        && !el.closest(
+                            [
+                            'aside',
+                            '.jobs-details__right-rail',
+                            '.job-card-container',
+                            '.jobs-search-results-list',
+                            '.scaffold-layout__list',
+                            ].join(',')
+                        );
+                    }
+
+                    function isExternalApply(el) {
+                        const text = textFor(el);
+                        const href = el.getAttribute('href') || '';
+
+                        return /company\\s+website|external\\s+apply|apply\\s+on\\s+company|apply\\s+on\\s+.*website/i.test(text)
+                        || /externalApply|offsite|company/i.test(href);
+                    }
+
+                    function isEasyApply(el) {
+                        const text = textFor(el);
+                        const n = norm(text);
+                        const className = String(el.className || '');
+                        const control = String(el.getAttribute('data-control-name') || '');
+
+                        if (!visible(el) || !enabled(el)) return false;
+                        if (!isPrimaryJobArea(el)) return false;
+                        if (isExternalApply(el)) return false;
+
+                        const explicitEasyApply =
+                        /easy\\s*apply/i.test(text)
+                        || /jobs-apply-button/i.test(className)
+                        || /easyapply|easy_apply|inapply/i.test(control);
+
+                        const linkedinApplyText =
+                        /apply\\s+to\\s+(this\\s+job|.+\\s+at\\s+)/i.test(text)
+                        || /linkedin\\s+apply|apply\\s+linkedin/i.test(text);
+
+                        const shortPrimaryApply =
+                        n === 'apply'
+                        || n === 'in apply'
+                        || n === 'continue application';
+
+                        return explicitEasyApply || linkedinApplyText || shortPrimaryApply;
+                    }
+
+                    const candidates = Array.from(document.querySelectorAll(
+                        [
+                        'button',
+                        'a[href]',
+                        '[role="button"]',
+                        'div[role="button"]',
+                        'span[role="button"]',
+                        'input[type="button"]',
+                        'input[type="submit"]'
+                        ].join(',')
+                    )).filter(visible);
+
+                    const visibleApplyButtons = candidates
+                        .map(compactText)
+                        .filter((text) => /(easy\\s*apply|\\bapply\\b|continue application|company website)/i.test(text))
+                        .filter((text) => text.length <= 180);
+
+                    const targets = candidates.filter(isEasyApply);
+
+                    const target =
+                        targets.find((el) => /easy\\s*apply/i.test(textFor(el)))
+                        || targets[0];
+
+                    document
+                        .querySelectorAll('[data-seekapply-easy-apply-target="1"]')
+                        .forEach((el) => el.removeAttribute('data-seekapply-easy-apply-target'));
+
+                    if (!target) {
+                        return {
+                        clicked: false,
+                        reason: candidates.some((el) => /easy\\s*apply/i.test(textFor(el)))
+                            ? 'linkedin_apply_disabled'
+                            : 'linkedin_apply_not_found',
+                        visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10),
+                        };
+                    }
+
+                    target.setAttribute('data-seekapply-easy-apply-target', '1');
+                    target.scrollIntoView({ block: 'center', inline: 'center' });
+
+                    return {
+                        clicked: true,
+                        reason: /easy\\s*apply/i.test(textFor(target))
+                        ? 'found_easy_apply'
+                        : 'found_linkedin_apply_button',
+                        clicked_text: compactText(target),
+                        visible_apply_buttons: Array.from(new Set(visibleApplyButtons)).slice(0, 10),
+                    };
+                    }
+                    """
+                )
+            except Exception as exc:
+                last_result = {
+                    "clicked": False,
+                    "reason": f"easy_apply_detection_error: {exc}",
+                    "visible_apply_buttons": [],
+                }
+                page.wait_for_timeout(1000)
+                continue
+
+            if isinstance(result, bool):
+                return {
+                    "clicked": result,
+                    "reason": "legacy_detector",
+                    "visible_apply_buttons": [],
+                }
+
+            if not isinstance(result, dict):
+                last_result = {
+                    "clicked": False,
+                    "reason": "invalid_easy_apply_detector_result",
+                    "visible_apply_buttons": [],
+                }
+                page.wait_for_timeout(1000)
+                continue
+
+            last_result = result
+
+            if not result.get("clicked"):
+                page.wait_for_timeout(1000)
+                continue
+
+            clicked_result = {
+                **result,
+                "clicked": True,
+                "reason": result.get("reason", "clicked_easy_apply").replace("found_", "clicked_"),
+            }
+
+            if context:
+                new_pages = [
+                    item
+                    for item in context.pages
+                    if not any(item is existing for existing in before_pages)
+                ]
+
+                if new_pages and not hasattr(page, "locator"):
+                    new_page = new_pages[-1]
+                    try:
+                        new_page.wait_for_load_state("domcontentloaded", timeout=45_000)
+                    except Exception:
+                        pass
+
+                    clicked_result["_page"] = new_page
+                    clicked_result["opened_new_page"] = True
+                    clicked_result["new_page_url"] = getattr(new_page, "url", "")
+
+                    return clicked_result
+
+            if not hasattr(page, "locator"):
+                return clicked_result
+
+            try:
+                target = page.locator('[data-seekapply-easy-apply-target="1"]').first
+
+                target.wait_for(state="visible", timeout=5000)
+                target.scroll_into_view_if_needed(timeout=5000)
+
+                # Real Playwright click. This is more reliable than element.click() inside page.evaluate().
+                target.click(timeout=8000)
+
+                page.wait_for_timeout(1500)
+
+            except Exception as exc:
+                last_result = {
+                    **result,
+                    "clicked": False,
+                    "reason": f"easy_apply_click_failed: {exc}",
+                    "visible_apply_buttons": result.get("visible_apply_buttons", []),
+                }
+                page.wait_for_timeout(1000)
+                continue
+
+            if context:
+                new_pages = [
+                    item
+                    for item in context.pages
+                    if not any(item is existing for existing in before_pages)
+                ]
+
+                if new_pages:
+                    new_page = new_pages[-1]
+                    try:
+                        new_page.wait_for_load_state("domcontentloaded", timeout=45_000)
+                    except Exception:
+                        pass
+
+                    clicked_result["_page"] = new_page
+                    clicked_result["opened_new_page"] = True
+                    clicked_result["new_page_url"] = getattr(new_page, "url", "")
+
+                    return clicked_result
+
+            # LinkedIn Easy Apply usually opens a modal on the same page.
+            try:
+                modal = page.locator(
+                    '.jobs-easy-apply-modal, '
+                    '.artdeco-modal, '
+                    '[role="dialog"]'
+                ).first
+
+                modal.wait_for(state="visible", timeout=8000)
+                clicked_result["modal_opened"] = True
+
+            except Exception:
+                clicked_result["modal_opened"] = False
+
+            return clicked_result
+
+        return last_result
+    
     @staticmethod
     def _ensure_resume_selected(page, resume_path: Path) -> dict:
         uploaded = SupervisedLinkedInApplyAgent._upload_resume(page, resume_path)
@@ -1159,10 +1925,61 @@ class SupervisedLinkedInApplyAgent:
     @staticmethod
     def _answer_lookup(answers: list[ApplicationAnswer]) -> dict[str, str]:
         lookup: dict[str, str] = {}
+        aliases = {
+            "notice_period": [
+                "when can you join",
+                "available to start",
+                "availability to start",
+                "start date",
+                "joining date",
+                "how soon can you join",
+            ],
+            "expected_ctc": [
+                "expected ctc",
+                "expected salary",
+                "expected compensation",
+                "salary expectation",
+                "desired salary",
+            ],
+            "current_ctc": [
+                "current ctc",
+                "current salary",
+                "current compensation",
+            ],
+            "work_authorization": [
+                "work authorization",
+                "authorized to work",
+                "legally authorized",
+                "visa status",
+                "require sponsorship",
+                "need sponsorship",
+            ],
+            "relocation": [
+                "willing to relocate",
+                "relocation",
+                "can you relocate",
+            ],
+            "preferred_locations": [
+                "preferred location",
+                "location preference",
+                "work location",
+                "remote preference",
+            ],
+            "linkedin_url": ["linkedin profile", "linkedin url"],
+            "github_url": ["github profile", "github url"],
+            "portfolio_url": ["portfolio", "personal website", "website"],
+        }
         for answer in answers:
             if answer.approved and answer.answer_text.strip() and answer.answer_text != "[NEEDS HUMAN REVIEW]":
-                lookup[normalize(answer.question_key)] = answer.answer_text
-                lookup[normalize(answer.question_text)] = answer.answer_text
+                key = normalize(answer.question_key)
+                text = normalize(answer.question_text)
+                lookup[key] = answer.answer_text
+                lookup[text] = answer.answer_text
+                combined = f"{key} {text}"
+                for canonical_key, canonical_aliases in aliases.items():
+                    if canonical_key in combined or any(normalize(alias) in combined for alias in canonical_aliases):
+                        for alias in [canonical_key, *canonical_aliases]:
+                            lookup[normalize(alias)] = answer.answer_text
         return lookup
 
     @staticmethod
@@ -1575,6 +2392,8 @@ class SupervisedLinkedInApplyAgent:
             return getattr(user, "portfolio_url", None) or getattr(user, "github_url", None) or ""
         if "notice" in n:
             return getattr(user, "notice_period", None) or ""
+        if ("join" in n or "start" in n or "available" in n) and any(marker in n for marker in ["when", "date", "soon", "available"]):
+            return getattr(user, "notice_period", None) or ""
         if "authorization" in n or "visa" in n or "sponsor" in n:
             return getattr(user, "work_authorization", None) or ""
         if "year" in n and "experience" in n:
@@ -1667,53 +2486,7 @@ class SupervisedLinkedInApplyAgent:
         return bool(
             page.evaluate(
                 """
-                () => Array.from(document.querySelectorAll('button, input[type="submit"]')).some((el) =>
-                  /(submit application|submit|send application|finish application)/i.test(
-                    el.innerText || el.value || el.getAttribute('aria-label') || ''
-                  )
-                )
-                """
-            )
-        )
-
-    @staticmethod
-    def _click_marked_target(page, selector: str, *, context=None, timeout: int = 5000) -> dict:
-        clicked_page = page
-        before_pages = set(context.pages) if context else set()
-        try:
-            if context:
-                try:
-                    with context.expect_page(timeout=4000) as page_info:
-                        page.locator(selector).first.click(timeout=timeout)
-                    clicked_page = page_info.value
-                    clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
-                except Exception:
-                    page.locator(selector).first.click(timeout=timeout)
-                    page.wait_for_timeout(1200)
-                    new_pages = [item for item in context.pages if item not in before_pages]
-                    if new_pages:
-                        clicked_page = new_pages[-1]
-                        try:
-                            clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
-                        except Exception:
-                            pass
-            else:
-                page.locator(selector).first.click(timeout=timeout)
-                page.wait_for_timeout(1200)
-            return {"clicked": True, "page": clicked_page}
-        except Exception as exc:
-            return {"clicked": False, "page": page, "error": str(exc)}
-
-    @staticmethod
-    def _click_next_step(page, context=None) -> dict:
-        try:
-            result = page.evaluate(
-                """
                 () => {
-                  function textFor(el) {
-                    return [el.getAttribute('aria-label'), el.getAttribute('title'), el.value, el.innerText, el.textContent]
-                      .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
-                  }
                   function visible(el) {
                     const style = window.getComputedStyle(el);
                     const rect = el.getBoundingClientRect();
@@ -1726,39 +2499,383 @@ class SupervisedLinkedInApplyAgent:
                   function enabled(el) {
                     return !(el.disabled || el.getAttribute('disabled') !== null || el.getAttribute('aria-disabled') === 'true');
                   }
-                  const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal, [role="dialog"]');
-                  const root = modal || document;
-                  const buttons = Array.from(root.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'))
-                    .filter((el) => visible(el) && enabled(el));
-                  const button = buttons.find((el) => {
-                    const text = textFor(el).toLowerCase();
-                    return /^(next|review|continue|save and continue|next step|continue to next step|review your application)$/i.test(text)
-                      && !/(submit|send|finish|withdraw|delete|discard)/i.test(text);
-                  }) || buttons.find((el) => {
-                    const text = textFor(el).toLowerCase();
-                    return /(next|review|continue|save and continue)/i.test(text)
-                      && !/(submit|send|finish|withdraw|delete|discard|cancel|close)/i.test(text);
-                  });
-                  const buttonsSeen = buttons.map(textFor).filter(Boolean).slice(0, 30);
-                  if (!button) return {clicked: false, reason: 'no_next_or_continue_button', buttons_seen: buttonsSeen};
-                  document.querySelectorAll('[data-seekapply-next-target="1"]').forEach((el) => el.removeAttribute('data-seekapply-next-target'));
-                  button.setAttribute('data-seekapply-next-target', '1');
-                  button.scrollIntoView({ block: 'center', inline: 'center' });
-                  return {clicked: true, text: textFor(button).slice(0, 160), buttons_seen: buttonsSeen};
+                  return Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]')).some((el) =>
+                    visible(el) && enabled(el) && /(submit application|submit|send application|finish application)/i.test(
+                      el.innerText || el.value || el.getAttribute('aria-label') || ''
+                    )
+                  );
                 }
                 """
             )
-        except Exception as exc:
-            return {"clicked": False, "reason": str(exc), "page": page}
-        if isinstance(result, bool):
-            return {"clicked": result, "page": page}
-        if not isinstance(result, dict) or not result.get("clicked"):
-            return {**(result if isinstance(result, dict) else {}), "clicked": False, "page": page}
-        click_result = SupervisedLinkedInApplyAgent._click_marked_target(
-            page, '[data-seekapply-next-target="1"]', context=context, timeout=6000
         )
-        return {**result, **click_result, "clicked": bool(click_result.get("clicked"))}
 
+    @staticmethod
+    def _submission_success_visible(page) -> bool:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  function visible(el) {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && rect.width > 0
+                      && rect.height > 0
+                      && !el.closest('[aria-hidden="true"]');
+                  }
+                  function enabled(el) {
+                    return !(el.disabled || el.getAttribute('disabled') !== null || el.getAttribute('aria-disabled') === 'true');
+                  }
+                  const hasFinalSubmit = Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]')).some((el) =>
+                    visible(el) && enabled(el) && /(submit application|submit|send application|finish application)/i.test(
+                      el.innerText || el.value || el.getAttribute('aria-label') || ''
+                    )
+                  );
+                  if (hasFinalSubmit) return false;
+                  const text = [
+                    document.title || '',
+                    document.body && document.body.innerText ? document.body.innerText : '',
+                  ].join('\\n').replace(/\\s+/g, ' ').slice(0, 20000);
+                  return /(?:application (?:submitted|sent|received)|your application (?:was sent|has been submitted|has been received)|you(?:'|\\u2019)ve applied|you have applied|successfully applied|thank you for applying|thanks for applying|application complete|we(?:'|\\u2019)ve received your application|we have received your application)/i.test(text);
+                }
+                """
+            )
+        )
+
+    # @staticmethod
+    # def _click_marked_target(page, selector: str, *, context=None, timeout: int = 5000) -> dict:
+    #     clicked_page = page
+    #     before_pages = list(context.pages) if context else []
+    #     try:
+    #         if context:
+    #             try:
+    #                 with context.expect_page(timeout=4000) as page_info:
+    #                     page.locator(selector).first.click(timeout=timeout)
+    #                 clicked_page = page_info.value
+    #                 clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
+    #             except Exception:
+    #                 page.locator(selector).first.click(timeout=timeout)
+    #                 page.wait_for_timeout(1200)
+    #                 new_pages = [
+    #                     item
+    #                     for item in context.pages
+    #                     if not any(item is existing for existing in before_pages)
+    #                 ]
+    #                 if new_pages:
+    #                     clicked_page = new_pages[-1]
+    #                     try:
+    #                         clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
+    #                     except Exception:
+    #                         pass
+    #         else:
+    #             page.locator(selector).first.click(timeout=timeout)
+    #             page.wait_for_timeout(1200)
+    #         return {"clicked": True, "page": clicked_page}
+    #     except Exception as exc:
+    #         return {"clicked": False, "page": page, "error": str(exc)}
+
+    @staticmethod
+    def _click_marked_target(page, selector: str, *, context=None, timeout: int = 8000) -> dict:
+        clicked_page = page
+        before_pages = list(context.pages) if context else []
+
+        try:
+            target = page.locator(selector).first
+            if hasattr(target, "wait_for"):
+                target.wait_for(state="visible", timeout=timeout)
+            if hasattr(target, "scroll_into_view_if_needed"):
+                target.scroll_into_view_if_needed(timeout=timeout)
+
+            # Click exactly once. Do not use expect_page here.
+            try:
+                target.click(timeout=timeout)
+            except TypeError:
+                target.click()
+
+            if hasattr(page, "wait_for_timeout"):
+                page.wait_for_timeout(1800)
+
+            if context:
+                new_pages = [
+                    item
+                    for item in context.pages
+                    if not any(item is existing for existing in before_pages)
+                ]
+
+                if new_pages:
+                    clicked_page = new_pages[-1]
+                    try:
+                        clicked_page.wait_for_load_state("domcontentloaded", timeout=45_000)
+                    except Exception:
+                        pass
+
+                    return {
+                        "clicked": True,
+                        "page": clicked_page,
+                        "opened_new_page": True,
+                        "new_page_url": getattr(clicked_page, "url", ""),
+                    }
+
+            return {
+                "clicked": True,
+                "page": clicked_page,
+            }
+
+        except Exception as exc:
+            return {
+                "clicked": False,
+                "page": page,
+                "error": str(exc),
+                "reason": f"marked_target_click_failed: {exc}",
+            }
+
+    # @staticmethod
+    # def _click_next_step(page, context=None) -> dict:
+    #     try:
+    #         result = page.evaluate(
+    #             """
+    #             () => {
+    #               function textFor(el) {
+    #                 return [el.getAttribute('aria-label'), el.getAttribute('title'), el.value, el.innerText, el.textContent]
+    #                   .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+    #               }
+    #               function visible(el) {
+    #                 const style = window.getComputedStyle(el);
+    #                 const rect = el.getBoundingClientRect();
+    #                 return style.visibility !== 'hidden'
+    #                   && style.display !== 'none'
+    #                   && rect.width > 0
+    #                   && rect.height > 0
+    #                   && !el.closest('[aria-hidden="true"]');
+    #               }
+    #               function enabled(el) {
+    #                 return !(el.disabled || el.getAttribute('disabled') !== null || el.getAttribute('aria-disabled') === 'true');
+    #               }
+    #               const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal, [role="dialog"]');
+    #               const root = modal || document;
+    #               const buttons = Array.from(root.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'))
+    #                 .filter((el) => visible(el) && enabled(el));
+    #               const button = buttons.find((el) => {
+    #                 const text = textFor(el).toLowerCase();
+    #                 return /^(next|review|continue|save and continue|next step|continue to next step|review your application)$/i.test(text)
+    #                   && !/(submit|send|finish|withdraw|delete|discard)/i.test(text);
+    #               }) || buttons.find((el) => {
+    #                 const text = textFor(el).toLowerCase();
+    #                 return /(next|review|continue|save and continue)/i.test(text)
+    #                   && !/(submit|send|finish|withdraw|delete|discard|cancel|close)/i.test(text);
+    #               });
+    #               const buttonsSeen = buttons.map(textFor).filter(Boolean).slice(0, 30);
+    #               if (!button) return {clicked: false, reason: 'no_next_or_continue_button', buttons_seen: buttonsSeen};
+    #               document.querySelectorAll('[data-seekapply-next-target="1"]').forEach((el) => el.removeAttribute('data-seekapply-next-target'));
+    #               button.setAttribute('data-seekapply-next-target', '1');
+    #               button.scrollIntoView({ block: 'center', inline: 'center' });
+    #               return {clicked: true, text: textFor(button).slice(0, 160), buttons_seen: buttonsSeen};
+    #             }
+    #             """
+    #         )
+    #     except Exception as exc:
+    #         return {"clicked": False, "reason": str(exc), "page": page}
+    #     if isinstance(result, bool):
+    #         return {"clicked": result, "page": page}
+    #     if not isinstance(result, dict) or not result.get("clicked"):
+    #         return {**(result if isinstance(result, dict) else {}), "clicked": False, "page": page}
+    #     click_result = SupervisedLinkedInApplyAgent._click_marked_target(
+    #         page, '[data-seekapply-next-target="1"]', context=context, timeout=6000
+    #     )
+    #     return {**result, **click_result, "clicked": bool(click_result.get("clicked"))}
+
+
+    @staticmethod
+    def _click_next_step(page, context=None) -> dict:
+        try:
+            result = page.evaluate(
+                """
+                () => {
+                function textFor(el) {
+                    return [
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('title'),
+                    el.getAttribute('data-control-name'),
+                    el.value,
+                    el.innerText,
+                    el.textContent
+                    ]
+                    .filter(Boolean)
+                    .join(' ')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                }
+
+                function norm(value) {
+                    return String(value || '')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, ' ')
+                    .trim();
+                }
+
+                function visible(el) {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+
+                    return style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && !el.closest('[aria-hidden="true"]');
+                }
+
+                function enabled(el) {
+                    return !(
+                    el.disabled ||
+                    el.getAttribute('disabled') !== null ||
+                    el.getAttribute('aria-disabled') === 'true' ||
+                    /disabled/i.test(String(el.className || ''))
+                    );
+                }
+
+                function dangerous(text) {
+                    return /\\b(submit|submit application|send application|send|finish|withdraw|delete|discard|cancel|close)\\b/i.test(text);
+                }
+
+                function nextLike(text) {
+                    const n = norm(text);
+
+                    return (
+                    n === 'next' ||
+                    n === 'review' ||
+                    n === 'continue' ||
+                    n === 'save and continue' ||
+                    n === 'next step' ||
+                    n === 'continue to next step' ||
+                    n === 'review your application' ||
+                    n.includes('next') ||
+                    n.includes('review') ||
+                    n.includes('continue')
+                    );
+                }
+
+                const modal =
+                    document.querySelector('.jobs-easy-apply-modal') ||
+                    document.querySelector('.artdeco-modal') ||
+                    document.querySelector('[role="dialog"]');
+
+                const root = modal || document;
+
+                const footer =
+                    root.querySelector?.('.artdeco-modal__actionbar') ||
+                    root.querySelector?.('.jobs-easy-apply-modal__footer') ||
+                    root.querySelector?.('footer') ||
+                    root;
+
+                const selector = [
+                    'button',
+                    '[role="button"]',
+                    'input[type="button"]',
+                    'input[type="submit"]'
+                ].join(',');
+
+                const footerButtons = Array.from(footer.querySelectorAll(selector)).filter(visible);
+                const rootButtons = Array.from(root.querySelectorAll(selector)).filter(visible);
+
+                const buttons = [];
+                const seen = new Set();
+
+                for (const button of [...footerButtons, ...rootButtons]) {
+                    if (seen.has(button)) continue;
+                    seen.add(button);
+                    buttons.push(button);
+                }
+
+                const buttonsSeen = buttons
+                    .map(textFor)
+                    .filter(Boolean)
+                    .slice(0, 40);
+
+                const disabledButtonsSeen = buttons
+                    .filter((el) => !enabled(el))
+                    .map(textFor)
+                    .filter(Boolean)
+                    .slice(0, 20);
+
+                const candidates = buttons.filter((el) => {
+                    const text = textFor(el);
+                    if (!text) return false;
+                    if (!enabled(el)) return false;
+                    if (dangerous(text)) return false;
+                    return nextLike(text);
+                });
+
+                const target =
+                    candidates.find((el) => norm(textFor(el)) === 'next') ||
+                    candidates.find((el) => norm(textFor(el)) === 'review') ||
+                    candidates.find((el) => norm(textFor(el)) === 'continue') ||
+                    candidates.find((el) => norm(textFor(el)) === 'save and continue') ||
+                    candidates[0];
+
+                document
+                    .querySelectorAll('[data-seekapply-next-target="1"]')
+                    .forEach((el) => el.removeAttribute('data-seekapply-next-target'));
+
+                if (!target) {
+                    return {
+                    clicked: false,
+                    reason: disabledButtonsSeen.length
+                        ? 'next_button_disabled_or_required_fields_missing'
+                        : 'no_next_or_continue_button',
+                    buttons_seen: buttonsSeen,
+                    disabled_buttons_seen: disabledButtonsSeen
+                    };
+                }
+
+                target.setAttribute('data-seekapply-next-target', '1');
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+
+                return {
+                    clicked: true,
+                    text: textFor(target).slice(0, 160),
+                    buttons_seen: buttonsSeen,
+                    disabled_buttons_seen: disabledButtonsSeen
+                };
+                }
+                """
+            )
+
+        except Exception as exc:
+            return {
+                "clicked": False,
+                "reason": f"next_button_detection_error: {exc}",
+                "page": page,
+            }
+
+        if isinstance(result, bool):
+            return {
+                "clicked": result,
+                "page": page,
+            }
+
+        if not isinstance(result, dict) or not result.get("clicked"):
+            return {
+                **(result if isinstance(result, dict) else {}),
+                "clicked": False,
+                "page": page,
+            }
+
+        click_result = SupervisedLinkedInApplyAgent._click_marked_target(
+            page,
+            '[data-seekapply-next-target="1"]',
+            context=context,
+            timeout=8000,
+        )
+
+        return {
+            **result,
+            **click_result,
+            "clicked": bool(click_result.get("clicked")),
+            "reason": "clicked_next_step" if click_result.get("clicked") else click_result.get("reason"),
+        }
+
+        
     @staticmethod
     def _click_start_application(page, context=None) -> dict:
         try:

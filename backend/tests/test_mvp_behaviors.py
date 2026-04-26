@@ -857,6 +857,142 @@ def test_apply_queue_supports_external_site_supervised_fallback(tmp_path, monkey
         assert application.status == "Needs user action"
 
 
+def test_apply_queue_reconciles_submitted_active_browser_before_next_task(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.pdf", b"%PDF-1.4\nPython FastAPI RAG", "application/pdf")},
+    )
+    user_id = upload.json()["user_id"]
+    job_ids = []
+    for index in range(2):
+        job_ids.append(
+            client.post(
+                "/jobs/import-url",
+                json={
+                    "user_id": user_id,
+                    "job_url": f"https://www.linkedin.com/jobs/view/910{index}",
+                    "title": f"Data Scientist {index}",
+                    "company": f"Company{index}",
+                    "description": "Python FastAPI RAG production APIs",
+                    "skills": ["Python", "FastAPI", "RAG"],
+                    "source": "browser_assist:linkedin.com",
+                },
+            ).json()["job_id"]
+        )
+    with session_factory() as db:
+        for job_id in job_ids:
+            db.get(Job, job_id).match_score = 96
+        db.commit()
+
+    tasks = client.post("/apply-queue/build", json={"user_id": user_id, "job_ids": job_ids}).json()["tasks"]
+    active_task_id = tasks[0]["id"]
+    next_task_id = tasks[1]["id"]
+
+    class FakeApplyAgent:
+        closed: list[int | None] = []
+        started: list[int] = []
+
+        def __init__(self, storage_root):
+            self.storage_root = storage_root
+
+        @classmethod
+        def active_summary(cls):
+            return {
+                "live": True,
+                "task_id": active_task_id,
+                "submission_success": True,
+                "url": "https://www.linkedin.com/jobs/application-submitted",
+                "title": "Application submitted",
+            }
+
+        def close(self, task_id=None):
+            self.__class__.closed.append(task_id)
+
+        def start(self, **kwargs):
+            self.__class__.started.append(kwargs["task_id"])
+            return obj(
+                status="ready_for_submit",
+                message="Ready for final submit.",
+                steps=["Filled form", "Stopped before final submit."],
+                errors=[],
+                missing_questions=[],
+                fill_report={"resume_uploaded": True, "final_submit_detected": True},
+                action_required="Submit manually.",
+            )
+
+    monkeypatch.setattr("app.api.routes.SupervisedLinkedInApplyAgent", FakeApplyAgent)
+    started = client.post(f"/apply-queue/{next_task_id}/start", json={})
+    assert started.status_code == 200
+    assert started.json()["status"] == "ready_for_submit"
+    assert FakeApplyAgent.closed == [active_task_id]
+    assert FakeApplyAgent.started == [next_task_id]
+    with session_factory() as db:
+        active_task = db.get(ApplyQueueTask, active_task_id)
+        next_task = db.get(ApplyQueueTask, next_task_id)
+        active_application = db.get(Application, active_task.application_id)
+        assert active_task.status == "submitted_by_user"
+        assert active_application.status == "Applied"
+        assert active_application.applied_at is not None
+        assert next_task.status == "ready_for_submit"
+
+
+def test_apply_queue_reports_active_browser_blocker_without_marking_current_task(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.pdf", b"%PDF-1.4\nPython FastAPI RAG", "application/pdf")},
+    )
+    user_id = upload.json()["user_id"]
+    job_ids = []
+    for index in range(2):
+        job_ids.append(
+            client.post(
+                "/jobs/import-url",
+                json={
+                    "user_id": user_id,
+                    "job_url": f"https://www.linkedin.com/jobs/view/920{index}",
+                    "title": f"AI Engineer {index}",
+                    "company": f"Blocker{index}",
+                    "description": "Python FastAPI RAG",
+                    "skills": ["Python", "FastAPI", "RAG"],
+                    "source": "browser_assist:linkedin.com",
+                },
+            ).json()["job_id"]
+        )
+    with session_factory() as db:
+        for job_id in job_ids:
+            db.get(Job, job_id).match_score = 96
+        db.commit()
+    tasks = client.post("/apply-queue/build", json={"user_id": user_id, "job_ids": job_ids}).json()["tasks"]
+    active_task_id = tasks[0]["id"]
+    next_task_id = tasks[1]["id"]
+
+    class FakeApplyAgent:
+        def __init__(self, storage_root):
+            self.storage_root = storage_root
+
+        @classmethod
+        def active_summary(cls):
+            return {
+                "live": True,
+                "task_id": active_task_id,
+                "submission_success": False,
+                "url": "https://www.linkedin.com/jobs/view/9200",
+                "title": "AI Engineer 0",
+            }
+
+    monkeypatch.setattr("app.api.routes.SupervisedLinkedInApplyAgent", FakeApplyAgent)
+    blocked = client.post(f"/apply-queue/{next_task_id}/start", json={})
+    assert blocked.status_code == 200
+    body = blocked.json()
+    assert body["status"] == "needs_user_action"
+    assert body["task"]["id"] == active_task_id
+    assert body["fill_report"]["active_task_id"] == active_task_id
+    with session_factory() as db:
+        assert db.get(ApplyQueueTask, next_task_id).status == "queued"
+
+
 def test_bulk_answers_upsert_and_sync_profile_preferences(tmp_path, monkeypatch):
     client, session_factory = make_test_client(tmp_path, monkeypatch)
     upload = client.post(
@@ -1404,6 +1540,123 @@ def test_supervised_apply_detector_accepts_linkedin_apply_button_label():
     assert result["clicked"] is True
     assert result["reason"] == "clicked_linkedin_apply_button"
     assert result["clicked_text"] == "Apply to this job"
+
+
+def test_supervised_apply_easy_apply_tracks_new_page():
+    class NewPage:
+        url = "https://company.example/apply"
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+    class FakeContext:
+        def __init__(self):
+            self.new_page = NewPage()
+            self.pages = []
+
+    class FakePage:
+        def __init__(self, context):
+            self.context = context
+            self.url = "https://www.linkedin.com/jobs/view/123"
+
+        def evaluate(self, _script):
+            self.context.pages.append(self.context.new_page)
+            return {
+                "clicked": True,
+                "reason": "clicked_linkedin_apply_button",
+                "clicked_text": "Apply to this job",
+                "visible_apply_buttons": ["Apply to this job"],
+            }
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    context = FakeContext()
+    page = FakePage(context)
+    context.pages = [page]
+
+    result = SupervisedLinkedInApplyAgent._click_easy_apply(page, wait_seconds=3, context=context)
+
+    assert result["clicked"] is True
+    assert result["opened_new_page"] is True
+    assert result["_page"] is context.new_page
+    assert result["new_page_url"] == "https://company.example/apply"
+
+
+def test_supervised_apply_external_apply_clicks_visible_button_before_href():
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+            self.first = self
+
+        def click(self, timeout=None):
+            self.page.clicked_selectors.append(self.selector)
+            if self.selector == '[data-seekapply-external-target="1"]':
+                self.page.url = "https://ats.example/apply"
+
+        def inner_text(self, timeout=3000):
+            return ""
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://www.linkedin.com/jobs/view/123"
+            self.clicked_selectors = []
+            self.goto_calls = []
+
+        def evaluate(self, script):
+            if "data-seekapply-external-target" in script:
+                return {
+                    "found": True,
+                    "text": "Apply on company website",
+                    "href": "https://ats.example/direct",
+                    "visible_apply_buttons": ["Apply on company website"],
+                }
+            return False
+
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            self.url = url
+
+    page = FakePage()
+    steps = []
+
+    result = SupervisedLinkedInApplyAgent._open_external_apply(
+        page,
+        obj(apply_url="https://in.linkedin.com/jobs/view/123", job_url="https://www.linkedin.com/jobs/view/123"),
+        steps,
+    )
+
+    assert result is page
+    assert page.url == "https://ats.example/apply"
+    assert page.clicked_selectors == ['[data-seekapply-external-target="1"]']
+    assert page.goto_calls == []
+    assert any("Captured apply_url is still a LinkedIn job page" in step for step in steps)
+    assert any("Clicked external Apply button" in step for step in steps)
+
+
+def test_supervised_apply_kb_aliases_common_joining_questions():
+    lookup = SupervisedLinkedInApplyAgent._answer_lookup(
+        [
+            obj(
+                approved=True,
+                question_key="notice_period",
+                question_text="What is your notice period?",
+                answer_text="Immediate",
+            )
+        ]
+    )
+    user = sample_user()
+    user.notice_period = "Immediate"
+
+    assert SupervisedLinkedInApplyAgent._answer_for_label("When can you join?", lookup) == "Immediate"
+    assert SupervisedLinkedInApplyAgent._profile_value_for_label("How soon are you available to start?", user) == "Immediate"
 
 
 def test_supervised_apply_can_use_profile_experience_for_form_questions():
