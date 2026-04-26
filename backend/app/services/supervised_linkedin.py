@@ -36,7 +36,8 @@ class SupervisedLinkedInResult:
 class SupervisedLinkedInImporter:
     def __init__(self, storage_root: Path) -> None:
         self.storage_root = storage_root
-        self.session_dir = storage_root / "browser_sessions" / "linkedin"
+        self.session_dir = storage_root / "browser_sessions"
+        self.state_path = self.session_dir / "linkedin_state.json"
 
     def import_jobs(
         self,
@@ -68,46 +69,67 @@ class SupervisedLinkedInImporter:
 
         try:
             with sync_playwright() as p:
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=str(self.session_dir),
+                browser = p.chromium.launch(
                     headless=False,
-                    viewport={"width": 1360, "height": 900},
-                    user_agent=(
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-                    ),
+                    args=["--disable-blink-features=AutomationControlled"],
                 )
-                page = context.new_page()
-                for plan in plans:
-                    if len(jobs) >= max_jobs:
-                        break
-                    steps.append(f"Searching LinkedIn for {plan.keyword} in {plan.location}.")
+                context = None
+                try:
+                    context_options = {
+                        "viewport": {"width": 1360, "height": 900},
+                        "user_agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                        ),
+                    }
+                    if self.state_path.exists():
+                        context_options["storage_state"] = str(self.state_path)
+
                     try:
-                        page.goto(plan.url, wait_until="domcontentloaded", timeout=45_000)
-                        self._wait_for_results_or_user_action(page, wait_seconds)
-                        self._scroll_results(page)
-                        found = self._extract_result_cards(page)
-                        steps.append(f"Found {len(found)} visible card(s) for {plan.keyword}.")
-                        for item in found:
-                            if len(jobs) >= max_jobs:
-                                break
-                            url = item.get("job_url") or ""
-                            if not url or url in seen_urls:
-                                continue
-                            seen_urls.add(url)
-                            detail = {}
-                            if include_descriptions:
-                                detail = self._read_job_detail(context, url)
-                            merged = {**item, **{key: value for key, value in detail.items() if value}}
-                            jobs.append(self._job_from_payload(merged))
-                    except PlaywrightTimeoutError as exc:
-                        errors.append(f"Timed out reading {plan.keyword}: {exc}")
+                        context = browser.new_context(**context_options)
                     except PlaywrightError as exc:
-                        errors.append(f"Could not read {plan.keyword}: {exc}")
-                    except Exception as exc:
-                        logger.exception("Supervised LinkedIn import failed for %s", plan.url)
-                        errors.append(f"Could not read {plan.keyword}: {exc}")
-                context.close()
+                        errors.append(f"Saved LinkedIn browser session could not be reused; starting fresh: {exc}")
+                        context_options.pop("storage_state", None)
+                        context = browser.new_context(**context_options)
+
+                    page = context.new_page()
+                    for plan in plans:
+                        if len(jobs) >= max_jobs:
+                            break
+                        steps.append(f"Searching LinkedIn for {plan.keyword} in {plan.location}.")
+                        try:
+                            page.goto(plan.url, wait_until="domcontentloaded", timeout=45_000)
+                            self._wait_for_results_or_user_action(page, wait_seconds)
+                            self._scroll_results(page)
+                            found = self._extract_result_cards(page)
+                            steps.append(f"Found {len(found)} visible card(s) for {plan.keyword}.")
+                            for item in found:
+                                if len(jobs) >= max_jobs:
+                                    break
+                                url = item.get("job_url") or ""
+                                if not url or url in seen_urls:
+                                    continue
+                                seen_urls.add(url)
+                                detail = {}
+                                if include_descriptions:
+                                    detail = self._read_job_detail(context, url)
+                                merged = {**item, **{key: value for key, value in detail.items() if value}}
+                                jobs.append(self._job_from_payload(merged))
+                        except PlaywrightTimeoutError as exc:
+                            errors.append(f"Timed out reading {plan.keyword}: {exc}")
+                        except PlaywrightError as exc:
+                            errors.append(f"Could not read {plan.keyword}: {exc}")
+                        except Exception as exc:
+                            logger.exception("Supervised LinkedIn import failed for %s", plan.url)
+                            errors.append(f"Could not read {plan.keyword}: {exc}")
+                    try:
+                        context.storage_state(path=str(self.state_path))
+                    except PlaywrightError as exc:
+                        errors.append(f"Could not save LinkedIn browser session: {exc}")
+                finally:
+                    if context:
+                        context.close()
+                    browser.close()
         except Exception as exc:
             logger.exception("Could not start supervised LinkedIn browser")
             return SupervisedLinkedInResult(
@@ -115,7 +137,7 @@ class SupervisedLinkedInImporter:
                 message=f"Could not start or control the supervised browser: {exc}",
                 steps=steps,
                 errors=[*errors, str(exc)],
-                action_required="Make sure Playwright Chromium is installed and no stale browser session is locked.",
+                action_required="Make sure Playwright Chromium is installed. Close any leftover Playwright browser windows, then retry.",
             )
 
         if jobs:

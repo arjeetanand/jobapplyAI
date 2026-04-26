@@ -16,8 +16,9 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.models.entities import Job, ResumeVersion, User
-from app.services.documents import write_docx_rich, write_latex, write_pdf
-from app.services.text import extract_keywords, keyword_overlap, normalize
+from app.services.documents import compile_latex_to_pdf, write_docx_rich, write_latex, write_pdf
+from app.services.resume_extraction import ResumeExtractionService
+from app.services.text import clean_job_skills, extract_keywords, keyword_overlap, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +166,10 @@ class ResumeTailoringAgent:
         self.storage_root = storage_root or get_settings().resolved_storage_root
 
     def tailor(self, user: User, job: Job, match_score: int) -> TailoredResume:
-        job_keywords = job.skills or extract_keywords(job.description)
-        overlap, missing = keyword_overlap(user.skills, job_keywords)
-        emphasized = sorted(overlap)[:12]
+        verified_skills = self._verified_resume_skills(user)
+        job_keywords = self._job_keywords(job)
+        overlap, missing = keyword_overlap(verified_skills, job_keywords)
+        emphasized = self._emphasized_verified_skills(verified_skills, job)
         recommended_projects = self._recommended_projects(missing)
         resume_id = self._resume_id(job)
         version_dir = self.storage_root / "resume_versions"
@@ -179,44 +181,48 @@ class ResumeTailoringAgent:
         # --- Try LLM tailoring first ---
         ai_generated = False
         paragraphs: list[str] = []
-        try:
-            from app.services.oci_genai import OCIGenerativeAIProvider
-            provider = OCIGenerativeAIProvider()
-            if provider.status().configured:
-                prompt = _build_prompt(user, job, match_score, emphasized)
-                llm_text = provider.chat(prompt)
-                paragraphs = _parse_llm_response(llm_text)
-                ai_generated = True
-                logger.info("AI resume tailoring succeeded for job %s", job.id)
-        except Exception as exc:
-            logger.warning("AI tailoring failed, using template fallback: %s", exc)
+        if not getattr(user, "latex_template_source", None):
+            try:
+                from app.services.oci_genai import OCIGenerativeAIProvider
+                provider = OCIGenerativeAIProvider()
+                if provider.status().configured:
+                    prompt = _build_prompt(user, job, match_score, emphasized)
+                    llm_text = provider.chat(prompt)
+                    paragraphs = _parse_llm_response(llm_text)
+                    ai_generated = True
+                    logger.info("AI resume tailoring succeeded for job %s", job.id)
+            except Exception as exc:
+                logger.warning("AI tailoring failed, using template fallback: %s", exc)
 
         if not paragraphs:
             paragraphs = self._build_resume_text(user, job, emphasized, recommended_projects)
 
         title = f"{user.name} - {job.title} at {job.company}"
 
-        # Build a flat plain-text version for the simple PDF writer
-        plain_paragraphs = [p.replace("__HEADING__", "") for p in paragraphs]
-
         write_docx_rich(docx_path, title, paragraphs)
-        write_pdf(pdf_path, title, plain_paragraphs)
 
-        # Generate LaTeX version if template is available
-        tex_path: Path | None = None
+        # Always generate a LaTeX export. If the user uploaded a .tex template,
+        # the writer keeps that structure; otherwise it creates a clean fallback.
+        tex_path = version_dir / f"{resume_id}.tex"
         latex_template_source = getattr(user, "latex_template_source", None)
-        if latex_template_source:
-            tex_path = version_dir / f"{resume_id}.tex"
-            write_latex(
-                path=tex_path,
-                template_source=latex_template_source,
-                user_name=user.name or "Candidate",
-                skills=emphasized or user.skills[:15],
-                experience=user.experience or [],
-                projects=user.projects or [],
-                job_title=job.title,
-                company=job.company,
-            )
+        ordered_skills = self._ordered_verified_skills(verified_skills, emphasized)
+        write_latex(
+            path=tex_path,
+            template_source=latex_template_source,
+            user_name=user.name or "Candidate",
+            skills=ordered_skills,
+            experience=user.experience or [],
+            projects=user.projects or [],
+            job_title=job.title,
+            company=job.company,
+            paragraphs=paragraphs,
+        )
+
+        compiled_pdf = compile_latex_to_pdf(tex_path, pdf_path)
+        if not compiled_pdf:
+            write_pdf(pdf_path, title, paragraphs)
+
+        plain_paragraphs = [p.replace("__HEADING__", "") for p in paragraphs]
 
         metadata = {
             "resume_id": resume_id,
@@ -229,6 +235,11 @@ class ResumeTailoringAgent:
             "based_on_resume": "base_resume_v1",
             "truthfulness_check": "passed",
             "ai_generated": ai_generated,
+            "minimal_latex_edit": bool(latex_template_source),
+            "pdf_generation": "latex_compiler" if compiled_pdf else "styled_pdf_fallback",
+            "resume_changes": self._resume_changes(bool(latex_template_source), emphasized, ordered_skills),
+            "ordered_verified_skills": ordered_skills,
+            "verified_skills_source": "uploaded_resume_and_profile",
             "recommended_projects_to_build": recommended_projects,
         }
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,9 +258,161 @@ class ResumeTailoringAgent:
             ai_generated=ai_generated,
         )
 
+    def ensure_latex_export(self, user: User, version: ResumeVersion, job: Job | None = None, *, force: bool = False) -> Path:
+        tex_path = Path(version.tex_path) if version.tex_path else self._version_export_path(version, "tex")
+        if tex_path.exists() and not force:
+            version.tex_path = str(tex_path)
+            return tex_path
+
+        paragraphs = self._export_paragraphs(user, version, job)
+        verified_skills = self._verified_resume_skills(user)
+        write_latex(
+            path=tex_path,
+            template_source=getattr(user, "latex_template_source", None),
+            user_name=user.name or "Candidate",
+            skills=self._ordered_verified_skills(verified_skills, version.skills_emphasized or []),
+            experience=user.experience or [],
+            projects=user.projects or [],
+            job_title=version.role,
+            company=version.company,
+            paragraphs=paragraphs,
+        )
+        version.tex_path = str(tex_path)
+        return tex_path
+
+    def ensure_pdf_export(self, user: User, version: ResumeVersion, job: Job | None = None, *, force: bool = False) -> Path:
+        pdf_path = Path(version.pdf_path)
+        paragraphs = self._export_paragraphs(user, version, job)
+        tex_path = self.ensure_latex_export(user, version, job, force=force)
+        if force or not pdf_path.exists():
+            title = f"{user.name} - {version.role} at {version.company}"
+            if not compile_latex_to_pdf(tex_path, pdf_path):
+                write_pdf(pdf_path, title, paragraphs)
+        version.pdf_path = str(pdf_path)
+        return pdf_path
+
+    def _version_export_path(self, version: ResumeVersion, suffix: str) -> Path:
+        version_dir = self.storage_root / "resume_versions"
+        role = re.sub(r"[^a-z0-9]+", "-", version.role.lower()).strip("-")[:40]
+        company = re.sub(r"[^a-z0-9]+", "-", version.company.lower()).strip("-")[:40]
+        return version_dir / f"resume_version_{version.id}_{company}_{role}.{suffix}"
+
+    def _export_paragraphs(self, user: User, version: ResumeVersion, job: Job | None = None) -> list[str]:
+        skills = version.skills_emphasized or user.skills[:12] or (job.skills if job else [])
+        paragraphs = [
+            f"Email: {user.email} | Phone: {user.phone or 'Not provided'} | Location: {user.location or 'Not provided'}",
+            f"LinkedIn: {user.linkedin_url or 'Not provided'} | GitHub: {user.github_url or 'Not provided'}",
+            f"Target Role: {version.role} at {version.company}",
+            "__HEADING__Professional Summary",
+            (
+                f"{user.current_role or 'Candidate'} with {user.experience_years:g} years of experience. "
+                f"This resume version emphasizes {', '.join(skills) or 'verified resume strengths'} for {version.role}."
+            ),
+            "__HEADING__Relevant Skills",
+            ", ".join(skills or ["Skills available in the uploaded resume"]),
+            "__HEADING__Experience",
+        ]
+
+        if user.experience:
+            for item in user.experience[:4]:
+                role = item.get("role", "Role")
+                company = item.get("company", "Company")
+                duration = item.get("duration", "")
+                paragraphs.append(f"{role} - {company}{f' | {duration}' if duration else ''}")
+                paragraphs.extend(str(bullet) for bullet in item.get("bullets", [])[:4])
+        elif user.base_resume_text:
+            paragraphs.append(user.base_resume_text[:1600])
+        else:
+            paragraphs.append("Experience details were not provided during onboarding.")
+
+        paragraphs.append("__HEADING__Projects")
+        if user.projects:
+            for project in user.projects[:4]:
+                name = project.get("name", "Project")
+                summary = project.get("summary", "")
+                project_skills = ", ".join(project.get("skills", []))
+                paragraphs.append(f"{name}: {summary}{f' ({project_skills})' if project_skills else ''}")
+        else:
+            paragraphs.append("Project details were not provided during onboarding.")
+
+        if job and job.description:
+            paragraphs.append("__HEADING__Target Job Notes")
+            paragraphs.append(job.description[:600])
+        return paragraphs
+
+    @staticmethod
+    def _ordered_verified_skills(user_skills: list[str], emphasized: list[str]) -> list[str]:
+        selected: list[str] = []
+        normalized_seen: set[str] = set()
+        for skill in [*emphasized, *user_skills]:
+            key = normalize(str(skill))
+            if key and key not in normalized_seen:
+                normalized_seen.add(key)
+                selected.append(str(skill))
+        return selected[:28]
+
+    @staticmethod
+    def _job_keywords(job: Job) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for skill in [*clean_job_skills(job.skills), *extract_keywords(job.description or "", limit=28)]:
+            key = normalize(str(skill))
+            if key and key not in seen:
+                seen.add(key)
+                selected.append(str(skill))
+        return selected
+
+    @staticmethod
+    def _verified_resume_skills(user: User) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        raw_sources = [
+            *(user.skills or []),
+            *ResumeExtractionService._extract_skills(getattr(user, "base_resume_text", "") or ""),
+            *ResumeExtractionService._extract_skills(getattr(user, "latex_template_source", "") or ""),
+        ]
+        for skill in raw_sources:
+            key = normalize(str(skill))
+            if key and key not in seen:
+                seen.add(key)
+                selected.append(str(skill))
+        return selected[:60]
+
+    @classmethod
+    def _emphasized_verified_skills(cls, verified_skills: list[str], job: Job) -> list[str]:
+        job_text = normalize(" ".join([job.title or "", job.description or "", *[str(skill) for skill in job.skills or []]]))
+        emphasized: list[str] = []
+        seen: set[str] = set()
+        for skill in verified_skills:
+            key = normalize(str(skill))
+            if not key or key in seen:
+                continue
+            tokens = [token for token in re.split(r"[^a-z0-9+#.]+", key) if len(token) > 1]
+            direct_match = key in job_text
+            token_match = tokens and all(token in job_text for token in tokens[:3])
+            if direct_match or token_match:
+                emphasized.append(str(skill))
+                seen.add(key)
+        return emphasized[:12]
+
+    @staticmethod
+    def _resume_changes(has_latex_template: bool, emphasized: list[str], ordered_skills: list[str]) -> list[str]:
+        changes = []
+        if has_latex_template:
+            changes.append("Kept the uploaded LaTeX resume template and preserved core formatting.")
+            changes.append("Updated the Profile/Summary section to target the selected role.")
+            changes.append("Added a compact Targeted Focus line in Technical Skills using only verified resume skills.")
+        else:
+            changes.append("Generated a clean LaTeX resume because no uploaded LaTeX template was available.")
+        if emphasized:
+            changes.append(f"Emphasized verified overlap: {', '.join(emphasized[:8])}.")
+        elif ordered_skills:
+            changes.append(f"Kept verified skills visible: {', '.join(ordered_skills[:8])}.")
+        return changes
+
     def find_reusable(self, existing: list[ResumeVersion], job: Job) -> ResumeVersion | None:
         best: tuple[float, ResumeVersion] | None = None
-        job_terms = set(job.skills or extract_keywords(job.description))
+        job_terms = set(clean_job_skills(job.skills) or extract_keywords(job.description))
         for version in existing:
             version_terms = set(version.skills_emphasized or [])
             skill_score = len({normalize(x) for x in job_terms} & {normalize(x) for x in version_terms}) / max(

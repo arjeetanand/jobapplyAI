@@ -23,7 +23,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     settings.resolved_storage_root.mkdir(parents=True, exist_ok=True)
-    for child in ["base_resumes", "resume_versions", "metadata", "vector_index"]:
+    for child in ["base_resumes", "browser_sessions", "resume_versions", "metadata", "vector_index"]:
         (settings.resolved_storage_root / child).mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
 

@@ -1,0 +1,250 @@
+\documentclass[letterpaper,11pt]{article}
+
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[colorlinks = true,
+            linkcolor = blue,
+            urlcolor  = black,
+            citecolor = black,
+            anchorcolor = black]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage{fontawesome5}
+\usepackage{multicol}
+\setlength{\multicolsep}{-3.0pt}
+\setlength{\columnsep}{-1pt}
+\input{glyphtounicode}
+
+\hypersetup{pdfborder = 0 0 0}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\addtolength{\oddsidemargin}{-0.7in}
+\addtolength{\evensidemargin}{-0.7in}
+\addtolength{\textwidth}{1.4in}
+\addtolength{\topmargin}{-.85in}
+\addtolength{\textheight}{1.7in}
+
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large\bfseries
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+\pdfgentounicode=1
+
+%-------------------------
+\newcommand{\resumeItem}[1]{
+  \item\small{{#1 \vspace{-1pt}}}
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{1.0\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & \textbf{\small #2} \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{1.001\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & \textbf{\small #2}\\
+    \end{tabular*}\vspace{-5pt}
+}
+
+\renewcommand\labelitemi{$\vcenter{\hbox{\tiny$\bullet$}}$}
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-9pt}}
+
+
+% ================================================================
+\begin{document}
+% ================================================================
+
+% ---------- HEADER ----------
+\begin{center}
+    {\Huge \scshape Arjeet Anand} \\ \vspace{1pt}
+    \small
+    \raisebox{-0.1\height}\faPhone\ 7004253767 ~
+    \href{mailto:arjeet.anand2024@gmail.com}{\faEnvelope\ arjeet.anand2024@gmail.com} ~
+    \href{https://linkedin.com/in/arjeetanand}{\faLinkedin\ arjeetanand} ~
+    \href{https://github.com/arjeetanand}{\faGithub\ arjeetanand} ~
+    \href{https://arjeetanand.vercel.app/}{\faGlobe\ Portfolio}
+    \vspace{-7pt}
+\end{center}
+
+
+% ---------- PROFILE ----------
+\section{Profile}
+\vspace{1pt}
+\small{
+AI/ML Engineer building production GenAI applications at Oracle, including RAG pipelines, LLM-powered workflows, document intelligence, automation systems, and scalable cloud-native API services.
+}
+\vspace{-10pt}
+
+
+% ---------- EXPERIENCE ----------
+\section{Experience}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Oracle Solution Services (India) Private Limited}{August 2024 -- Present}
+      {AI/ML Engineer}{Bangalore, Karnataka}
+      \resumeItemListStart
+        \resumeItem{Architected and deployed \textbf{AICUE}, a production GenAI contract intelligence system
+        processing 5{,}000+ clauses/month; leveraged n-gram keyphrase extraction, semantic embeddings,
+        and structured LLM generation on OCI via Flask APIs, reducing manual contract review by \textbf{30\%}.}
+        \resumeItem{Engineered an end-to-end invoice processing pipeline using Tesseract OCR and fine-tuned
+        \textbf{FinBERT} for structured field classification; deployed via FastAPI microservices, reducing
+        processing time by \textbf{45\%} and achieving \textbf{91\%} extraction accuracy across 10{,}000+ invoices.}
+        \resumeItem{Designed an AI-powered documentation engine for Oracle IAR files using \textbf{Cohere} and
+        \textbf{OCI GenAI}, auto-generating Excel, Word, and Mermaid outputs; containerized FastAPI microservice
+        cutting documentation turnaround by \textbf{60\%}.}
+      \resumeItemListEnd
+\vspace{-6pt}
+
+
+% ---------- TECHNICAL SKILLS ----------
+\section{Technical Skills}
+\vspace{-3pt}
+ \begin{itemize}[leftmargin=0.1in, label={}]
+    \small{\item{
+    \textbf{Languages:} Python, SQL, C++ \\
+    \textbf{AI/ML \& GenAI:} LLMs, Generative AI, RAG, Agentic AI, Prompt Engineering,
+      Fine-tuning, Transformers, PyTorch, FinBERT, Scikit-learn, TensorFlow, Hugging Face, LangChain,
+      LangGraph, LlamaIndex, Embeddings, FAISS, ChromaDB \\
+    \textbf{Data Engineering:} ClickHouse, Redis, Kafka, DuckDB, Dimensional Modelling (Star Schema), Advanced SQL, Parquet, Apache Arrow, ETL Pipelines, Hot/Cold Split Architecture \\
+    \textbf{Backend \& APIs:} FastAPI, Flask, REST APIs \\
+    \textbf{MLOps \& Cloud:} Docker, Kubernetes, MLflow, GitHub Actions, CI/CD, Oracle Cloud (OCI), AWS S3 \\
+    \textbf{Data \& Tools:} Pandas, NumPy, Tesseract OCR, Streamlit, Plotly, SQLite
+    }}
+\end{itemize}
+\vspace{-20pt}
+
+
+% ---------- EDUCATION ----------
+\section{Education}
+\vspace{-3pt}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Vellore Institute of Technology, Vellore, Tamil Nadu}{September 2020 -- June 2024}
+      {B.Tech in Electronics \& Communication Engineering}{CGPA: 8.86}
+  \resumeSubHeadingListEnd
+\vspace{-12pt}
+
+
+% ---------- AI PROJECTS ----------
+\section{AI Projects}
+    \vspace{-7pt}
+    \resumeSubHeadingListStart
+
+
+    % \resumeProjectHeading
+    %   {\textbf{DataMind} $|$ \emph{Python, ClickHouse, Redis, Kafka, DuckDB, PyTorch, LlamaIndex, LangGraph, FastAPI}}
+    %   {\href{https://github.com/arjeetanand/datamind}{\faGithub}}
+    % \resumeItemListStart
+    %   \resumeItem{Engineered a high-performance \textbf{Hot/Cold Split Architecture} using \textbf{ClickHouse (Hot Path)} and \textbf{DuckDB (Cold Path)}, implementing a zero-lock ingestion pipeline via \textbf{Kafka Native Engine} that decoupled real-time simulation traffic from heavy analytical star-schema queries.}
+    %   \resumeItem{Architected a sub-millisecond \textbf{Real-time KPI Dashboard} using \textbf{Redis} as a write-through cache; optimized event processing with an async \textbf{4-partition Kafka cluster} and high-throughput consumer capable of handling \textbf{5,000+ transactions per second}.}
+    %   \resumeItem{Deployed a \textbf{PyTorch LSTM + Attention} forecasting model with Monte Carlo dropout for 7-day demand prediction, integrated with an automated \textbf{MAPE-aware retraining loop} that detects model drift and triggers local retraining to maintain error rates below 15\%.}
+    %   \resumeItem{Created a multi-agent \textbf{RAG Pipeline} using \textbf{LangGraph} and \textbf{LlamaIndex} to automate workflows from warehouse retrieval and \textbf{NL2SQL} to automated executive reports and reorder alerts served via a \textbf{React (Vite)} dashboard.
+    %   Created a multi-agent RAG pipeline using LangGraph and LlamaIndex to automate workflows from warehouse retrieval and NL2SQL to report generation and reorder recommendations.}
+    % \resumeItemListEnd
+    % \vspace{-3pt}
+
+    \resumeProjectHeading
+  {\textbf{DataMind} $|$ \emph{Python, ClickHouse, Redis, Kafka, DuckDB, PyTorch, LlamaIndex, LangGraph, FastAPI}}
+  {\href{https://github.com/arjeetanand/datamind}{\faGithub}}
+\resumeItemListStart
+  \resumeItem{Designed a scalable \textbf{Hot/Cold data architecture} using \textbf{ClickHouse} for real-time workloads and \textbf{DuckDB} for analytical queries, with a zero-lock \textbf{Kafka} ingestion pipeline that decoupled streaming traffic from star-schema analytics.}
+  \resumeItem{Built a sub-millisecond \textbf{real-time KPI dashboard} using \textbf{Redis} as a write-through cache; optimized async event processing with a high-throughput Kafka consumer handling \textbf{5,000+ transactions per second}.}
+  \resumeItem{Deployed a \textbf{PyTorch LSTM + Attention} forecasting model with Monte Carlo dropout for \textbf{7-day demand prediction}, integrated with a \textbf{MAPE-aware retraining loop} to detect drift and maintain forecasting error below \textbf{15\%}.}
+  \resumeItem{Built a multi-agent \textbf{RAG pipeline} using \textbf{LangGraph} and \textbf{LlamaIndex} to automate workflows from warehouse retrieval and \textbf{NL2SQL} to executive reporting and reorder signal generation, exposed through \textbf{FastAPI} services and a \textbf{React} dashboard.}
+\resumeItemListEnd
+\vspace{-3pt}
+    
+    \resumeProjectHeading
+      {\textbf{PromptMesh} $|$ \emph{Python, FastAPI, Ollama, OCI GenAI, Cohere, LLM-as-a-Judge, YAML}}
+      {\href{https://github.com/arjeetanand/PromptMesh}{\faGithub}}
+    \resumeItemListStart
+      \resumeItem{Built a \textbf{model-agnostic prompt evaluation and evolution platform} with FastAPI backend
+        and web UI; supports multi-model benchmarking across Ollama, OCI GenAI, and Cohere with per-run
+        latency, token usage, and hallucination-penalised scoring.}
+      \resumeItem{Implemented a \textbf{closed-loop prompt optimisation engine} using LLM-as-a-Judge scoring
+        (accuracy, completeness, instruction adherence) and failure-aware mutation for automated prompt evolution.}
+    \resumeItemListEnd
+    \vspace{-5pt}
+
+    % \resumeProjectHeading
+    %   {\textbf{Multi-Agent A2A Protocol} $|$ \emph{Python, LangGraph, AutoGen, CrewAI, Google ADK, MCP}}
+    %   {\href{https://github.com/arjeetanand/a2a_protocol}{\faGithub}}
+    % \resumeItemListStart
+    %   \resumeItem{Designed a \textbf{cross-framework agentic AI system} enabling interoperability across Google ADK,
+    %     LangGraph, AutoGen, MAF, and CrewAI via a custom A2A protocol; integrated OCI GenAI (Cohere Command R+)
+    %     as the shared LLM inference backbone.}
+    %   \resumeItem{Centralised tool access via a \textbf{Model Context Protocol (MCP)} server, providing all agents
+    %     unified timesheet and payroll data --- reducing inter-agent integration code by \textbf{40\%}.}
+    % \resumeItemListEnd
+    % \vspace{-8pt}
+
+
+    \resumeSubHeadingListEnd
+\vspace{-12pt}
+
+
+% ---------- CERTIFICATIONS ----------
+\section{Certifications}
+    \vspace{-3pt}
+    \resumeSubHeadingListStart
+      \resumeItemListStart
+        \resumeItem{\href{https://catalog-education.oracle.com/ords/certview/sharebadge?id=D3E1FACE9A53DA35AED93F15F1E5F74457A70840767461AD76A44BD80564E861}
+          {\textbf{Oracle AI Vector Search Certified Professional}}}
+        \resumeItem{\href{https://catalog-education.oracle.com/ords/certview/sharebadge?id=C3ABB9EE2E382B9DC5991747E9730E78CEAD25EC7CDFBC0E85C3C24AE5306FAD}
+          {\textbf{Oracle Cloud Infrastructure 2024 Generative AI Certified Professional}}}
+        % \resumeItem{\href{https://moonshot.scaler.com/s/li/tXMxuPWgOC}
+        %   {\textbf{Supervised Machine Learning -- Scaler (2023)}}}
+      \resumeItemListEnd
+    \resumeSubHeadingListEnd
+\vspace{-13pt}
+
+
+% ---------- ACHIEVEMENTS ----------
+\section{Achievements}
+    \vspace{-3pt}
+    \resumeSubHeadingListStart
+      \resumeItemListStart
+        \resumeItem{\href{https://drive.google.com/file/d/1RReZu2Fm9lYCAsLuDVKpCv4ea1fEU9DL/view?usp=sharing}
+          {Awarded the \textbf{YES Recognition Award 2024--25} at Oracle OSSI for learning and innovation}}
+        \resumeItem{\href{https://drive.google.com/file/d/1ncpbEwM8u1lUfpr4qJDBAfHfAED9nSfx/view?usp=sharing}
+          {Awarded the \textbf{VIT Merit Scholarship}, ranking among the top 10 students at VIT University}}
+        \resumeItem{\href{https://drive.google.com/file/d/1242fGIAlae87CG_29Kyui4Z8RPgcNqjJ/view?usp=drive_link}
+          {Secured \textbf{1st place at HACKX 2.0}, organised by IEEE-SPS VIT, 2023}}
+      \resumeItemListEnd
+    \resumeSubHeadingListEnd
+\vspace{-13pt}
+
+
+% ---------- POSITIONS OF RESPONSIBILITY ----------
+\section{Positions of Responsibility}
+\vspace{-4pt}
+\small{
+\textbf{Technical Lead, ADGVIT (2022--2024)} -- Led a 50+ member technical team across projects and events. \\
+\textbf{Oracle Volunteers Project Leader (2024--Present)} -- Led 60+ volunteers across social and community initiatives.
+}
+
+\end{document}

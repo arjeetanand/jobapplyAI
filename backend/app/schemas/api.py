@@ -43,7 +43,7 @@ class PreferencesIn(BaseModel):
     auto_apply_enabled: bool = False
     auto_email_enabled: bool = False
     max_applications_per_day: int = 10
-    match_threshold: int = 75
+    match_threshold: int = 60
 
 
 class OnboardingIn(BaseModel):
@@ -101,6 +101,18 @@ class LinkedInSupervisedImportIn(BaseModel):
     user_id: int | None = None
     max_jobs: int = 20
     include_descriptions: bool = True
+    wait_seconds: int = 90
+
+
+class ApplyQueueBuildIn(BaseModel):
+    user_id: int | None = None
+    job_ids: list[int] = Field(default_factory=list)
+    max_items: int = 25
+    force: bool = False
+
+
+class ApplyQueueActionIn(BaseModel):
+    user_id: int | None = None
     wait_seconds: int = 90
 
 

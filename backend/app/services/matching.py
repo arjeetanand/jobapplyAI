@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from app.models.entities import Job, JobPreference, User
 from app.services.safety import SafetyComplianceAgent
-from app.services.text import keyword_overlap, normalize, tokenize
+from app.services.text import clean_job_skills, keyword_overlap, normalize, tokenize
 
 
 @dataclass
@@ -74,9 +74,10 @@ class JobMatchingAgent:
                 concerns.append("Role title is not an obvious target-role match.")
 
         # ---- 2. Skill overlap (max 28) ----
-        overlap, missing = keyword_overlap(user.skills, job.skills)
-        if job.skills:
-            skill_ratio = len(overlap) / len(set(normalize(skill) for skill in job.skills if skill))
+        job_skills = clean_job_skills(job.skills)
+        overlap, missing = keyword_overlap(user.skills, job_skills)
+        if job_skills:
+            skill_ratio = len(overlap) / len(set(normalize(skill) for skill in job_skills if skill))
             skill_points = round(skill_ratio * 28)
             score += skill_points
             if overlap:

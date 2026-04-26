@@ -54,6 +54,7 @@ pnpm-debug.log*
 
 # Local generated storage
 storage/base_resumes/*
+storage/browser_sessions/*
 storage/resume_versions/*
 storage/metadata/*
 storage/vector_index/*

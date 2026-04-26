@@ -3,6 +3,7 @@ from html import escape
 import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
@@ -17,6 +18,7 @@ from app.models.entities import (
     Application,
     ApplicationAnswer,
     ApplicationPacket,
+    ApplyQueueTask,
     BrowserImport,
     ClaimLedgerItem,
     Contact,
@@ -31,6 +33,8 @@ from app.models.entities import (
 )
 from app.schemas.api import (
     ApplicationAnswerIn,
+    ApplyQueueActionIn,
+    ApplyQueueBuildIn,
     BrowserAssistBulkImportIn,
     BrowserImportIn,
     BulkApplicationAnswersIn,
@@ -48,16 +52,19 @@ from app.schemas.api import (
     StatusPatchIn,
 )
 from app.services.application_packet import ApplicationPacketAgent
+from app.services.documents import latex_compiler_available
 from app.services.email_outreach import EmailOutreachAgent
 from app.services.job_discovery import JobSearchAgent
+from app.services.latex_parser import parse_latex_resume
 from app.services.linkedin_assist import LinkedInAssistAgent
 from app.services.matching import JobMatchingAgent
 from app.services.oci_genai import OCIGenerativeAIProvider
 from app.services.resume import ResumeTailoringAgent
 from app.services.resume_extraction import ResumeExtractionService
 from app.services.safety import SafetyComplianceAgent
+from app.services.supervised_apply import SupervisedLinkedInApplyAgent
 from app.services.supervised_linkedin import SupervisedLinkedInImporter
-from app.services.text import extract_keywords
+from app.services.text import clean_job_skills, extract_keywords
 
 router = APIRouter()
 
@@ -78,13 +85,19 @@ def _preferences_for(db: Session, user: User) -> JobPreference:
             similar_roles=[],
             preferred_locations=[],
             remote_preference="any",
-            match_threshold=85,
+            match_threshold=_configured_match_threshold(None),
             auto_apply_enabled=False,
             auto_email_enabled=False,
         )
         db.add(preferences)
         db.flush()
     return preferences
+
+
+def _configured_match_threshold(preferences: JobPreference | None = None) -> int:
+    configured = getattr(get_settings(), "match_threshold", None)
+    threshold = configured if configured is not None else (preferences.match_threshold if preferences else 60)
+    return max(0, min(int(threshold or 60), 100))
 
 
 def _discovery_preferences_for(db: Session, user: User) -> DiscoveryPreference:
@@ -265,7 +278,7 @@ def _preferences_payload(preferences: JobPreference) -> dict:
         "preferred_locations": preferences.preferred_locations,
         "remote_preference": preferences.remote_preference,
         "excluded_companies": preferences.excluded_companies,
-        "match_threshold": preferences.match_threshold,
+        "match_threshold": _configured_match_threshold(preferences),
         "auto_apply_enabled": preferences.auto_apply_enabled,
         "auto_email_enabled": preferences.auto_email_enabled,
     }
@@ -367,6 +380,7 @@ def _import_visible_job_payload(
         skills = skills or parsed["skills"]
 
     description_text = description or visible
+    cleaned_skills = clean_job_skills(skills) or extract_keywords(description_text, limit=16)
     title_text = title or "Browser Imported Role"
     company_text = company or "Unknown Company"
     source = source_site or _source_site_from_url(page_url)
@@ -391,7 +405,7 @@ def _import_visible_job_payload(
             location=location,
             salary=salary,
             description=description_text[:12000],
-            skills=skills or extract_keywords(description_text, limit=16),
+            skills=cleaned_skills,
             job_url=page_url,
             apply_url=apply_url or page_url,
             source=f"browser_assist:{source}",
@@ -416,7 +430,7 @@ def _import_visible_job_payload(
             "description": description_text[:12000],
             "apply_url": apply_url,
             "salary": salary,
-            "skills": skills or [],
+            "skills": cleaned_skills,
         },
         missing_fields=missing,
     )
@@ -437,6 +451,256 @@ def _import_visible_job_payload(
         "missing_fields": missing,
         "message": "Visible job page imported for review.",
     }
+
+
+def _is_linkedin_job(job: Job) -> bool:
+    source = (job.source or "").lower()
+    url = (job.job_url or "").lower()
+    return "linkedin" in source or "linkedin.com" in url
+
+
+def _application_for_job(db: Session, user: User, job: Job) -> Application:
+    application = db.scalar(select(Application).where(Application.user_id == user.id, Application.job_id == job.id))
+    if not application:
+        application = Application(
+            user_id=user.id,
+            job_id=job.id,
+            company=job.company,
+            role=job.title,
+            source=job.source,
+            status="Queued for supervised apply",
+        )
+        db.add(application)
+        db.flush()
+    return application
+
+
+def _latest_resume_for_job(db: Session, user: User, job: Job) -> ResumeVersion | None:
+    return db.scalar(
+        select(ResumeVersion)
+        .where(ResumeVersion.user_id == user.id, ResumeVersion.job_id == job.id)
+        .order_by(ResumeVersion.created_at.desc())
+    )
+
+
+def _store_tailored_resume_version(db: Session, user: User, job: Job, score: int) -> ResumeVersion:
+    tailored = ResumeTailoringAgent().tailor(user, job, score)
+    version = ResumeVersion(
+        user_id=user.id,
+        company=job.company,
+        role=job.title,
+        job_id=job.id,
+        file_path=str(tailored.pdf_path),
+        docx_path=str(tailored.docx_path),
+        pdf_path=str(tailored.pdf_path),
+        tex_path=str(tailored.tex_path) if tailored.tex_path else None,
+        metadata_path=str(tailored.metadata_path),
+        skills_emphasized=tailored.skills_emphasized,
+        similarity_group="-".join(tailored.skills_emphasized[:4]) or None,
+        truthfulness_status="passed",
+    )
+    db.add(version)
+    db.flush()
+    return version
+
+
+def _ensure_queue_resume(
+    db: Session,
+    *,
+    user: User,
+    preferences: JobPreference,
+    job: Job,
+    application: Application,
+    task: ApplyQueueTask,
+) -> Path:
+    version = db.get(ResumeVersion, task.resume_version_id) if task.resume_version_id else None
+    version = version or (db.get(ResumeVersion, application.resume_version_id) if application.resume_version_id else None)
+    version = version or _latest_resume_for_job(db, user, job)
+    if version:
+        pdf_path = ResumeTailoringAgent().ensure_pdf_export(user, version, job, force=True)
+        task.resume_version_id = version.id
+        application.resume_version_id = version.id
+        return pdf_path
+
+    score = job.match_score if job.match_score is not None else JobMatchingAgent().score(user, preferences, job).score
+    if getattr(user, "latex_template_source", None):
+        version = _store_tailored_resume_version(db, user, job, score)
+        task.resume_version_id = version.id
+        application.resume_version_id = version.id
+        job.status = "Resume tailored"
+        application.status = "Resume tailored"
+        return Path(version.pdf_path)
+
+    base_path = Path(user.base_resume_path).expanduser() if user.base_resume_path else None
+    if base_path and base_path.exists() and base_path.suffix.lower() == ".pdf":
+        return base_path
+
+    version = _store_tailored_resume_version(db, user, job, score)
+    task.resume_version_id = version.id
+    application.resume_version_id = version.id
+    job.status = "Resume tailored"
+    application.status = "Resume tailored"
+    return Path(version.pdf_path)
+
+
+def _apply_queue_task_payload(db: Session, task: ApplyQueueTask) -> dict:
+    job = db.get(Job, task.job_id)
+    application = db.get(Application, task.application_id) if task.application_id else None
+    resume = db.get(ResumeVersion, task.resume_version_id) if task.resume_version_id else None
+    return {
+        "id": task.id,
+        "user_id": task.user_id,
+        "job_id": task.job_id,
+        "application_id": task.application_id,
+        "resume_version_id": task.resume_version_id,
+        "status": task.status,
+        "source": task.source,
+        "message": task.message,
+        "missing_questions": task.missing_questions or [],
+        "fill_report": task.fill_report or {},
+        "steps": task.steps or [],
+        "last_error": task.last_error,
+        "auto_submit": False,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "job": {
+            "title": job.title if job else "",
+            "company": job.company if job else "",
+            "location": job.location if job else None,
+            "job_url": job.job_url if job else "",
+            "match_score": job.match_score if job else None,
+            "status": job.status if job else "",
+        },
+        "application_status": application.status if application else None,
+        "resume": {
+            "id": resume.id,
+            "pdf_path": resume.pdf_path,
+            "docx_path": resume.docx_path,
+        }
+        if resume
+        else None,
+    }
+
+
+def _save_apply_missing_questions(db: Session, user: User, job: Job, questions: list[str]) -> None:
+    for question in questions:
+        key = _canonical_question_key(question)
+        existing = db.scalar(
+            select(ApplicationAnswer).where(
+                ApplicationAnswer.user_id == user.id,
+                ApplicationAnswer.question_key == key,
+            )
+        )
+        if existing:
+            if not existing.answer_text.strip():
+                existing.answer_text = "[NEEDS HUMAN REVIEW]"
+            existing.approved = existing.approved and existing.answer_text != "[NEEDS HUMAN REVIEW]"
+            continue
+        db.add(
+            ApplicationAnswer(
+                user_id=user.id,
+                question_key=key,
+                question_text=question,
+                answer_text="[NEEDS HUMAN REVIEW]",
+                source=f"linkedin_easy_apply_{job.company[:60]}",
+                sensitive=True,
+                approved=False,
+            )
+        )
+
+
+def _resume_version_metadata(path: str | None) -> dict:
+    if not path:
+        return {}
+    metadata_path = Path(path)
+    if not metadata_path.exists():
+        return {}
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _score_tailored_resume_payload(
+    *,
+    user: User,
+    preferences: JobPreference,
+    job: Job,
+    original_score: int,
+    resume_text: str,
+    metadata: dict,
+) -> dict:
+    verified_resume_skills = metadata.get("ordered_verified_skills") or user.skills or []
+    proxy = SimpleNamespace(
+        skills=verified_resume_skills,
+        base_resume_text=resume_text,
+        experience_years=user.experience_years,
+        projects=user.projects or [],
+        certifications=user.certifications or [],
+        achievements=user.achievements or [],
+        experience=user.experience or [],
+    )
+    tailored_score = JobMatchingAgent().score(proxy, preferences, job)
+    return {
+        "original_match_score": original_score,
+        "tailored_resume_score": tailored_score.score,
+        "score_delta": tailored_score.score - original_score,
+        "tailored_reasons": tailored_score.reasons,
+        "resume_changes": metadata.get("resume_changes", []),
+        "pdf_generation": metadata.get("pdf_generation"),
+        "minimal_latex_edit": metadata.get("minimal_latex_edit", False),
+    }
+
+
+def _tailored_resume_text(tailored_or_version, fallback: str = "") -> str:
+    parts: list[str] = []
+    paragraphs = getattr(tailored_or_version, "paragraphs", None)
+    if paragraphs:
+        parts.append("\n".join(str(item) for item in paragraphs))
+    tex_path_value = getattr(tailored_or_version, "tex_path", None)
+    if tex_path_value:
+        tex_path = Path(tex_path_value)
+        if tex_path.exists():
+            parts.append(tex_path.read_text(encoding="utf-8", errors="ignore"))
+    return "\n".join(parts) or fallback
+
+
+def _tailor_and_rescore_job(
+    db: Session,
+    *,
+    user: User,
+    preferences: JobPreference,
+    job: Job,
+    original_score: int | None = None,
+) -> tuple[ResumeVersion, dict]:
+    score = original_score
+    if score is None:
+        score_result = JobMatchingAgent().score(user, preferences, job)
+        score = score_result.score
+        job.match_score = score_result.score
+        job.score_reasons = score_result.reasons
+        job.score_concerns = score_result.concerns
+
+    agent = ResumeTailoringAgent()
+    version = _latest_resume_for_job(db, user, job)
+    if version:
+        agent.ensure_pdf_export(user, version, job, force=True)
+    else:
+        version = _store_tailored_resume_version(db, user, job, score)
+
+    metadata = _resume_version_metadata(version.metadata_path)
+    score_payload = _score_tailored_resume_payload(
+        user=user,
+        preferences=preferences,
+        job=job,
+        original_score=score,
+        resume_text=_tailored_resume_text(version, user.base_resume_text or ""),
+        metadata=metadata,
+    )
+    job.match_score = max(score, score_payload["tailored_resume_score"])
+    job.score_reasons = score_payload.get("tailored_reasons", [])
+    job.status = "Resume tailored"
+    return version, score_payload
 
 
 @router.post("/onboarding/profile")
@@ -507,6 +771,7 @@ def download_base_resume(db: Session = Depends(get_db)) -> FileResponse:
     media_types = {
         ".pdf": "application/pdf",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".tex": "application/x-tex",
         ".txt": "text/plain",
         ".md": "text/markdown",
     }
@@ -522,19 +787,32 @@ async def upload_base_resume(file: UploadFile, user_id: int | None = None, db: S
     target = target_dir / filename
     content = await file.read()
     target.write_bytes(content)
+
     extraction = ResumeExtractionService().extract(target, content, file.content_type)
+    latex_source = content.decode("utf-8", errors="ignore") if target.suffix.lower() == ".tex" else None
+    latex_profile = None
+    if latex_source:
+        try:
+            latex_profile = parse_latex_resume(latex_source)
+        except Exception:
+            latex_profile = None
 
     user = db.get(User, user_id) if user_id else db.scalar(select(User).where(User.email == extraction.email))
     if not user:
         user = User(
-            name=extraction.name,
-            email=extraction.email,
-            phone=extraction.phone,
-            linkedin_url=extraction.linkedin_url,
-            github_url=extraction.github_url,
-            skills=extraction.skills,
+            name=(latex_profile.name if latex_profile and latex_profile.name != "Unknown" else extraction.name),
+            email=(latex_profile.email if latex_profile and latex_profile.email else extraction.email),
+            phone=(latex_profile.phone if latex_profile and latex_profile.phone else extraction.phone),
+            linkedin_url=(latex_profile.linkedin_url if latex_profile and latex_profile.linkedin_url else extraction.linkedin_url),
+            github_url=(latex_profile.github_url if latex_profile and latex_profile.github_url else extraction.github_url),
+            skills=(latex_profile.skills if latex_profile and latex_profile.skills else extraction.skills),
+            projects=[project.__dict__ for project in latex_profile.projects] if latex_profile else [],
+            experience=[item.__dict__ for item in latex_profile.experience] if latex_profile else [],
+            education=[item.__dict__ for item in latex_profile.education] if latex_profile else [],
+            achievements=latex_profile.achievements if latex_profile else [],
             base_resume_text=extraction.text,
             base_resume_path=str(target),
+            latex_template_source=latex_source,
         )
         db.add(user)
         db.flush()
@@ -545,7 +823,7 @@ async def upload_base_resume(file: UploadFile, user_id: int | None = None, db: S
                 similar_roles=[],
                 preferred_locations=[],
                 remote_preference="any",
-                match_threshold=85,
+                match_threshold=_configured_match_threshold(None),
                 auto_apply_enabled=False,
                 auto_email_enabled=False,
             )
@@ -558,6 +836,20 @@ async def upload_base_resume(file: UploadFile, user_id: int | None = None, db: S
         user.skills = user.skills or extraction.skills
         user.base_resume_text = extraction.text
         user.base_resume_path = str(target)
+        if latex_profile:
+            if latex_profile.name != "Unknown":
+                user.name = latex_profile.name
+            user.email = latex_profile.email or user.email
+            user.phone = latex_profile.phone or user.phone
+            user.linkedin_url = latex_profile.linkedin_url or user.linkedin_url
+            user.github_url = latex_profile.github_url or user.github_url
+            user.skills = latex_profile.skills or user.skills
+            user.projects = [project.__dict__ for project in latex_profile.projects] or user.projects
+            user.experience = [item.__dict__ for item in latex_profile.experience] or user.experience
+            user.education = [item.__dict__ for item in latex_profile.education] or user.education
+            user.achievements = latex_profile.achievements or user.achievements
+        if latex_source:
+            user.latex_template_source = latex_source
 
     user.base_resume_path = str(target)
     user.base_resume_text = extraction.text
@@ -657,7 +949,7 @@ def import_job(payload: JobImportIn, db: Session = Depends(get_db)) -> dict:
         salary_min=payload.salary_min,
         experience_required=payload.experience_required,
         description=payload.description or "",
-        skills=payload.skills,
+        skills=clean_job_skills(payload.skills) or extract_keywords(payload.description or "", limit=16),
         job_url=str(payload.job_url),
         apply_url=payload.apply_url,
         source=payload.source,
@@ -693,7 +985,7 @@ def search_jobs(payload: JobSearchIn, db: Session = Depends(get_db)) -> dict:
             company=item.company,
             location=item.location,
             description=item.description,
-            skills=item.skills,
+            skills=clean_job_skills(item.skills) or extract_keywords(item.description, limit=16),
             job_url=item.job_url,
             apply_url=item.apply_url,
             source=item.source,
@@ -852,7 +1144,7 @@ def linkedin_import_visible(payload: LinkedInImportIn, db: Session = Depends(get
         company=parsed["company"],
         location=parsed["location"],
         description=parsed["description"],
-        skills=parsed["skills"],
+        skills=clean_job_skills(parsed["skills"]) or extract_keywords(parsed["description"], limit=16),
         job_url=str(payload.job_url),
         apply_url=str(payload.job_url),
         source="linkedin_browser_assist",
@@ -1090,16 +1382,45 @@ def tailor_resume(job_id: int, user_id: int | None = None, db: Session = Depends
     if not safety.allowed:
         raise HTTPException(status_code=409, detail={"message": "Safety rules block tailoring.", "blocks": safety.blocks})
 
+    score_result = JobMatchingAgent().score(user, preferences, job)
+    job.match_score = score_result.score
+    job.score_reasons = score_result.reasons
+    job.score_concerns = score_result.concerns
     existing_versions = db.scalars(select(ResumeVersion).where(ResumeVersion.user_id == user.id)).all()
     agent = ResumeTailoringAgent()
     reusable = agent.find_reusable(existing_versions, job)
     if reusable:
+        agent.ensure_pdf_export(user, reusable, job, force=True)
+        metadata = _resume_version_metadata(reusable.metadata_path)
+        score_payload = _score_tailored_resume_payload(
+            user=user,
+            preferences=preferences,
+            job=job,
+            original_score=score_result.score,
+            resume_text=_tailored_resume_text(reusable, user.base_resume_text or ""),
+            metadata=metadata,
+        )
+        job.match_score = max(score_result.score, score_payload["tailored_resume_score"])
         job.status = "Resume tailored"
         db.commit()
-        return {"reused": True, "resume_version_id": reusable.id, "docx_path": reusable.docx_path, "pdf_path": reusable.pdf_path}
+        return {
+            "reused": True,
+            "resume_version_id": reusable.id,
+            "docx_path": reusable.docx_path,
+            "pdf_path": reusable.pdf_path,
+            **score_payload,
+        }
 
-    score = job.match_score if job.match_score is not None else JobMatchingAgent().score(user, preferences, job).score
+    score = score_result.score
     tailored = agent.tailor(user, job, score)
+    score_payload = _score_tailored_resume_payload(
+        user=user,
+        preferences=preferences,
+        job=job,
+        original_score=score,
+        resume_text=_tailored_resume_text(tailored, user.base_resume_text or ""),
+        metadata=tailored.metadata,
+    )
     version = ResumeVersion(
         user_id=user.id,
         company=job.company,
@@ -1115,6 +1436,7 @@ def tailor_resume(job_id: int, user_id: int | None = None, db: Session = Depends
         truthfulness_status="passed",
     )
     db.add(version)
+    job.match_score = max(score, score_payload["tailored_resume_score"])
     job.status = "Resume tailored"
     db.flush()
     application = db.scalar(select(Application).where(Application.user_id == user.id, Application.job_id == job.id))
@@ -1142,6 +1464,7 @@ def tailor_resume(job_id: int, user_id: int | None = None, db: Session = Depends
         "pdf_path": str(tailored.pdf_path),
         "metadata_path": str(tailored.metadata_path),
         "recommended_projects_to_build": tailored.recommended_projects,
+        **score_payload,
     }
 
 
@@ -1150,7 +1473,7 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
     user = db.get(User, user_id) if user_id else _default_user(db)
     preferences = _preferences_for(db, user)
     job = _job_or_404(db, job_id)
-    threshold = preferences.match_threshold or 85
+    threshold = _configured_match_threshold(preferences)
     score = JobMatchingAgent().score(user, preferences, job)
     job.match_score = score.score
     job.score_reasons = score.reasons
@@ -1222,6 +1545,14 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
         }
 
     tailored = ResumeTailoringAgent().tailor(user, job, score.score)
+    score_payload = _score_tailored_resume_payload(
+        user=user,
+        preferences=preferences,
+        job=job,
+        original_score=score.score,
+        resume_text=_tailored_resume_text(tailored, user.base_resume_text or ""),
+        metadata=tailored.metadata,
+    )
     version = ResumeVersion(
         user_id=user.id,
         company=job.company,
@@ -1240,6 +1571,7 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
     db.flush()
     application.resume_version_id = version.id
     application.status = "Resume tailored"
+    job.match_score = max(score.score, score_payload["tailored_resume_score"])
     job.status = "Resume tailored"
     db.add(
         AgentRun(
@@ -1264,6 +1596,7 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
         "reasons": score.reasons,
         "concerns": score.concerns,
         "tex_path": str(tailored.tex_path) if tailored.tex_path else None,
+        **score_payload,
     }
 
 
@@ -1288,30 +1621,257 @@ def required_questions_for_job(job_id: int, user_id: int | None = None, db: Sess
     return {"job_id": job.id, "questions": questions, "saved_answers": packet.packet["answers"]}
 
 
-@router.post("/jobs/{job_id}/auto-apply")
-def auto_apply_job(job_id: int, db: Session = Depends(get_db)) -> dict:
-    """Guardrail endpoint until supervised browser automation is implemented."""
-    job = _job_or_404(db, job_id)
-    _default_user(db)
+@router.post("/apply-queue/build")
+def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, payload.user_id) if payload.user_id else _default_user(db)
+    preferences = _preferences_for(db, user)
+    threshold = _configured_match_threshold(preferences)
+    max_items = max(1, min(payload.max_items, 50))
+
+    if payload.job_ids:
+        jobs = [job for job in (db.get(Job, job_id) for job_id in payload.job_ids) if job]
+    else:
+        jobs = db.scalars(select(Job).order_by(Job.created_at.desc())).all()
+
+    queued: list[ApplyQueueTask] = []
+    skipped: list[dict] = []
+    for job in jobs:
+        if len(queued) >= max_items:
+            break
+        if not _is_linkedin_job(job):
+            skipped.append({"job_id": job.id, "reason": "not_linkedin"})
+            continue
+        if job.match_score is None:
+            score = JobMatchingAgent().score(user, preferences, job)
+            job.match_score = score.score
+            job.score_reasons = score.reasons
+            job.score_concerns = score.concerns
+        below_threshold = (job.match_score or 0) < threshold
+        if below_threshold and not payload.force:
+            before_score = job.match_score or 0
+            try:
+                version, score_payload = _tailor_and_rescore_job(
+                    db,
+                    user=user,
+                    preferences=preferences,
+                    job=job,
+                    original_score=before_score,
+                )
+                below_threshold = (job.match_score or 0) < threshold
+                if below_threshold:
+                    skipped.append(
+                        {
+                            "job_id": job.id,
+                            "reason": "below_threshold_after_tailoring",
+                            "match_score": job.match_score,
+                            "original_match_score": before_score,
+                            "tailored_resume_score": score_payload["tailored_resume_score"],
+                            "threshold": threshold,
+                        }
+                    )
+                    continue
+            except Exception as exc:
+                skipped.append(
+                    {
+                        "job_id": job.id,
+                        "reason": "tailoring_failed_before_queue",
+                        "match_score": before_score,
+                        "threshold": threshold,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+        application = _application_for_job(db, user, job)
+        version = _latest_resume_for_job(db, user, job)
+        if version and not application.resume_version_id:
+            application.resume_version_id = version.id
+        existing = db.scalar(
+            select(ApplyQueueTask)
+            .where(
+                ApplyQueueTask.user_id == user.id,
+                ApplyQueueTask.job_id == job.id,
+                ApplyQueueTask.status.not_in(["failed", "skipped", "submitted_by_user"]),
+            )
+            .order_by(ApplyQueueTask.created_at.desc())
+        )
+        if existing:
+            queued.append(existing)
+            continue
+
+        task = ApplyQueueTask(
+            user_id=user.id,
+            job_id=job.id,
+            application_id=application.id,
+            resume_version_id=application.resume_version_id,
+            status="queued",
+            source="linkedin_easy_apply",
+            message="Queued for supervised LinkedIn Easy Apply.",
+            auto_submit=False,
+        )
+        db.add(task)
+        db.flush()
+        try:
+            task.status = "preparing_resume"
+            resume_path = _ensure_queue_resume(db, user=user, preferences=preferences, job=job, application=application, task=task)
+            task.status = "queued"
+            notes = ["Resume is ready. Start supervised browser apply when ready."]
+            if below_threshold and payload.force:
+                notes.append(f"Queued manually even though score {job.match_score} is below threshold {threshold}.")
+            if task.resume_version_id:
+                notes.append("Prepared PDF from the LaTeX-backed resume version.")
+                if not latex_compiler_available():
+                    notes.append("No local LaTeX compiler was found, so SeekApply used the styled PDF fallback.")
+            elif resume_path == (Path(user.base_resume_path).expanduser() if user.base_resume_path else None):
+                notes.append("Using the uploaded base PDF because no LaTeX template is available.")
+            task.message = " ".join(notes)
+            application.status = "Queued for supervised apply"
+        except Exception as exc:
+            task.status = "failed"
+            task.message = "Could not prepare resume for supervised apply."
+            task.last_error = str(exc)
+        queued.append(task)
+
     db.add(
         AgentRun(
-            agent_name="Application Automation Guard",
-            input_summary=f"job_id={job.id}",
-            output_summary="Unsupervised auto-apply is disabled; prepare a packet and submit manually.",
-            status="blocked",
+            agent_name="Apply Queue Builder",
+            input_summary=f"user_id={user.id}, job_ids={payload.job_ids or 'auto'}",
+            output_summary=f"Queued {len(queued)} LinkedIn job(s); skipped {len(skipped)}.",
         )
     )
     db.commit()
     return {
-        "status": "supervised_required",
-        "message": "Unsupervised auto-apply is disabled. Prepare the application packet, review the resume and answers, then submit in the browser yourself.",
-        "steps": [
-            "Run Resume Decision for this job.",
-            "Prepare the application packet.",
-            "Open the job portal in your browser.",
-            "Pause for login, CAPTCHA, sensitive questions, and final submit.",
-        ],
-        "job_id": job.id,
+        "message": f"Queued {len(queued)} LinkedIn job(s) for supervised apply.",
+        "threshold": threshold,
+        "tasks": [_apply_queue_task_payload(db, task) for task in queued],
+        "skipped": skipped,
+        "auto_submit": False,
+    }
+
+
+@router.get("/apply-queue")
+def list_apply_queue(user_id: int | None = None, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, user_id) if user_id else _default_user(db)
+    tasks = db.scalars(
+        select(ApplyQueueTask).where(ApplyQueueTask.user_id == user.id).order_by(ApplyQueueTask.updated_at.desc())
+    ).all()
+    return {"tasks": [_apply_queue_task_payload(db, task) for task in tasks], "auto_submit": False}
+
+
+def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, resume_existing: bool = False) -> dict:
+    task = db.get(ApplyQueueTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Apply queue task not found.")
+    user = db.get(User, payload.user_id) if payload.user_id else db.get(User, task.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Apply queue user not found.")
+    job = _job_or_404(db, task.job_id)
+    preferences = _preferences_for(db, user)
+    application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
+    task.application_id = application.id
+    task.status = "opening_browser"
+    task.message = "Opening supervised LinkedIn Easy Apply browser."
+    db.flush()
+
+    resume_path = _ensure_queue_resume(db, user=user, preferences=preferences, job=job, application=application, task=task)
+    answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.user_id == user.id)).all()
+    result = SupervisedLinkedInApplyAgent(get_settings().resolved_storage_root).start(
+        task_id=task.id,
+        user=user,
+        job=job,
+        resume_path=resume_path,
+        answers=answers,
+        wait_seconds=max(15, min(payload.wait_seconds, 240)),
+    )
+
+    if result.missing_questions:
+        _save_apply_missing_questions(db, user, job, result.missing_questions)
+    task.status = result.status
+    task.message = result.message
+    task.missing_questions = result.missing_questions
+    task.fill_report = result.fill_report
+    task.steps = result.steps
+    task.last_error = "; ".join(result.errors) if result.errors else None
+    task.auto_submit = False
+    if result.status == "ready_for_submit":
+        application.status = "Ready for final submit"
+    elif result.status == "needs_answers":
+        application.status = "Needs application answers"
+    elif result.status == "needs_login":
+        application.status = "Needs LinkedIn login"
+    elif result.status == "failed":
+        application.status = "Supervised apply failed"
+    db.add(
+        AgentRun(
+            agent_name="Supervised LinkedIn Easy Apply",
+            input_summary=f"task_id={task.id}, job_id={job.id}",
+            output_summary=result.message,
+            status=result.status,
+        )
+    )
+    db.commit()
+    return {
+        "task": _apply_queue_task_payload(db, task),
+        "status": result.status,
+        "message": result.message,
+        "action_required": result.action_required,
+        "steps": result.steps,
+        "errors": result.errors,
+        "missing_questions": result.missing_questions,
+        "fill_report": result.fill_report,
+        "auto_submit": False,
+        "resumed": resume_existing,
+    }
+
+
+@router.post("/apply-queue/{task_id}/start")
+def start_apply_queue_task(task_id: int, payload: ApplyQueueActionIn | None = None, db: Session = Depends(get_db)) -> dict:
+    return _run_apply_task(task_id, payload or ApplyQueueActionIn(), db)
+
+
+@router.post("/apply-queue/{task_id}/resume")
+def resume_apply_queue_task(task_id: int, payload: ApplyQueueActionIn | None = None, db: Session = Depends(get_db)) -> dict:
+    return _run_apply_task(task_id, payload or ApplyQueueActionIn(), db, resume_existing=True)
+
+
+@router.post("/apply-queue/{task_id}/mark-submitted")
+def mark_apply_queue_submitted(task_id: int, payload: ApplyQueueActionIn | None = None, db: Session = Depends(get_db)) -> dict:
+    task = db.get(ApplyQueueTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Apply queue task not found.")
+    user = db.get(User, payload.user_id) if payload and payload.user_id else db.get(User, task.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Apply queue user not found.")
+    job = _job_or_404(db, task.job_id)
+    application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
+    application.status = "Applied"
+    if not application.applied_at:
+        application.applied_at = datetime.utcnow()
+    task.status = "submitted_by_user"
+    task.message = "User confirmed the LinkedIn application was submitted manually."
+    task.auto_submit = False
+    SupervisedLinkedInApplyAgent(get_settings().resolved_storage_root).close(task.id)
+    db.add(
+        AgentRun(
+            agent_name="Supervised LinkedIn Easy Apply",
+            input_summary=f"task_id={task.id}, job_id={job.id}",
+            output_summary="User marked application as submitted.",
+            status="submitted_by_user",
+        )
+    )
+    db.commit()
+    return {"task": _apply_queue_task_payload(db, task), "application_id": application.id, "status": application.status, "auto_submit": False}
+
+
+@router.post("/jobs/{job_id}/auto-apply")
+def auto_apply_job(job_id: int, db: Session = Depends(get_db)) -> dict:
+    """Compatibility route: create a supervised apply queue item, never auto-submit."""
+    _job_or_404(db, job_id)
+    result = build_apply_queue(ApplyQueueBuildIn(job_ids=[job_id], max_items=1, force=True), db)
+    return {
+        **result,
+        "status": "queued_for_supervised_apply" if result["tasks"] else "not_queued",
+        "message": "Job was queued for supervised LinkedIn Easy Apply. Start it from Apply Queue.",
         "auto_submit": False,
     }
 
@@ -1630,7 +2190,12 @@ def download_resume_pdf(version_id: int, db: Session = Depends(get_db)) -> FileR
     version = db.get(ResumeVersion, version_id)
     if not version:
         raise HTTPException(status_code=404, detail="Resume version not found.")
-    pdf_path = Path(version.pdf_path)
+    user = db.get(User, version.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Resume owner not found.")
+    job = db.get(Job, version.job_id) if version.job_id else None
+    pdf_path = ResumeTailoringAgent().ensure_pdf_export(user, version, job, force=True)
+    db.commit()
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF file not found on disk.")
     filename = f"{version.role}_{version.company}.pdf".replace(" ", "_")[:120]
@@ -1658,9 +2223,12 @@ def download_resume_tex(version_id: int, db: Session = Depends(get_db)) -> FileR
     version = db.get(ResumeVersion, version_id)
     if not version:
         raise HTTPException(status_code=404, detail="Resume version not found.")
-    if not version.tex_path:
-        raise HTTPException(status_code=404, detail="LaTeX file was not generated for this version.")
-    tex_path = Path(version.tex_path)
+    user = db.get(User, version.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Resume owner not found.")
+    job = db.get(Job, version.job_id) if version.job_id else None
+    tex_path = ResumeTailoringAgent().ensure_latex_export(user, version, job, force=True)
+    db.commit()
     if not tex_path.exists():
         raise HTTPException(status_code=404, detail="LaTeX file not found on disk.")
     filename = f"{version.role}_{version.company}.tex".replace(" ", "_")[:120]
@@ -1693,13 +2261,14 @@ def list_jobs(db: Session = Depends(get_db)) -> dict:
                 "location": job.location,
                 "work_mode": job.work_mode,
                 "salary": job.salary,
+                "description": job.description,
                 "source": job.source,
                 "status": job.status,
                 "match_score": job.match_score,
                 "score_reasons": job.score_reasons,
                 "score_concerns": job.score_concerns,
                 "job_url": job.job_url,
-                "skills": job.skills,
+                "skills": clean_job_skills(job.skills),
                 "created_at": job.created_at,
                 "application_id": application.id if application else None,
                 "application_status": application.status if application else None,

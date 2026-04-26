@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./seekapply.db"
     storage_root: Path = Path("../storage")
     cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    match_threshold: int = 60
 
     oci_config_file: str = "~/.oci/config"
     oci_profile: str = "DEFAULT"

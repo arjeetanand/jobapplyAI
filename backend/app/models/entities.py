@@ -62,7 +62,7 @@ class JobPreference(Base, TimestampMixin):
     auto_apply_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_email_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     max_applications_per_day: Mapped[int] = mapped_column(Integer, default=10)
-    match_threshold: Mapped[int] = mapped_column(Integer, default=85)
+    match_threshold: Mapped[int] = mapped_column(Integer, default=60)
 
     user: Mapped[User] = relationship(back_populates="preferences")
 
@@ -141,6 +141,24 @@ class Application(Base, TimestampMixin):
     follow_up_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     interview_stage: Mapped[str | None] = mapped_column(String(160), nullable=True)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ApplyQueueTask(Base, TimestampMixin):
+    __tablename__ = "apply_queue_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"))
+    application_id: Mapped[int | None] = mapped_column(ForeignKey("applications.id"), nullable=True)
+    resume_version_id: Mapped[int | None] = mapped_column(ForeignKey("resume_versions.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(80), default="queued")
+    source: Mapped[str] = mapped_column(String(120), default="linkedin_easy_apply")
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    missing_questions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    fill_report: Mapped[dict] = mapped_column(JSON, default=dict)
+    steps: Mapped[list[str]] = mapped_column(JSON, default=list)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auto_submit: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Contact(Base, TimestampMixin):

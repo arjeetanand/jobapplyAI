@@ -260,6 +260,10 @@ def populate():
         # --- Store the LaTeX template source ---
         # We'll store in preferred_resume_template for now (will add proper field in Phase 3)
         user.preferred_resume_template = "overleaf-latex"
+        
+        main_tex_path = Path(__file__).parent.parent.parent / "main.tex"
+        if main_tex_path.exists():
+            user.latex_template_source = main_tex_path.read_text(encoding="utf-8")
 
         # --- Update preferences ---
         prefs = db.scalar(select(JobPreference).where(JobPreference.user_id == user.id))

@@ -4,6 +4,7 @@ import {
   History,
   ListChecks,
   Linkedin,
+  Send,
   ShieldCheck,
   Upload
 } from "lucide-react";
@@ -12,10 +13,11 @@ export const sections = [
   { id: "resume", label: "Resume Intake", icon: Upload, idx: "01 / 07" },
   { id: "linkedin", label: "Find Jobs", icon: Linkedin, idx: "02 / 07" },
   { id: "review", label: "Match & Resume", icon: ShieldCheck, idx: "03 / 07" },
-  { id: "questions", label: "Questions KB", icon: ListChecks, idx: "04 / 07" },
-  { id: "tracker", label: "Applications", icon: BriefcaseBusiness, idx: "05 / 07" },
-  { id: "logs", label: "Logs", icon: History, idx: "06 / 07" },
-  { id: "browser", label: "Page Import", icon: ClipboardCheck, idx: "07 / 07" }
+  { id: "apply", label: "Apply Queue", icon: Send, idx: "04 / 08" },
+  { id: "questions", label: "Questions KB", icon: ListChecks, idx: "05 / 08" },
+  { id: "tracker", label: "Applications", icon: BriefcaseBusiness, idx: "06 / 08" },
+  { id: "logs", label: "Logs", icon: History, idx: "07 / 08" },
+  { id: "browser", label: "Page Import", icon: ClipboardCheck, idx: "08 / 08" }
 ] as const;
 
 export type SectionId = string;

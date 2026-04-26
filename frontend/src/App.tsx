@@ -21,7 +21,7 @@ import {
   Zap
 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, API_URL, Analytics, Answer, Claim, CurrentResume, DiscoveryPreferences, JobRow, LinkedInPlan, ResumeVersion, TrackerRow } from "./lib/api";
+import { api, API_URL, Analytics, Answer, ApplyQueueTask, Claim, CurrentResume, DiscoveryPreferences, JobRow, LinkedInPlan, ResumeVersion, TrackerRow } from "./lib/api";
 import { Button, Field, inputClass, Panel, textareaClass } from "./components/ui";
 import { SectionId, Sidebar } from "./components/Sidebar";
 import { StatCard } from "./components/StatCard";
@@ -67,7 +67,7 @@ const defaultPreferences = {
   auto_apply_enabled: false,
   auto_email_enabled: false,
   max_applications_per_day: 10,
-  match_threshold: 75
+  match_threshold: 60
 };
 
 export default function App() {
@@ -108,7 +108,7 @@ export default function App() {
               <div className="section-kicker">01 / 13 Workflow System</div>
               <h1 className="hero-title mt-3 text-ink">Resume-First Job Application Playbook</h1>
               <p className="mt-3 max-w-3xl text-sm leading-6 text-[#5f574b]">
-                Upload once, extract verified profile data, match jobs against an 85% threshold, reuse or tailor resume versions, and preserve every portal question in your knowledge base.
+                Upload once, extract verified profile data, match jobs against the configured threshold, reuse or tailor resume versions, and preserve every portal question in your knowledge base.
               </p>
             </div>
             <div className="rounded-[18px] border border-[#2f2f2f] bg-[#111111] p-4 text-[#f7f2e8] shadow-float fade-slide-up">
@@ -151,6 +151,7 @@ export default function App() {
               {active === "linkedin" && <LinkedInAssist onNotice={setNotice} onGoReview={() => setActive("review")} />}
               {active === "browser" && <BrowserAssist onNotice={setNotice} />}
               {active === "review" && <MatchReview onNotice={setNotice} onRefresh={refresh} />}
+              {active === "apply" && <ApplyQueue onNotice={setNotice} onRefresh={refresh} />}
               {(active === "answers" || active === "questions") && <AnswerBank onNotice={setNotice} />}
               {active === "packets" && <ApplicationPackets onNotice={setNotice} />}
               {active === "claims" && <ClaimLedger onNotice={setNotice} />}
@@ -689,9 +690,9 @@ function RunHistory({ onNotice }: { onNotice: (message: string) => void }) {
 }
 
 function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) => void; onGoReview: () => void }) {
-  const [keywords, setKeywords] = useState("AI Engineer, Generative AI Engineer, ML Engineer");
+  const [keywords, setKeywords] = useState("AI Engineer, Generative AI Engineer, ML Engineer, AI Scientist");
   const [location, setLocation] = useState("India");
-  const [workMode, setWorkMode] = useState("remote");
+  const [workMode, setWorkMode] = useState("Hybrid");
   const [dateSincePosted, setDateSincePosted] = useState("past_week");
   const [easyApply, setEasyApply] = useState("any");
   const [limit, setLimit] = useState(6);
@@ -1011,12 +1012,24 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     setBusyFor(job.id, true);
     try {
       const decision = await api.resumeDecision(job.id);
+      const actionLabels: Record<string, string> = {
+        use_base_resume: "Use uploaded base resume",
+        tailored_resume_created: "Tailored resume created",
+        blocked: "Blocked by safety settings",
+      };
       const lines = [
-        `${decision.match_score}/100 — threshold ${decision.threshold}`,
-        `Action: ${decision.action}`,
+        `Match score: ${decision.match_score}/100. Queue threshold: ${decision.threshold}.`,
+        `Resume decision: ${actionLabels[decision.action] ?? decision.action}`,
+        decision.original_match_score !== undefined ? `Original resume score: ${decision.original_match_score}/100` : "",
+        decision.tailored_resume_score !== undefined
+          ? `Tailored resume score: ${decision.tailored_resume_score}/100 (${decision.score_delta && decision.score_delta > 0 ? "+" : ""}${decision.score_delta ?? 0})`
+          : "",
+        decision.minimal_latex_edit ? "PDF is based on your uploaded LaTeX resume with minimal targeted edits." : "",
+        decision.pdf_generation ? `PDF generation: ${decision.pdf_generation}` : "",
         decision.message,
         decision.resume_path ? `Base resume: ${decision.resume_path}` : "",
-        decision.ai_generated ? "✨ AI-generated tailored resume" : "",
+        decision.ai_generated ? "AI-generated tailored resume" : "",
+        ...(decision.resume_changes ?? []).map((change) => `Changed: ${change}`),
         ...(decision.reasons ?? []),
         ...(decision.concerns ?? []),
       ].filter(Boolean);
@@ -1066,6 +1079,26 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     try {
       const draft = await api.draftEmail(job.id);
       setResultFor(job.id, [draft.subject, "", draft.body]);
+      await onRefresh();
+    } finally {
+      setBusyFor(job.id, false);
+    }
+  };
+
+  const handleQueue = async (job: JobRow) => {
+    setBusyFor(job.id, true);
+    try {
+      const result = await api.buildApplyQueue({ job_ids: [job.id], max_items: 1, force: true });
+      const task = result.tasks[0];
+      setResultFor(job.id, [
+        result.message,
+        task ? `Apply task ${task.id}: ${task.status}` : "Job was not eligible for the supervised LinkedIn queue.",
+        task?.message || "",
+        result.skipped.length ? `Skipped: ${JSON.stringify(result.skipped)}` : "",
+        "SeekApply will use a LaTeX-backed PDF when a LaTeX template/source is available.",
+      ].filter(Boolean));
+      onNotice(task ? `Queued ${job.title} for supervised apply.` : "Job was not queued. Check source details.");
+      await loadJobs();
       await onRefresh();
     } finally {
       setBusyFor(job.id, false);
@@ -1143,6 +1176,14 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                     ))}
                   </div>
                 )}
+                {job.description && (
+                  <details className="mt-3 max-w-4xl rounded border border-line bg-white px-3 py-2 text-xs text-slate-700">
+                    <summary className="cursor-pointer font-semibold text-ink">Job description</summary>
+                    <div className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap leading-5">
+                      {job.description}
+                    </div>
+                  </details>
+                )}
               </div>
 
               {/* Score badge */}
@@ -1185,6 +1226,13 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
               >
                 <MailPlus size={13} /> Draft Email
+              </button>
+              <button
+                disabled={isBusy}
+                onClick={() => handleQueue(job).catch((e) => onNotice(e.message))}
+                className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
+              >
+                <Send size={13} /> Add to Apply Queue
               </button>
             </div>
 
@@ -1259,6 +1307,195 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
           </Panel>
         );
       })}
+    </div>
+  );
+}
+
+function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => void; onRefresh: () => Promise<void> }) {
+  const [tasks, setTasks] = useState<ApplyQueueTask[]>([]);
+  const [busy, setBusy] = useState<Record<number, boolean>>({});
+  const [answerTask, setAnswerTask] = useState<ApplyQueueTask | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+
+  const load = async () => {
+    const data = await api.applyQueue();
+    setTasks(data.tasks);
+  };
+
+  useEffect(() => {
+    load().catch((error) => onNotice(error.message));
+  }, []);
+
+  const setBusyFor = (id: number, value: boolean) => setBusy((prev) => ({ ...prev, [id]: value }));
+
+  const buildQueue = async () => {
+    const result = await api.buildApplyQueue({});
+    setTasks(result.tasks);
+    onNotice(`${result.message} Threshold: ${result.threshold}. Skipped: ${result.skipped.length}.`);
+    await onRefresh();
+  };
+
+  const runTask = async (task: ApplyQueueTask, mode: "start" | "resume") => {
+    setBusyFor(task.id, true);
+    try {
+      const result = mode === "start" ? await api.startApplyTask(task.id) : await api.resumeApplyTask(task.id);
+      onNotice(result.action_required || result.message);
+      if (result.missing_questions.length) {
+        setAnswerTask(result.task);
+        setAnswers(Object.fromEntries(result.missing_questions.map((question) => [question, ""])));
+      }
+      await load();
+      await onRefresh();
+    } finally {
+      setBusyFor(task.id, false);
+    }
+  };
+
+  const markSubmitted = async (task: ApplyQueueTask) => {
+    setBusyFor(task.id, true);
+    try {
+      const result = await api.markApplySubmitted(task.id);
+      onNotice(`Application ${result.application_id} marked as ${result.status}.`);
+      await load();
+      await onRefresh();
+    } finally {
+      setBusyFor(task.id, false);
+    }
+  };
+
+  const saveMissingAnswers = async () => {
+    if (!answerTask) return;
+    const items = answerTask.missing_questions
+      .map((question) => ({
+        question_text: question,
+        answer_text: answers[question] || "",
+        source: "linkedin_easy_apply_missing_question",
+        sensitive: true,
+        approved: true,
+      }))
+      .filter((item) => item.answer_text.trim());
+    if (!items.length) {
+      onNotice("Add at least one answer before saving.");
+      return;
+    }
+    await api.bulkAnswers({ answers: items });
+    onNotice(`Saved ${items.length} answer(s). Resuming supervised apply.`);
+    const task = answerTask;
+    setAnswerTask(null);
+    setAnswers({});
+    await runTask(task, "resume");
+  };
+
+  const statusClass = (status: string) => {
+    if (status === "ready_for_submit") return "bg-emerald-100 text-emerald-700";
+    if (status === "needs_answers" || status === "needs_login") return "bg-amber-100 text-amber-700";
+    if (status === "failed") return "bg-red-100 text-red-700";
+    if (status === "submitted_by_user") return "bg-cobalt text-white";
+    return "bg-slate-100 text-slate-600";
+  };
+
+  return (
+    <div className="grid gap-4">
+      <Panel className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold">Supervised Apply Queue</h2>
+            <div className="mt-1 text-sm text-slate-500">LinkedIn Easy Apply only. SeekApply fills and pauses before Submit.</div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" onClick={() => load().catch((error) => onNotice(error.message))}>
+              <RefreshCcw size={15} /> Refresh
+            </Button>
+            <Button onClick={() => buildQueue().catch((error) => onNotice(error.message))}>
+              <Send size={15} /> Build Queue
+            </Button>
+          </div>
+        </div>
+      </Panel>
+
+      {tasks.length ? (
+        <div className="grid gap-3">
+          {tasks.map((task) => {
+            const isBusy = busy[task.id] ?? false;
+            return (
+              <Panel key={task.id} className="p-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="font-semibold text-ink">{task.job.title}</div>
+                    <div className="mt-1 text-sm text-slate-600">
+                      {task.job.company}{task.job.location ? ` · ${task.job.location}` : ""} · score {task.job.match_score ?? "-"}
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                      <span className={`rounded px-2 py-1 font-semibold ${statusClass(task.status)}`}>{task.status}</span>
+                      <span className="text-slate-500">{task.application_status || "No application yet"}</span>
+                      <a href={task.job.job_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-cobalt hover:underline">
+                        <ExternalLink size={12} /> Job
+                      </a>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button disabled={isBusy || task.status === "submitted_by_user"} onClick={() => runTask(task, "start").catch((error) => onNotice(error.message))}>
+                      <Linkedin size={15} /> {isBusy ? "Working..." : "Start"}
+                    </Button>
+                    <Button variant="secondary" disabled={isBusy || !["needs_login", "needs_answers", "failed"].includes(task.status)} onClick={() => runTask(task, "resume").catch((error) => onNotice(error.message))}>
+                      <RefreshCcw size={15} /> Resume
+                    </Button>
+                    <Button variant="secondary" disabled={isBusy || task.status !== "ready_for_submit"} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
+                      <CheckCircle2 size={15} /> Mark Submitted
+                    </Button>
+                  </div>
+                </div>
+                {task.message && <div className="mt-3 rounded border border-line bg-field px-3 py-2 text-sm text-slate-700">{task.message}</div>}
+                {task.missing_questions.length > 0 && (
+                  <div className="mt-3 grid gap-2">
+                    <div className="text-xs font-semibold uppercase text-slate-500">Missing questions</div>
+                    {task.missing_questions.map((question) => (
+                      <div key={question} className="rounded border border-line bg-white px-3 py-2 text-sm text-slate-700">{question}</div>
+                    ))}
+                    <div>
+                      <Button variant="secondary" onClick={() => { setAnswerTask(task); setAnswers(Object.fromEntries(task.missing_questions.map((q) => [q, ""]))); }}>
+                        <ListChecks size={15} /> Answer Questions
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </Panel>
+            );
+          })}
+        </div>
+      ) : (
+        <Panel className="p-8 text-center text-sm text-slate-500">
+          No apply queue items yet. Build the queue from imported LinkedIn jobs that pass your match threshold.
+        </Panel>
+      )}
+
+      {answerTask && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h3 className="text-base font-semibold">Answer LinkedIn Questions</h3>
+              <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setAnswerTask(null)}>Close</button>
+            </div>
+            <div className="grid max-h-[60vh] gap-4 overflow-auto pr-1">
+              {answerTask.missing_questions.map((question) => (
+                <Field key={question} label={question}>
+                  <textarea
+                    className={textareaClass}
+                    value={answers[question] || ""}
+                    onChange={(event) => setAnswers((prev) => ({ ...prev, [question]: event.target.value }))}
+                  />
+                </Field>
+              ))}
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <Button variant="secondary" onClick={() => setAnswerTask(null)}>Cancel</Button>
+              <Button onClick={() => saveMissingAnswers().catch((error) => onNotice(error.message))}>
+                <Save size={15} /> Save &amp; Resume
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

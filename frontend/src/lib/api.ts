@@ -114,6 +114,7 @@ export type JobRow = {
   location: string | null;
   work_mode: string | null;
   salary: string | null;
+  description: string;
   source: string;
   status: string;
   match_score: number | null;
@@ -125,6 +126,38 @@ export type JobRow = {
   application_id: number | null;
   application_status: string | null;
   resume_version_id: number | null;
+};
+
+export type ApplyQueueTask = {
+  id: number;
+  user_id: number;
+  job_id: number;
+  application_id: number | null;
+  resume_version_id: number | null;
+  status: string;
+  source: string;
+  message: string | null;
+  missing_questions: string[];
+  fill_report: Record<string, unknown>;
+  steps: string[];
+  last_error: string | null;
+  auto_submit: false;
+  created_at: string;
+  updated_at: string;
+  job: {
+    title: string;
+    company: string;
+    location: string | null;
+    job_url: string;
+    match_score: number | null;
+    status: string;
+  };
+  application_status: string | null;
+  resume: {
+    id: number;
+    pdf_path: string;
+    docx_path: string;
+  } | null;
 };
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -300,7 +333,18 @@ export const api = {
       recommendation: string;
     }>(`/jobs/${jobId}/score`, { method: "POST" }),
   tailorResume: (jobId: number) =>
-    request<{ resume_version_id: number; pdf_path: string; docx_path: string; reused: boolean }>(
+    request<{
+      resume_version_id: number;
+      pdf_path: string;
+      docx_path: string;
+      reused: boolean;
+      original_match_score?: number;
+      tailored_resume_score?: number;
+      score_delta?: number;
+      resume_changes?: string[];
+      pdf_generation?: string;
+      minimal_latex_edit?: boolean;
+    }>(
       `/jobs/${jobId}/tailor-resume`,
       { method: "POST" }
     ),
@@ -316,6 +360,12 @@ export const api = {
       pdf_path?: string;
       docx_path?: string;
       ai_generated?: boolean;
+      original_match_score?: number;
+      tailored_resume_score?: number;
+      score_delta?: number;
+      resume_changes?: string[];
+      pdf_generation?: string;
+      minimal_latex_edit?: boolean;
       reasons?: string[];
       concerns?: string[];
     }>(`/jobs/${jobId}/resume-decision`, { method: "POST" }),
@@ -337,6 +387,41 @@ export const api = {
     request<{ status: string; message: string; steps: string[]; fill_plan?: any }>(`/jobs/${jobId}/auto-apply`, {
       method: "POST"
     }),
+  buildApplyQueue: (payload: unknown = {}) =>
+    request<{ message: string; threshold: number; tasks: ApplyQueueTask[]; skipped: unknown[]; auto_submit: false }>(
+      "/apply-queue/build",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+  applyQueue: () => request<{ tasks: ApplyQueueTask[]; auto_submit: false }>("/apply-queue"),
+  startApplyTask: (taskId: number) =>
+    request<{
+      task: ApplyQueueTask;
+      status: string;
+      message: string;
+      action_required: string | null;
+      steps: string[];
+      errors: string[];
+      missing_questions: string[];
+      fill_report: Record<string, unknown>;
+      auto_submit: false;
+    }>(`/apply-queue/${taskId}/start`, { method: "POST", body: JSON.stringify({ wait_seconds: 90 }) }),
+  resumeApplyTask: (taskId: number) =>
+    request<{
+      task: ApplyQueueTask;
+      status: string;
+      message: string;
+      action_required: string | null;
+      steps: string[];
+      errors: string[];
+      missing_questions: string[];
+      fill_report: Record<string, unknown>;
+      auto_submit: false;
+    }>(`/apply-queue/${taskId}/resume`, { method: "POST", body: JSON.stringify({ wait_seconds: 90 }) }),
+  markApplySubmitted: (taskId: number) =>
+    request<{ task: ApplyQueueTask; application_id: number; status: string; auto_submit: false }>(
+      `/apply-queue/${taskId}/mark-submitted`,
+      { method: "POST", body: JSON.stringify({}) }
+    ),
   updateApplicationStatus: (applicationId: number, status: string, notes?: string) =>
     request<{ application_id: number; status: string }>(
       `/applications/${applicationId}/status`,
