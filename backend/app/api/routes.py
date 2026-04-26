@@ -866,6 +866,8 @@ async def browser_assist_import_bookmarklet(request: Request, db: Session = Depe
 
     user = db.scalar(select(User).order_by(User.id.desc()))
     source_site = str(payload.get("source_site") or _source_site_from_url(page_url))
+    raw_skills = payload.get("skills") or []
+    skills = raw_skills if isinstance(raw_skills, list) else _split_answer_list(str(raw_skills))
     result = _import_visible_job_payload(
         db,
         user=user,
@@ -878,7 +880,7 @@ async def browser_assist_import_bookmarklet(request: Request, db: Session = Depe
         visible_text=payload.get("visible_text"),
         apply_url=payload.get("apply_url") or page_url,
         salary=payload.get("salary"),
-        skills=payload.get("skills") or [],
+        skills=skills,
         agent_name="Browser Assist Bookmarklet",
     )
 

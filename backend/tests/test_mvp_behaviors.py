@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -333,3 +334,78 @@ def test_bulk_answers_upsert_and_sync_profile_preferences(tmp_path, monkeypatch)
         phone_answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.question_key == "phone")).all()
         assert len(phone_answers) == 1
         assert phone_answers[0].answer_text == "9999999999"
+
+
+def test_linkedin_assist_preferences_are_saved_and_reused(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", b"Arjeet Anand\narjeet@example.com\nPython FastAPI RAG", "text/plain")},
+    )
+    user_id = upload.json()["user_id"]
+
+    saved = client.patch(
+        "/linkedin/assist/preferences",
+        json={
+            "user_id": user_id,
+            "keywords": ["AI Engineer", "ML Engineer"],
+            "location": "Bengaluru",
+            "date_since_posted": "past_24_hours",
+            "work_mode": "hybrid",
+            "easy_apply": "easy_apply",
+            "limit": 4,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["preferences"]["keywords"] == ["AI Engineer", "ML Engineer"]
+
+    loaded = client.get("/linkedin/assist/preferences")
+    assert loaded.status_code == 200
+    assert loaded.json()["location"] == "Bengaluru"
+    assert loaded.json()["work_mode"] == "hybrid"
+
+    plans = client.post(
+        "/linkedin/assist/search",
+        json={
+            "user_id": user_id,
+            "keywords": ["Data Scientist"],
+            "location": "Remote",
+            "date_since_posted": "past_week",
+            "work_mode": "remote",
+            "easy_apply": "any",
+            "limit": 2,
+        },
+    )
+    assert plans.status_code == 200
+    body = plans.json()
+    assert body["preferences"]["keywords"] == ["Data Scientist"]
+    assert body["plans"][0]["filters"]["sort"] == "most_recent"
+    assert "keywords=Data+Scientist" in body["plans"][0]["url"]
+
+
+def test_bookmarklet_import_saves_visible_job(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+    client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", b"Arjeet Anand\narjeet@example.com\nPython FastAPI RAG", "text/plain")},
+    )
+    payload = {
+        "page_url": "https://www.linkedin.com/jobs/view/999",
+        "source_site": "linkedin.com",
+        "title": "Generative AI Engineer",
+        "company": "ExampleAI",
+        "location": "Remote India",
+        "description": "Build LLM applications with Python, FastAPI, RAG, and vector databases.",
+        "visible_text": "Generative AI Engineer\nExampleAI\nRemote India\nPython FastAPI RAG",
+    }
+
+    imported = client.post("/browser-assist/import-bookmarklet", data={"payload": json.dumps(payload)})
+    assert imported.status_code == 200
+    assert "Imported job" in imported.text
+
+    jobs = client.get("/jobs")
+    assert jobs.status_code == 200
+    row = jobs.json()["jobs"][0]
+    assert row["title"] == "Generative AI Engineer"
+    assert row["company"] == "ExampleAI"
+    assert row["source"] == "browser_assist:linkedin.com"

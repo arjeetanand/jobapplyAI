@@ -679,30 +679,63 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
   const [keywords, setKeywords] = useState("AI Engineer, Generative AI Engineer, ML Engineer");
   const [location, setLocation] = useState("India");
   const [workMode, setWorkMode] = useState("remote");
+  const [dateSincePosted, setDateSincePosted] = useState("past_week");
+  const [easyApply, setEasyApply] = useState("any");
+  const [limit, setLimit] = useState(6);
   const [plans, setPlans] = useState<LinkedInPlan[]>([]);
   const [checklist, setChecklist] = useState<string[]>([]);
   const [jobUrl, setJobUrl] = useState("https://www.linkedin.com/jobs/view/123456789");
   const [visibleText, setVisibleText] = useState(
     "Generative AI Engineer\nExampleAI\nRemote India\nBuild LLM applications with Python, FastAPI, RAG, vector databases, evaluation, and production APIs."
   );
+  const [copied, setCopied] = useState(false);
+  const bookmarkletHref = useMemo(() => buildBrowserAssistBookmarklet(`${API_URL}/browser-assist/import-bookmarklet`), []);
+
+  const applyDiscoveryPreferences = (preferences: DiscoveryPreferences) => {
+    if (preferences.keywords.length) setKeywords(preferences.keywords.join(", "));
+    if (preferences.location) setLocation(preferences.location);
+    setWorkMode(preferences.work_mode || "any");
+    setDateSincePosted(preferences.date_since_posted || "past_week");
+    setEasyApply(preferences.easy_apply || "any");
+    setLimit(preferences.limit || 6);
+  };
+
+  useEffect(() => {
+    api.linkedinPreferences().then(applyDiscoveryPreferences).catch((error) => onNotice(error.message));
+  }, []);
+
+  const preferencePayload = () => ({
+    keywords: split(keywords),
+    location,
+    work_mode: workMode,
+    date_since_posted: dateSincePosted,
+    easy_apply: easyApply,
+    limit
+  });
 
   const buildPlans = async () => {
-    const result = await api.linkedinAssist({
-      keywords: split(keywords),
-      location,
-      work_mode: workMode,
-      date_since_posted: "past_week",
-      easy_apply: "any",
-      limit: 6
-    });
+    const result = await api.linkedinAssist(preferencePayload());
+    applyDiscoveryPreferences(result.preferences);
     setPlans(result.plans);
     setChecklist(result.checklist);
-    onNotice(`Created ${result.plans.length} LinkedIn browser-assist searches.`);
+    onNotice(`Saved preferences and created ${result.plans.length} LinkedIn searches.`);
+  };
+
+  const savePreferences = async () => {
+    const result = await api.saveLinkedinPreferences(preferencePayload());
+    applyDiscoveryPreferences(result.preferences);
+    onNotice(result.message);
   };
 
   const importVisible = async () => {
     const result = await api.linkedinImportVisible({ job_url: jobUrl, visible_text: visibleText });
     onNotice(`${result.message} Job ID: ${result.job_id}`);
+  };
+
+  const copyBookmarklet = async () => {
+    await navigator.clipboard.writeText(bookmarkletHref);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
   };
 
   return (
@@ -723,9 +756,53 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
               <option value="onsite">Onsite</option>
             </select>
           </Field>
-          <Button onClick={() => buildPlans().catch((error) => onNotice(error.message))}>
-            <Linkedin size={16} /> Generate Searches
-          </Button>
+          <Field label="Date posted">
+            <select className={inputClass} value={dateSincePosted} onChange={(e) => setDateSincePosted(e.target.value)}>
+              <option value="past_24_hours">Past 24 hours</option>
+              <option value="past_week">Past week</option>
+              <option value="past_month">Past month</option>
+              <option value="any">Any</option>
+            </select>
+          </Field>
+          <Field label="Apply type">
+            <select className={inputClass} value={easyApply} onChange={(e) => setEasyApply(e.target.value)}>
+              <option value="any">Any</option>
+              <option value="easy_apply">Easy Apply</option>
+            </select>
+          </Field>
+          <Field label="Search count">
+            <input className={inputClass} type="number" min={1} max={12} value={limit} onChange={(e) => setLimit(Number(e.target.value) || 1)} />
+          </Field>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => buildPlans().catch((error) => onNotice(error.message))}>
+              <Linkedin size={16} /> Generate And Save
+            </Button>
+            <Button variant="secondary" onClick={() => savePreferences().catch((error) => onNotice(error.message))}>
+              <Save size={16} /> Save Preferences
+            </Button>
+          </div>
+        </div>
+        <div className="mt-5 grid gap-3 border-t border-line pt-5">
+          <div className="flex flex-wrap items-center gap-2">
+            <a
+              className="focus-ring floating-lift inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-cobalt bg-cobalt px-4 text-sm font-semibold text-white transition hover:opacity-90"
+              href={bookmarkletHref}
+              onClick={(event) => {
+                event.preventDefault();
+                copyBookmarklet().catch((error) => onNotice(error.message));
+              }}
+              draggable
+              title="Drag this to your bookmarks bar, then click it on an open job page."
+            >
+              <ClipboardCheck size={16} /> Save Visible Job to SeekApply
+            </a>
+            <Button variant="secondary" onClick={() => copyBookmarklet().catch((error) => onNotice(error.message))}>
+              <Save size={16} /> {copied ? "Copied" : "Copy"}
+            </Button>
+          </div>
+          <div className="rounded border border-line bg-field p-3 text-xs leading-5 text-slate-600">
+            Add this once to your bookmarks bar. On a LinkedIn job page, click it and the visible job details are saved here automatically.
+          </div>
         </div>
         <div className="mt-5 grid gap-2">
           {checklist.map((item) => (
@@ -749,7 +826,7 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
           </div>
         </Panel>
         <Panel className="p-5">
-          <h2 className="mb-4 text-base font-semibold">Import Visible Job</h2>
+          <h2 className="mb-4 text-base font-semibold">Manual Fallback</h2>
           <div className="grid gap-4">
             <Field label="LinkedIn job URL"><input className={inputClass} value={jobUrl} onChange={(e) => setJobUrl(e.target.value)} /></Field>
             <Field label="Copied visible job text"><textarea className={textareaClass} value={visibleText} onChange={(e) => setVisibleText(e.target.value)} /></Field>
@@ -1195,4 +1272,9 @@ function formatBytes(value: number | null | undefined) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function buildBrowserAssistBookmarklet(endpoint: string) {
+  const script = `(function(){function q(s){var e=document.querySelector(s);return e&&e.innerText?e.innerText.trim():""}var href=window.location.href;var host=window.location.hostname.replace(/^www\\./,"");var title=q(".job-details-jobs-unified-top-card__job-title,.topcard__title,[data-test-job-title],h1")||document.title;var company=q(".job-details-jobs-unified-top-card__company-name,.topcard__org-name-link,[data-test-job-company-name]");var loc=q(".job-details-jobs-unified-top-card__primary-description-container,.topcard__flavor--bullet,[data-test-job-location]");var desc=q(".jobs-description-content__text,.description__text,.jobs-box__html-content,[data-test-job-description],main")||document.body.innerText;var payload={page_url:href,source_site:host,title:title,company:company,location:loc,description:desc.slice(0,12000),visible_text:document.body.innerText.slice(0,12000),apply_url:href};var f=document.createElement("form");f.method="POST";f.action=${JSON.stringify(endpoint)};f.target="_blank";var i=document.createElement("input");i.type="hidden";i.name="payload";i.value=JSON.stringify(payload);f.appendChild(i);document.body.appendChild(f);f.submit();setTimeout(function(){f.remove()},1000);})();`;
+  return `javascript:${script}`;
 }
