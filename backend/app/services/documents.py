@@ -101,8 +101,10 @@ def write_docx_from_template(
     """Create a tailored DOCX by making small edits to an uploaded Word resume.
 
     The goal is to keep the user's Word layout intact while replacing only the
-    profile/summary and adding compact targeted evidence. If python-docx cannot
-    load the template, the caller can fall back to the clean DOCX writer.
+    profile/summary and adding compact targeted skill evidence. The Projects
+    section is preserved exactly so generated or inferred project text cannot
+    look like unsupported resume evidence. If python-docx cannot load the
+    template, the caller can fall back to the clean DOCX writer.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -141,28 +143,6 @@ def write_docx_from_template(
 
     def norm(value: str) -> str:
         return " ".join(value.lower().strip().split())
-
-    def compact_key(value: str) -> str:
-        return "".join(ch for ch in value.lower() if ch.isalnum())
-
-    def project_name(project: dict) -> str:
-        name = str(project.get("name") or "").strip()
-        if name:
-            return name
-        url = str(project.get("url") or project.get("repo_url") or "").strip()
-        return url.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ").title() if url else "Project"
-
-    def unique_projects(projects: list[dict]) -> list[dict]:
-        selected: list[dict] = []
-        seen: set[str] = set()
-        for project in projects:
-            name = project_name(project)
-            key = compact_key(name) or compact_key(str(project.get("url") or project.get("repo_url") or ""))
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            selected.append(project)
-        return selected
 
     def replace_text(paragraph, text: str) -> None:
         if paragraph.runs:
@@ -234,7 +214,7 @@ def write_docx_from_template(
         profile_text = f"Profile updated for {job_title} at {company} using verified resume evidence."
 
     skills_text = ", ".join(emphasized_skills[:10])
-    selected_projects = unique_projects(selected_projects)
+    _ = selected_projects  # Project evidence is tracked in metadata only for Word templates.
 
     items = all_paragraphs(doc)
     profile_idx = heading_index(items, {"profile", "professional summary", "summary"})
@@ -250,28 +230,6 @@ def write_docx_from_template(
     skills_idx = heading_index(items, {"technical skills", "skills"})
     if skills_idx is not None and skills_text:
         insert_after(items[skills_idx], f"Targeted Focus for {job_title}: {skills_text}")
-
-    items = all_paragraphs(doc)
-    projects_idx = heading_index(items, {"projects", "ai projects", "selected projects"})
-    if projects_idx is not None and selected_projects:
-        existing_text_key = compact_key(" ".join(paragraph.text for paragraph in items))
-        focus_names: list[str] = []
-        new_projects: list[dict] = []
-        for project in selected_projects[:5]:
-            name = project_name(project)
-            if name not in focus_names:
-                focus_names.append(name)
-            if compact_key(name) and compact_key(name) not in existing_text_key:
-                new_projects.append(project)
-
-        anchor = insert_after(items[projects_idx], f"Targeted Project Focus for {job_title}: {', '.join(focus_names[:5])}")
-        for project in new_projects[:3]:
-            name = project_name(project)
-            summary = str(project.get("summary") or "").strip()
-            skills = ", ".join(str(skill) for skill in (project.get("skills") or [])[:6])
-            line = f"{name}: {summary}{f' ({skills})' if skills else ''}".strip()
-            if line:
-                anchor = insert_after(anchor, line)
 
     try:
         doc.save(str(path))

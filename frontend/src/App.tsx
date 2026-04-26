@@ -481,6 +481,7 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
     linkedin_url: string | null;
     github_url: string | null;
     work_authorization: string | null;
+    experience_years: number;
     skills: string[];
   } | null>(null);
   const [skillsText, setSkillsText] = useState("");
@@ -511,6 +512,7 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
         linkedin_url: data.profile.linkedin_url,
         github_url: data.profile.github_url,
         work_authorization: data.profile.work_authorization,
+        experience_years: data.profile.experience_years ?? 0,
         skills: data.profile.skills || []
       });
       setSkillsText((data.profile.skills || []).join(", "));
@@ -578,6 +580,7 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
     add("linkedin_url", "What is your LinkedIn profile URL?", extracted.linkedin_url);
     add("github_url", "What is your GitHub profile URL, if relevant?", extracted.github_url);
     add("verified_skills", "Which skills should be treated as verified for matching?", skillsText, false);
+    add("experience_years", "How many years of professional experience should be used for job eligibility?", String(extracted.experience_years ?? 0), false);
     add("notice_period", "What is your notice period?", noticePeriod);
     add("work_authorization", "What work authorization answer should be used?", workAuthorization);
     add("expected_ctc", "What is your expected compensation?", preferredSalary);
@@ -601,6 +604,7 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
         linkedin_url: extracted.linkedin_url?.trim() || null,
         github_url: extracted.github_url?.trim() || null,
         work_authorization: workAuthorization.trim() || null,
+        experience_years: Number(extracted.experience_years) || 0,
         skills: split(skillsText),
         notice_period: noticePeriod,
         preferred_salary: preferredSalary,
@@ -715,6 +719,16 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
                 <Field label="Location"><input className={inputClass} value={extracted.location || ""} onChange={(e) => setExtracted({ ...extracted, location: e.target.value })} /></Field>
                 <Field label="LinkedIn"><input className={inputClass} value={extracted.linkedin_url || ""} onChange={(e) => setExtracted({ ...extracted, linkedin_url: e.target.value })} /></Field>
                 <Field label="GitHub"><input className={inputClass} value={extracted.github_url || ""} onChange={(e) => setExtracted({ ...extracted, github_url: e.target.value })} /></Field>
+                <Field label="Years of experience">
+                  <input
+                    className={inputClass}
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={extracted.experience_years ?? 0}
+                    onChange={(e) => setExtracted({ ...extracted, experience_years: Number(e.target.value) || 0 })}
+                  />
+                </Field>
                 <Field label="Notice period"><input className={inputClass} value={noticePeriod} onChange={(e) => setNoticePeriod(e.target.value)} placeholder="Immediate / 30 days / 60 days" /></Field>
                 <Field label="Work authorization"><input className={inputClass} value={workAuthorization} onChange={(e) => setWorkAuthorization(e.target.value)} placeholder="Country / visa / sponsorship status" /></Field>
                 <Field label="Expected compensation"><input className={inputClass} value={preferredSalary} onChange={(e) => setPreferredSalary(e.target.value)} placeholder="Example: 18-28 LPA" /></Field>
@@ -803,13 +817,14 @@ function ResumeIntake({ onNotice }: { onNotice: (message: string) => void }) {
 function Onboarding({ onNotice, onRefresh }: { onNotice: (message: string) => void; onRefresh: () => Promise<void> }) {
   const [name, setName] = useState(defaultProfile.name);
   const [email, setEmail] = useState(defaultProfile.email);
+  const [experienceYears, setExperienceYears] = useState(defaultProfile.experience_years);
   const [skills, setSkills] = useState(defaultProfile.skills.join(", "));
   const [targetRoles, setTargetRoles] = useState(defaultPreferences.target_roles.join(", "));
   const [excluded, setExcluded] = useState("");
 
   const save = async () => {
     const payload = {
-      profile: { ...defaultProfile, name, email, skills: split(skills) },
+      profile: { ...defaultProfile, name, email, experience_years: experienceYears, skills: split(skills) },
       preferences: { ...defaultPreferences, target_roles: split(targetRoles), excluded_companies: split(excluded) }
     };
     const result = await api.onboarding(payload);
@@ -827,6 +842,9 @@ function Onboarding({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Full name"><input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} /></Field>
           <Field label="Email"><input className={inputClass} value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+          <Field label="Years of experience">
+            <input className={inputClass} type="number" min={0} step={0.1} value={experienceYears} onChange={(e) => setExperienceYears(Number(e.target.value) || 0)} />
+          </Field>
           <Field label="Skills"><textarea className={textareaClass} value={skills} onChange={(e) => setSkills(e.target.value)} /></Field>
           <Field label="Target roles"><textarea className={textareaClass} value={targetRoles} onChange={(e) => setTargetRoles(e.target.value)} /></Field>
           <Field label="Excluded companies"><textarea className={textareaClass} value={excluded} onChange={(e) => setExcluded(e.target.value)} placeholder="Company names separated by commas" /></Field>
@@ -858,7 +876,7 @@ function BrowserAssist({ onNotice }: { onNotice: (message: string) => void }) {
       description,
       visible_text: `${title}\n${company}\n${description}`
     });
-    onNotice(`${result.message} Job ID: ${result.job_id}. Confidence: ${result.parser_confidence}`);
+    onNotice(`${result.message} Job ID: ${result.job_id}. Confidence: ${result.parser_confidence}. ${result.experience_requirement?.message || ""}`.trim());
   };
 
   return (
@@ -997,6 +1015,7 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
   const [dateSincePosted, setDateSincePosted] = useState("past_week");
   const [easyApply, setEasyApply] = useState("any");
   const [limit, setLimit] = useState(6);
+  const [maxPages, setMaxPages] = useState(5);
   const [plans, setPlans] = useState<LinkedInPlan[]>([]);
   const [checklist, setChecklist] = useState<string[]>([]);
   const [jobUrl, setJobUrl] = useState("https://www.linkedin.com/jobs/view/123456789");
@@ -1026,7 +1045,7 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
   const loadImportedJobs = async () => {
     const data = await api.listJobs();
     setImportedJobs(
-      data.jobs.filter((job) => job.source.includes("linkedin") || job.source.includes("browser_assist")).slice(0, 12)
+      data.jobs.filter((job) => job.source.includes("linkedin") || job.source.includes("browser_assist")).slice(0, 25)
     );
   };
 
@@ -1062,14 +1081,17 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
       const result = await api.supervisedLinkedinImport({
         max_jobs: Math.max(1, Math.min(limit, 50)),
         include_descriptions: true,
-        wait_seconds: 90
+        wait_seconds: 90,
+        max_pages: Math.max(1, Math.min(maxPages, 8)),
+        skip_existing: true
       });
       setImportResult([
         `${result.status}: ${result.message}`,
         `Found ${result.jobs_found}; added ${result.jobs_added}; already saved ${result.jobs_deduped}.`,
+        result.pages_scanned ? `Pages scanned: ${result.pages_scanned}. Saved jobs skipped before opening details: ${result.jobs_skipped_existing ?? 0}.` : "",
         ...(result.action_required ? [result.action_required] : []),
         ...result.errors
-      ]);
+      ].filter(Boolean));
       await loadImportedJobs();
       onNotice(`LinkedIn import finished: ${result.jobs_added} new job(s), ${result.jobs_deduped} duplicate(s).`);
     } catch (error: any) {
@@ -1083,7 +1105,7 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
   const importVisible = async () => {
     const result = await api.linkedinImportVisible({ job_url: jobUrl, visible_text: visibleText });
     await loadImportedJobs();
-    onNotice(`${result.message} Job ID: ${result.job_id}`);
+    onNotice(`${result.message} Job ID: ${result.job_id}. ${result.experience_requirement?.message || ""}`.trim());
   };
 
   const copyBookmarklet = async () => {
@@ -1127,6 +1149,9 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
           <Field label="Search count">
             <input className={inputClass} type="number" min={1} max={12} value={limit} onChange={(e) => setLimit(Number(e.target.value) || 1)} />
           </Field>
+          <Field label="Pages per search">
+            <input className={inputClass} type="number" min={1} max={8} value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value) || 1)} />
+          </Field>
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => buildPlans().catch((error) => onNotice(error.message))}>
               <Linkedin size={16} /> Generate And Save
@@ -1167,7 +1192,7 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
             </Button>
           </div>
           <div className="rounded border border-line bg-field p-3 text-xs leading-5 text-slate-600">
-            Add this once to your bookmarks bar. Open a LinkedIn search page, scroll to load jobs, then click it to save all visible job cards.
+            Add this once to your bookmarks bar. Open a LinkedIn search page, scroll to load jobs, then click it to save visible cards. Auto Import scans later result pages, skips jobs already saved, and uses a visible browser with conservative delays.
           </div>
         </div>
         <div className="mt-5 grid gap-2">
@@ -1210,6 +1235,9 @@ function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) 
                   <div className="font-semibold text-ink">{job.title}</div>
                   <div className="mt-1 text-slate-600">{job.company}{job.location ? ` · ${job.location}` : ""}</div>
                   <div className="mt-1 text-xs text-slate-500">{job.status} · score {job.match_score ?? "-"}</div>
+                  <div className={`mt-2 inline-flex max-w-full rounded border px-2 py-0.5 text-xs font-medium ${experienceFitClass(job.experience_fit?.status)}`}>
+                    {experienceFitShort(job)}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1254,7 +1282,7 @@ function JobSearch({ onNotice }: { onNotice: (message: string) => void }) {
       skills: split(skills),
       source: "manual"
     });
-    onNotice(`${result.message} Job ID: ${result.job_id}`);
+    onNotice(`${result.message} Job ID: ${result.job_id}. ${result.experience_requirement?.message || ""}`.trim());
   };
 
   return (
@@ -1451,6 +1479,9 @@ function ApplyInterventionModal({
           </button>
         </div>
         <div className="grid gap-4 overflow-auto p-5">
+          <div className="rounded border border-blue-200 bg-blue-50 p-3 text-xs leading-5 text-blue-900">
+            SeekApply is not randomly searching LinkedIn here. It opens the saved job URL, clicks the top-card apply action, fills visible fields from your profile/KB, uploads the selected resume, and stops before final submit.
+          </div>
           <div className="rounded border border-line bg-field p-3 text-sm leading-6 text-slate-700">
             {snapshot.action_required || snapshot.message}
           </div>
@@ -1625,6 +1656,7 @@ function compactResumeChange(change: string) {
   }
   if (/Auto-refined from the job description/i.test(clean)) return "Auto-refined from JD without unsupported skills";
   if (/Applied your refinement comments/i.test(clean)) return clean.replace("Applied your refinement comments where they matched verified skills:", "Applied your notes:");
+  if (/Preserved the Word Projects section exactly/i.test(clean)) return "Preserved Word Projects exactly";
   return clean;
 }
 
@@ -1741,6 +1773,21 @@ function PdfPreviewGrid({ preview }: { preview: ResumePreview }) {
 
 function scoreValue(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function experienceFitClass(status?: string | null) {
+  if (status === "meets") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (status === "stretch") return "border-amber-200 bg-amber-50 text-amber-800";
+  if (status === "below") return "border-red-200 bg-red-50 text-red-800";
+  return "border-sky-200 bg-sky-50 text-sky-800";
+}
+
+function experienceFitShort(job: { experience_fit?: { status?: string; label?: string; message?: string; min_years?: number | null } | null; experience_required?: string | null }) {
+  const fit = job.experience_fit;
+  if (fit?.status === "meets") return fit.label || "Experience meets JD";
+  if (fit?.status === "stretch") return "Stretch: " + (fit.label || "experience requirement");
+  if (fit?.status === "below") return "Below minimum: " + (fit.label || "experience requirement");
+  return job.experience_required || fit?.message || "No minimum mentioned; you can apply";
 }
 
 function ResumeDifferenceView({ preview }: { preview: ResumePreview }) {
@@ -1863,9 +1910,10 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
       setJobs((prev) => prev.map((item) => item.id === job.id ? { ...item, match_score: score.match_score } : item));
       setResultFor(job.id, [
         `${score.match_score}/100 — ${score.recommendation}`,
+        score.experience_requirement?.message ? `Experience: ${score.experience_requirement.message}` : "",
         ...score.reason,
         ...score.concerns,
-      ]);
+      ].filter(Boolean));
       await loadLab(job.id);
       await loadJobs();
       await onRefresh();
@@ -1886,9 +1934,10 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
           setJobs((prev) => prev.map((item) => item.id === job.id ? { ...item, match_score: score.match_score } : item));
           setResultFor(job.id, [
             `${score.match_score}/100 — ${score.recommendation}`,
+            score.experience_requirement?.message ? `Experience: ${score.experience_requirement.message}` : "",
             ...score.reason.slice(0, 4),
             ...score.concerns.slice(0, 3),
-          ]);
+          ].filter(Boolean));
         } finally {
           setBusyFor(job.id, false);
         }
@@ -2233,6 +2282,9 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                   <span className={`font-medium ${statusColor(job.status)}`}>{job.status}</span>
                   {job.work_mode && <span className="text-slate-400">{job.work_mode}</span>}
                   {job.salary && <span className="text-slate-400">{job.salary}</span>}
+                  <span title={job.experience_fit?.message || job.experience_required || ""} className={`max-w-full truncate rounded border px-2 py-0.5 font-medium ${experienceFitClass(job.experience_fit?.status)}`}>
+                    {experienceFitShort(job)}
+                  </span>
                   <a href={job.job_url} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-cobalt hover:underline">
                     <ExternalLink size={12} /> View Job
                   </a>
@@ -2852,6 +2904,8 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         <div className="grid gap-3">
           {tasks.map((task) => {
             const isBusy = busy[task.id] ?? false;
+            const canStart = ["queued"].includes(task.status);
+            const canResume = ["needs_login", "needs_answers", "needs_user_action", "failed", "opening_browser"].includes(task.status);
             return (
               <Panel key={task.id} className="p-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -2877,11 +2931,11 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    <Button disabled={isBusy || task.status === "submitted_by_user"} onClick={() => runTask(task, "start").catch((error) => onNotice(error.message))}>
+                    <Button disabled={isBusy || !canStart || task.status === "submitted_by_user"} onClick={() => runTask(task, "start").catch((error) => onNotice(error.message))}>
                       <Linkedin size={15} /> {isBusy ? "Working..." : "Start"}
                     </Button>
-                    <Button variant="secondary" disabled={isBusy || !["needs_login", "needs_answers", "needs_user_action", "failed"].includes(task.status)} onClick={() => runTask(task, "resume").catch((error) => onNotice(error.message))}>
-                      <RefreshCcw size={15} /> Resume
+                    <Button variant="secondary" disabled={isBusy || !canResume} onClick={() => runTask(task, "resume").catch((error) => onNotice(error.message))}>
+                      <RefreshCcw size={15} /> Resume Agent
                     </Button>
                     <Button variant="secondary" disabled={isBusy || !["ready_for_submit", "needs_user_action"].includes(task.status)} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
                       <CheckCircle2 size={15} /> Mark Submitted

@@ -4,6 +4,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from app.services.linkedin_assist import LinkedInSearchPlan
 from app.services.text import extract_keywords
@@ -31,6 +32,8 @@ class SupervisedLinkedInResult:
     steps: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     action_required: str | None = None
+    skipped_existing: int = 0
+    pages_scanned: int = 0
 
 
 class SupervisedLinkedInImporter:
@@ -46,6 +49,8 @@ class SupervisedLinkedInImporter:
         max_jobs: int = 20,
         include_descriptions: bool = True,
         wait_seconds: int = 90,
+        exclude_urls: set[str] | None = None,
+        max_pages: int = 5,
     ) -> SupervisedLinkedInResult:
         try:
             from playwright.sync_api import Error as PlaywrightError
@@ -62,10 +67,16 @@ class SupervisedLinkedInImporter:
             return SupervisedLinkedInResult(status="no_searches", message="No LinkedIn search plans were generated.")
 
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        steps = ["Opening a supervised browser window."]
+        steps = [
+            "Opening a supervised browser window.",
+            "Using visible LinkedIn search pages only; saved jobs are skipped before opening detail pages.",
+        ]
         errors: list[str] = []
         jobs: list[SupervisedLinkedInJob] = []
-        seen_urls: set[str] = set()
+        excluded = {_clean_job_url(url) for url in (exclude_urls or set()) if url}
+        seen_urls: set[str] = set(excluded)
+        skipped_existing = 0
+        pages_scanned = 0
 
         try:
             with sync_playwright() as p:
@@ -96,32 +107,50 @@ class SupervisedLinkedInImporter:
                     for plan in plans:
                         if len(jobs) >= max_jobs:
                             break
-                        steps.append(f"Searching LinkedIn for {plan.keyword} in {plan.location}.")
-                        try:
-                            page.goto(plan.url, wait_until="domcontentloaded", timeout=45_000)
-                            self._wait_for_results_or_user_action(page, wait_seconds)
-                            self._scroll_results(page)
-                            found = self._extract_result_cards(page)
-                            steps.append(f"Found {len(found)} visible card(s) for {plan.keyword}.")
-                            for item in found:
-                                if len(jobs) >= max_jobs:
-                                    break
-                                url = item.get("job_url") or ""
-                                if not url or url in seen_urls:
-                                    continue
-                                seen_urls.add(url)
-                                detail = {}
-                                if include_descriptions:
-                                    detail = self._read_job_detail(context, url)
-                                merged = {**item, **{key: value for key, value in detail.items() if value}}
-                                jobs.append(self._job_from_payload(merged))
-                        except PlaywrightTimeoutError as exc:
-                            errors.append(f"Timed out reading {plan.keyword}: {exc}")
-                        except PlaywrightError as exc:
-                            errors.append(f"Could not read {plan.keyword}: {exc}")
-                        except Exception as exc:
-                            logger.exception("Supervised LinkedIn import failed for %s", plan.url)
-                            errors.append(f"Could not read {plan.keyword}: {exc}")
+                        for page_index in range(max(1, max_pages)):
+                            if len(jobs) >= max_jobs:
+                                break
+                            search_url = _paginated_search_url(plan.url, page_index)
+                            steps.append(
+                                f"Searching LinkedIn page {page_index + 1}/{max_pages} for {plan.keyword} in {plan.location}."
+                            )
+                            try:
+                                page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
+                                pages_scanned += 1
+                                self._wait_for_results_or_user_action(page, wait_seconds)
+                                self._scroll_results(page)
+                                found = self._extract_result_cards(page)
+                                candidates = []
+                                for item in found:
+                                    url = _clean_job_url(item.get("job_url") or "")
+                                    if not url:
+                                        continue
+                                    if url in seen_urls:
+                                        skipped_existing += 1
+                                        continue
+                                    item["job_url"] = url
+                                    seen_urls.add(url)
+                                    candidates.append(item)
+                                steps.append(
+                                    f"Found {len(found)} visible card(s); {len(candidates)} new after skipping saved/duplicate jobs."
+                                )
+                                for item in candidates:
+                                    if len(jobs) >= max_jobs:
+                                        break
+                                    detail = {}
+                                    if include_descriptions:
+                                        detail = self._read_job_detail(context, item["job_url"])
+                                        page.wait_for_timeout(700)
+                                    merged = {**item, **{key: value for key, value in detail.items() if value}}
+                                    jobs.append(self._job_from_payload(merged))
+                                page.wait_for_timeout(1200)
+                            except PlaywrightTimeoutError as exc:
+                                errors.append(f"Timed out reading {plan.keyword} page {page_index + 1}: {exc}")
+                            except PlaywrightError as exc:
+                                errors.append(f"Could not read {plan.keyword} page {page_index + 1}: {exc}")
+                            except Exception as exc:
+                                logger.exception("Supervised LinkedIn import failed for %s", search_url)
+                                errors.append(f"Could not read {plan.keyword} page {page_index + 1}: {exc}")
                     try:
                         context.storage_state(path=str(self.state_path))
                     except PlaywrightError as exc:
@@ -147,6 +176,8 @@ class SupervisedLinkedInImporter:
                 jobs=jobs,
                 steps=steps,
                 errors=errors,
+                skipped_existing=skipped_existing,
+                pages_scanned=pages_scanned,
             )
 
         return SupervisedLinkedInResult(
@@ -158,6 +189,8 @@ class SupervisedLinkedInImporter:
             steps=steps,
             errors=errors,
             action_required="Open LinkedIn in the launched browser, sign in or resolve prompts manually, then retry.",
+            skipped_existing=skipped_existing,
+            pages_scanned=pages_scanned,
         )
 
     @staticmethod
@@ -269,8 +302,7 @@ class SupervisedLinkedInImporter:
     @staticmethod
     def _job_from_payload(payload: dict) -> SupervisedLinkedInJob:
         description = str(payload.get("description") or payload.get("visible_text") or "")
-        job_url = str(payload.get("job_url") or payload.get("page_url") or payload.get("apply_url") or "")
-        job_url = re.sub(r"\?.*$", "", job_url)
+        job_url = _clean_job_url(str(payload.get("job_url") or payload.get("page_url") or payload.get("apply_url") or ""))
         return SupervisedLinkedInJob(
             title=str(payload.get("title") or "LinkedIn Imported Role")[:300],
             company=str(payload.get("company") or "Unknown Company")[:250],
@@ -280,3 +312,23 @@ class SupervisedLinkedInImporter:
             apply_url=str(payload.get("apply_url") or job_url),
             skills=extract_keywords(description, limit=16),
         )
+
+
+def _clean_job_url(value: str) -> str:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        if "linkedin." in parsed.netloc.lower() and "/jobs/view/" in parsed.path:
+            return parsed._replace(query="", fragment="").geturl().rstrip("/")
+        return parsed._replace(fragment="").geturl().rstrip("/")
+    except Exception:
+        return re.sub(r"[?#].*$", "", str(value or "")).rstrip("/")
+
+
+def _paginated_search_url(url: str, page_index: int) -> str:
+    if page_index <= 0:
+        return url
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    query["start"] = [str(page_index * 25)]
+    clean_query = urlencode({key: values[-1] for key, values in query.items() if values})
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))

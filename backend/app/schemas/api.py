@@ -103,6 +103,8 @@ class LinkedInSupervisedImportIn(BaseModel):
     max_jobs: int = 20
     include_descriptions: bool = True
     wait_seconds: int = 90
+    max_pages: int = 5
+    skip_existing: bool = True
 
 
 class ApplyQueueBuildIn(BaseModel):
@@ -133,6 +135,7 @@ class ResumeProfileUpdateIn(BaseModel):
     linkedin_url: str | None = None
     github_url: str | None = None
     work_authorization: str | None = None
+    experience_years: float | None = None
     skills: list[str] | None = None
     notice_period: str | None = None
     preferred_salary: str | None = None
@@ -241,6 +244,7 @@ class ScoreOut(BaseModel):
     reason: list[str]
     concerns: list[str]
     recommendation: str
+    experience_requirement: dict[str, Any] = Field(default_factory=dict)
 
 
 class SafetySettingsOut(BaseModel):

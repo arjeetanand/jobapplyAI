@@ -150,8 +150,14 @@ class SupervisedLinkedInApplyAgent:
             answer_lookup = self._answer_lookup(answers)
             fill_report = {
                 "resume_uploaded": False,
+                "resume_selected": False,
+                "resume_actions": [],
                 "profile_fields_filled": 0,
                 "answers_filled": 0,
+                "easy_apply_steps_completed": 0,
+                "questions_seen": [],
+                "kb_matched_questions": [],
+                "unanswered_questions": [],
                 "final_submit_detected": False,
                 "session_profile": str(self.profile_dir),
                 "mode": "linkedin_easy_apply" if is_linkedin else "external_site",
@@ -219,7 +225,25 @@ class SupervisedLinkedInApplyAgent:
             if is_linkedin and easy_apply.get("clicked"):
                 clicked_text = easy_apply.get("clicked_text") or "LinkedIn apply button"
                 steps.append(f"Opened the LinkedIn apply flow from: {clicked_text}.")
-                page.wait_for_timeout(1200)
+                page.wait_for_timeout(2200)
+                if not self._application_form_present(page) and not self._final_submit_visible(page):
+                    fill_report.update(self._page_snapshot(page))
+                    fill_report["manual_review_reason"] = (
+                        "SeekApply clicked the visible LinkedIn Apply button, but no Easy Apply form appeared. "
+                        "LinkedIn may have opened a custom prompt, blocked the modal, or changed the button behavior."
+                    )
+                    self._save_state(context)
+                    return SupervisedApplyResult(
+                        status="needs_user_action",
+                        message="LinkedIn Apply was clicked, but the application form did not open.",
+                        steps=steps,
+                        fill_report=fill_report,
+                        errors=[fill_report["manual_review_reason"]],
+                        action_required=(
+                            "In the visible browser, click the real Easy Apply/Application button manually. "
+                            "When the form is open, click Resume Agent in SeekApply."
+                        ),
+                    )
                 return self._fill_supervised_form(
                     page=page,
                     user=user,
@@ -297,12 +321,15 @@ class SupervisedLinkedInApplyAgent:
             )
         except PlaywrightTimeoutError as exc:
             logger.exception("Supervised apply timed out")
-            self.__class__._close_on_worker(task_id)
+            active = self.__class__._active
+            if active and active.get("task_id") == task_id:
+                self._save_state(active["context"])
             return SupervisedApplyResult(
-                status="failed",
-                message="Supervised apply timed out.",
+                status="needs_user_action",
+                message="Supervised apply timed out, but the visible browser was kept open.",
                 steps=steps,
                 errors=[str(exc)],
+                action_required="Continue in the visible browser, then click Resume Agent. The browser is intentionally left open for inspection.",
             )
         except PlaywrightError as exc:
             message = str(exc)
@@ -316,21 +343,27 @@ class SupervisedLinkedInApplyAgent:
                     action_required="Close the existing LinkedIn apply browser window, then click Start/Resume again.",
                 )
             logger.exception("Supervised apply browser error")
-            self.__class__._close_on_worker(task_id)
+            active = self.__class__._active
+            if active and active.get("task_id") == task_id:
+                self._save_state(active["context"])
             return SupervisedApplyResult(
-                status="failed",
-                message=f"Supervised apply browser error: {exc}",
+                status="needs_user_action",
+                message="Supervised apply hit a browser automation error, but the visible browser was kept open.",
                 steps=steps,
                 errors=[message],
+                action_required="Inspect the visible browser, handle any prompt manually, then click Resume Agent.",
             )
         except Exception as exc:
             logger.exception("Supervised apply automation failed")
-            self.__class__._close_on_worker(task_id)
+            active = self.__class__._active
+            if active and active.get("task_id") == task_id:
+                self._save_state(active["context"])
             return SupervisedApplyResult(
-                status="failed",
-                message=f"Supervised apply automation failed: {exc}",
+                status="needs_user_action",
+                message="Supervised apply hit an automation error, but the visible browser was kept open.",
                 steps=steps,
                 errors=[str(exc)],
+                action_required="Inspect the visible browser, handle any prompt manually, then click Resume Agent.",
             )
 
     @classmethod
@@ -475,14 +508,29 @@ class SupervisedLinkedInApplyAgent:
                         fill_report=fill_report,
                         action_required="Complete login or verification in the visible browser, then click Resume in SeekApply.",
                     )
-            uploaded = self._upload_resume(page, resume_path)
-            fill_report["resume_uploaded"] = fill_report["resume_uploaded"] or uploaded
+            resume_state = self._ensure_resume_selected(page, resume_path)
+            fill_report["resume_uploaded"] = fill_report["resume_uploaded"] or bool(resume_state.get("uploaded"))
+            fill_report["resume_selected"] = fill_report["resume_selected"] or bool(resume_state.get("selected"))
+            resume_message = resume_state.get("message")
+            if resume_message and resume_message not in fill_report["resume_actions"]:
+                fill_report["resume_actions"].append(resume_message)
+                steps.append(resume_message)
             filled = self._fill_visible_fields(page, user, answer_lookup)
             custom_choice_filled = self._fill_custom_choice_controls(page, user, answer_lookup)
             fill_report["profile_fields_filled"] += filled["profile_fields_filled"]
             fill_report["answers_filled"] += filled["answers_filled"] + custom_choice_filled["answers_filled"]
             fill_report["profile_fields_filled"] += custom_choice_filled["profile_fields_filled"]
-            missing_questions = self._missing_questions(page, answer_lookup)
+            previous_matched = set(fill_report.get("kb_matched_questions") or [])
+            question_inventory = self._question_inventory(page, user, answer_lookup)
+            for key in ["questions_seen", "kb_matched_questions", "unanswered_questions"]:
+                merged = list(dict.fromkeys([*(fill_report.get(key) or []), *question_inventory.get(key, [])]))
+                fill_report[key] = merged[:40]
+            new_matched = [item for item in question_inventory.get("kb_matched_questions", []) if item not in previous_matched]
+            if new_matched:
+                steps.append(
+                    f"Matched {len(new_matched)} visible question(s) from profile/KB."
+                )
+            missing_questions = self._missing_questions(page, answer_lookup, user=user)
             if missing_questions:
                 self._save_state(context)
                 return SupervisedApplyResult(
@@ -524,6 +572,7 @@ class SupervisedLinkedInApplyAgent:
             page = next_result.get("page") or page
             if self.__class__._active:
                 self.__class__._active["page"] = page
+            fill_report["easy_apply_steps_completed"] += 1
             steps.append(
                 f"{next_step_label}"
                 f"{' Button: ' + next_result.get('text') if next_result.get('text') else ''}"
@@ -951,6 +1000,80 @@ class SupervisedLinkedInApplyAgent:
         return last_result
 
     @staticmethod
+    def _ensure_resume_selected(page, resume_path: Path) -> dict:
+        uploaded = SupervisedLinkedInApplyAgent._upload_resume(page, resume_path)
+        if uploaded:
+            return {"uploaded": True, "selected": True, "message": f"Uploaded selected resume file: {resume_path.name}."}
+        selected = SupervisedLinkedInApplyAgent._select_existing_resume(page)
+        if selected.get("selected"):
+            return {
+                "uploaded": False,
+                "selected": True,
+                "message": f"Selected resume option: {selected.get('text') or 'existing resume'}.",
+            }
+        return {"uploaded": False, "selected": False, "message": None, **selected}
+
+    @staticmethod
+    def _select_existing_resume(page) -> dict:
+        try:
+            result = page.evaluate(
+                """
+                () => {
+                  function textFor(el) {
+                    const id = el.getAttribute('id');
+                    const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                    const wrapper = el.closest('label, .jobs-document-upload, .jobs-resume-picker, .jobs-easy-apply-form-section__grouping, .fb-dash-form-element, fieldset, li, div');
+                    return [
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('title'),
+                      el.getAttribute('name'),
+                      el.value,
+                      label && label.innerText,
+                      wrapper && wrapper.innerText,
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                  }
+                  function visible(el) {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && rect.width > 0
+                      && rect.height > 0
+                      && !el.closest('[aria-hidden="true"]');
+                  }
+                  function enabled(el) {
+                    return !(el.disabled || el.getAttribute('disabled') !== null || el.getAttribute('aria-disabled') === 'true');
+                  }
+                  function looksResume(text) {
+                    return /(resume|cv|curriculum|\\.pdf|\\.docx|document)/i.test(text)
+                      && !/(cover\\s+letter|portfolio|delete|remove|trash|preview|download)/i.test(text);
+                  }
+                  const root = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal, [role="dialog"]') || document;
+                  const radios = Array.from(root.querySelectorAll('input[type="radio"], input[type="checkbox"]'))
+                    .filter((el) => visible(el) && enabled(el) && looksResume(textFor(el)));
+                  const checked = radios.find((el) => el.checked);
+                  if (checked) return {selected: true, already_selected: true, text: textFor(checked).slice(0, 160)};
+                  const target = radios[0];
+                  if (target) {
+                    target.scrollIntoView({block: 'center', inline: 'center'});
+                    target.click();
+                    return {selected: true, already_selected: false, text: textFor(target).slice(0, 160)};
+                  }
+                  const buttons = Array.from(root.querySelectorAll('button, [role="button"], label'))
+                    .filter((el) => visible(el) && enabled(el) && looksResume(textFor(el)) && /(select|choose|use|resume|cv)/i.test(textFor(el)));
+                  const button = buttons[0];
+                  if (!button) return {selected: false, reason: 'no_resume_option'};
+                  button.scrollIntoView({block: 'center', inline: 'center'});
+                  button.click();
+                  return {selected: true, already_selected: false, text: textFor(button).slice(0, 160)};
+                }
+                """
+            )
+            return result if isinstance(result, dict) else {"selected": bool(result)}
+        except Exception as exc:
+            return {"selected": False, "reason": str(exc)}
+
+    @staticmethod
     def _upload_resume(page, resume_path: Path) -> bool:
         uploaded = False
         if hasattr(page, "main_frame") and hasattr(page, "frames"):
@@ -964,6 +1087,28 @@ class SupervisedLinkedInApplyAgent:
                 inputs = []
             for input_el in inputs[:4]:
                 try:
+                    label = input_el.evaluate(
+                        """
+                        (el) => {
+                          const id = el.getAttribute('id');
+                          const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                          const wrapper = el.closest('label, .jobs-easy-apply-form-section__grouping, .fb-dash-form-element, fieldset, .form-group, .field, .input, .application-question, div');
+                          return [
+                            el.getAttribute('aria-label'),
+                            el.getAttribute('title'),
+                            el.getAttribute('name'),
+                            el.getAttribute('accept'),
+                            label && label.innerText,
+                            wrapper && wrapper.innerText,
+                          ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                        }
+                        """
+                    )
+                    lowered = normalize(str(label or ""))
+                    if len(inputs) > 1 and not any(marker in lowered for marker in ["resume", "cv", "curriculum", "document"]):
+                        continue
+                    if any(marker in lowered for marker in ["cover letter", "portfolio", "transcript"]):
+                        continue
                     input_el.set_input_files(str(resume_path))
                     uploaded = True
                 except Exception:
@@ -1039,6 +1184,17 @@ class SupervisedLinkedInApplyAgent:
                   wrapper && wrapper.innerText,
                 ].filter(Boolean).join(' ').trim();
               }
+              function optionLabelFor(el) {
+                const id = el.getAttribute('id');
+                const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                const parentLabel = el.closest('label');
+                return [
+                  el.getAttribute('aria-label'),
+                  label && label.innerText,
+                  parentLabel && parentLabel.innerText,
+                  el.value,
+                ].filter(Boolean).join(' ').trim();
+              }
               function norm(value) {
                 return (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
               }
@@ -1074,6 +1230,9 @@ class SupervisedLinkedInApplyAgent:
                 if (n.includes('linkedin')) return profile.linkedin_url || '';
                 if (n.includes('github')) return profile.github_url || '';
                 if (n.includes('website') || n.includes('portfolio')) return profile.portfolio_url || profile.github_url || '';
+                if (n.includes('notice')) return profile.notice_period || '';
+                if (n.includes('authorization') || n.includes('visa') || n.includes('sponsor')) return profile.work_authorization || '';
+                if (n.includes('year') && n.includes('experience')) return profile.experience_years !== null && profile.experience_years !== undefined ? String(profile.experience_years) : '';
                 return '';
               }
               function answerValue(label) {
@@ -1135,8 +1294,8 @@ class SupervisedLinkedInApplyAgent:
                 if (!value) continue;
                 const wanted = norm(value);
                 const radio = radios.find((el) => {
-                  const optionLabel = labelFor(el);
-                  const optionText = norm([optionLabel, el.value].filter(Boolean).join(' '));
+                  const optionLabel = optionLabelFor(el);
+                  const optionText = norm(optionLabel);
                   return optionText && (optionText.includes(wanted) || wanted.includes(optionText) || optionText === wanted);
                 });
                 if (!radio) continue;
@@ -1165,6 +1324,9 @@ class SupervisedLinkedInApplyAgent:
                     "linkedin_url": user.linkedin_url,
                     "github_url": user.github_url,
                     "portfolio_url": getattr(user, "portfolio_url", None),
+                    "notice_period": getattr(user, "notice_period", None),
+                    "work_authorization": getattr(user, "work_authorization", None),
+                    "experience_years": getattr(user, "experience_years", None),
                 },
                 "answers": answer_lookup,
             },
@@ -1328,7 +1490,102 @@ class SupervisedLinkedInApplyAgent:
         return counts
 
     @staticmethod
-    def _missing_questions(page, answer_lookup: dict[str, str]) -> list[str]:
+    def _question_inventory(page, user: User, answer_lookup: dict[str, str]) -> dict:
+        try:
+            questions = page.evaluate(
+                """
+                () => {
+                  function labelFor(el) {
+                    const id = el.getAttribute('id');
+                    const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                    const wrapper = el.closest('.jobs-easy-apply-form-section__grouping, .fb-dash-form-element, fieldset, .form-group, .field, .input, .application-question');
+                    return [
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('placeholder'),
+                      el.getAttribute('name'),
+                      label && label.innerText,
+                      wrapper && wrapper.innerText,
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                  }
+                  function visible(el) {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                  }
+                  const controls = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea, select, [contenteditable="true"], [role="combobox"]'));
+                  const out = [];
+                  for (const el of controls) {
+                    if (!visible(el)) continue;
+                    const label = labelFor(el);
+                    if (label && !out.includes(label)) out.push(label.slice(0, 260));
+                  }
+                  return out.slice(0, 30);
+                }
+                """
+            )
+        except Exception:
+            questions = []
+        seen = []
+        matched = []
+        unanswered = []
+        for question in questions or []:
+            if not question or question in seen:
+                continue
+            seen.append(question)
+            if SupervisedLinkedInApplyAgent._answer_for_label(question, answer_lookup) or SupervisedLinkedInApplyAgent._profile_value_for_label(question, user):
+                matched.append(question)
+            else:
+                unanswered.append(question)
+        return {"questions_seen": seen, "kb_matched_questions": matched, "unanswered_questions": unanswered}
+
+    @staticmethod
+    def _answer_for_label(label: str, answer_lookup: dict[str, str]) -> str:
+        normalized = normalize(label)
+        label_tokens = {token for token in normalized.split() if len(token) > 2}
+        for key, value in answer_lookup.items():
+            if not key or not value:
+                continue
+            if normalized in key or key in normalized:
+                return value
+            key_tokens = {token for token in key.split() if len(token) > 2}
+            if label_tokens and key_tokens:
+                overlap = label_tokens & key_tokens
+                if len(overlap) >= 2 and len(overlap) / min(len(label_tokens), len(key_tokens)) >= 0.55:
+                    return value
+        return ""
+
+    @staticmethod
+    def _profile_value_for_label(label: str, user: User) -> str:
+        n = normalize(label)
+        if "email" in n:
+            return getattr(user, "email", None) or ""
+        if "phone" in n or "mobile" in n:
+            return getattr(user, "phone", None) or ""
+        if "first name" in n:
+            return (getattr(user, "name", "") or "").split(" ")[0]
+        if "last name" in n:
+            return " ".join((getattr(user, "name", "") or "").split(" ")[1:])
+        if n == "name" or "full name" in n:
+            return getattr(user, "name", None) or ""
+        if "linkedin" in n:
+            return getattr(user, "linkedin_url", None) or ""
+        if "github" in n:
+            return getattr(user, "github_url", None) or ""
+        if "portfolio" in n or "website" in n:
+            return getattr(user, "portfolio_url", None) or getattr(user, "github_url", None) or ""
+        if "notice" in n:
+            return getattr(user, "notice_period", None) or ""
+        if "authorization" in n or "visa" in n or "sponsor" in n:
+            return getattr(user, "work_authorization", None) or ""
+        if "year" in n and "experience" in n:
+            years = getattr(user, "experience_years", None)
+            return str(years) if years is not None else ""
+        if "city" in n or "location" in n:
+            return getattr(user, "location", None) or ""
+        return ""
+
+    @staticmethod
+    def _missing_questions(page, answer_lookup: dict[str, str], user: User | None = None) -> list[str]:
         questions = page.evaluate(
             """
             () => {
@@ -1399,7 +1656,9 @@ class SupervisedLinkedInApplyAgent:
                     return False
                 overlap = question_tokens & key_tokens
                 return len(overlap) >= 2 and len(overlap) / min(len(question_tokens), len(key_tokens)) >= 0.55
-            if not any(matches(key) for key in approved_keys):
+            if not any(matches(key) for key in approved_keys) and not (
+                user and SupervisedLinkedInApplyAgent._profile_value_for_label(question, user)
+            ):
                 missing.append(question[:500])
         return missing
 

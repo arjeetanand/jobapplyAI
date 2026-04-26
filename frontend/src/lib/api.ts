@@ -137,6 +137,8 @@ export type JobDebug = {
     apply_url?: string | null;
     status: string;
     match_score: number | null;
+    experience_required?: string | null;
+    experience_fit?: ExperienceFit | null;
     score_reasons: string[];
     score_concerns: string[];
     skills: string[];
@@ -186,6 +188,16 @@ export type DiscoveryPreferences = {
   limit: number;
 };
 
+export type ExperienceFit = {
+  status: "no_mention" | "meets" | "stretch" | "below" | string;
+  eligible: boolean;
+  user_years: number;
+  min_years: number | null;
+  max_years: number | null;
+  label: string;
+  message: string;
+};
+
 export type Answer = {
   id: number;
   question_key: string;
@@ -215,6 +227,7 @@ export type CurrentResume = {
     linkedin_url: string | null;
     github_url: string | null;
     work_authorization: string | null;
+    experience_years: number;
     skills: string[];
     notice_period: string | null;
   } | null;
@@ -246,6 +259,8 @@ export type JobRow = {
   location: string | null;
   work_mode: string | null;
   salary: string | null;
+  experience_required?: string | null;
+  experience_fit?: ExperienceFit | null;
   description: string;
   source: string;
   status: string;
@@ -283,6 +298,8 @@ export type ApplyQueueTask = {
     location: string | null;
     job_url: string;
     match_score: number | null;
+    experience_required?: string | null;
+    experience_fit?: ExperienceFit | null;
     status: string;
   };
   application_status: string | null;
@@ -436,7 +453,7 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   importJob: (payload: unknown) =>
-    request<{ job_id: number; message: string }>("/jobs/import-url", {
+    request<{ job_id: number; message: string; deduped?: boolean; match_score?: number | null; experience_requirement?: ExperienceFit }>("/jobs/import-url", {
       method: "POST",
       body: JSON.stringify(payload)
     }),
@@ -461,13 +478,15 @@ export const api = {
       jobs_found: number;
       jobs_added: number;
       jobs_deduped: number;
-      jobs: Array<{ job_id: number; title: string; company: string; job_url: string; apply_url: string | null; deduped: boolean }>;
+      jobs_skipped_existing?: number;
+      pages_scanned?: number;
+      jobs: Array<{ job_id: number; title: string; company: string; job_url: string; apply_url: string | null; deduped: boolean; experience_requirement?: ExperienceFit }>;
     }>("/linkedin/assist/import-supervised", {
       method: "POST",
       body: JSON.stringify(payload)
     }),
   linkedinImportVisible: (payload: unknown) =>
-    request<{ job_id: number; message: string; parsed: { title: string; company: string; skills: string[] } }>(
+    request<{ job_id: number; message: string; experience_requirement?: ExperienceFit; parsed: { title: string; company: string; skills: string[] } }>(
       "/linkedin/assist/import-visible",
       {
         method: "POST",
@@ -475,7 +494,7 @@ export const api = {
       }
     ),
   browserImport: (payload: unknown) =>
-    request<{ job_id: number; message: string; parser_confidence: string; missing_fields: string[] }>(
+    request<{ job_id: number; message: string; parser_confidence: string; missing_fields: string[]; experience_requirement?: ExperienceFit }>(
       "/browser-assist/import-current-page",
       {
         method: "POST",
@@ -523,6 +542,7 @@ export const api = {
       reason: string[];
       concerns: string[];
       recommendation: string;
+      experience_requirement: ExperienceFit;
     }>(`/jobs/${jobId}/score`, { method: "POST" }),
   tailorResume: (jobId: number) =>
     request<{

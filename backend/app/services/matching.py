@@ -1,6 +1,11 @@
 from dataclasses import dataclass
 
 from app.models.entities import Job, JobPreference, User
+from app.services.experience_requirements import (
+    experience_fit_payload,
+    extract_experience_requirement,
+    format_years,
+)
 from app.services.safety import SafetyComplianceAgent
 from app.services.text import clean_job_skills, extract_keywords, keyword_overlap, normalize, tokenize
 
@@ -115,10 +120,30 @@ class JobMatchingAgent:
                     score += text_points
                     reasons.append(f"Resume text has {round(text_overlap * 100)}% keyword overlap with job description.")
 
-        # ---- 4. Experience (max 10) ----
-        if user.experience_years:
+        # ---- 4. Experience requirement (max 10) ----
+        requirement = extract_experience_requirement(job.description, getattr(job, "experience_required", None))
+        try:
+            job.experience_required = requirement.label
+        except Exception:
+            pass
+        fit = experience_fit_payload(getattr(user, "experience_years", 0), requirement)
+        if fit["status"] == "no_mention":
+            score += 8
+            reasons.append("JD does not mention a minimum experience requirement; you can apply if the rest of the fit is good.")
+        elif fit["status"] == "meets":
             score += 10
-            reasons.append(f"User has {user.experience_years}+ years of experience.")
+            reasons.append(
+                f"Experience fits JD minimum: user has {format_years(fit['user_years'])} years; JD asks {format_years(fit['min_years'])}+ years."
+            )
+        elif fit["status"] == "stretch":
+            score += 5
+            concerns.append(
+                f"Experience is a stretch: user has {format_years(fit['user_years'])} years; JD asks {format_years(fit['min_years'])}+ years."
+            )
+        else:
+            concerns.append(
+                f"Experience is below JD minimum: user has {format_years(fit['user_years'])} years; JD asks {format_years(fit['min_years'])}+ years."
+            )
 
         # ---- 5. Salary (max 10) ----
         if preferences.minimum_salary and job.salary_min:
@@ -170,6 +195,9 @@ class JobMatchingAgent:
         if safety.blocks:
             concerns.extend(safety.blocks)
             score = min(score, 40)
+
+        if fit["status"] == "below":
+            score = min(score, 55)
 
         score = max(0, min(100, score))
         recommendation = self._recommendation(score, safety.allowed)

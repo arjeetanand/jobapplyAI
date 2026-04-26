@@ -12,6 +12,7 @@ from app.db.session import Base, get_db
 from app.models.entities import Application, ApplicationAnswer, ApplyQueueTask, Job, ResumeVersion
 from app.services.email_outreach import EmailOutreachAgent
 from app.services.application_packet import ApplicationPacketAgent
+from app.services.experience_requirements import experience_fit_payload, extract_experience_requirement
 from app.services.linkedin_assist import LinkedInAssistAgent
 from app.services.matching import JobMatchingAgent
 from app.services.oci_genai import OCIGenerativeAIProvider
@@ -123,6 +124,28 @@ def test_low_score_requires_user_approval():
     result = JobMatchingAgent().score(sample_user(), sample_preferences(), job)
     assert result.score < 60
     assert result.recommendation == "Blocked by safety rules"
+
+
+def test_experience_requirement_parser_and_fit():
+    requirement = extract_experience_requirement(
+        "Minimum requirements: 2+ years of professional experience building Python APIs."
+    )
+    assert requirement.min_years == 2
+    near_fit = experience_fit_payload(1.8, requirement)
+    assert near_fit["status"] == "meets"
+    assert near_fit["eligible"] is True
+
+    no_mention = extract_experience_requirement("Build Python APIs with FastAPI and RAG.")
+    assert no_mention.no_mention is True
+    assert experience_fit_payload(0, no_mention)["message"] == "No minimum experience mentioned; you can apply."
+
+
+def test_experience_requirement_affects_match_score():
+    job = sample_job(description="Python FastAPI RAG. Minimum 5 years of relevant experience required.")
+    result = JobMatchingAgent().score(sample_user(), sample_preferences(), job)
+    assert result.score <= 55
+    assert any("below JD minimum" in concern for concern in result.concerns)
+    assert "5" in job.experience_required
 
 
 def test_truthfulness_check_rejects_unsupported_claim():
@@ -342,7 +365,8 @@ def test_docx_tailoring_does_not_duplicate_existing_projects(tmp_path, monkeypat
     tailored = ResumeTailoringAgent(storage_root=tmp_path).tailor(user, job, 70)
     text = ResumeExtractionService._docx_text(tailored.docx_path.read_bytes())
 
-    assert "Targeted Project Focus for GEN AI Engineer" in text
+    assert "Targeted Focus for GEN AI Engineer" in text
+    assert "Targeted Project Focus" not in text
     assert "Targeted Project Evidence" not in text
     assert "Old Role" not in text
     assert "stale duplicate" not in text
@@ -402,6 +426,30 @@ def test_linkedin_visible_text_import_parser():
     assert parsed["title"] == "Generative AI Engineer"
     assert parsed["company"] == "ExampleAI"
     assert any(skill.lower() == "python" for skill in parsed["skills"])
+
+
+def test_job_import_extracts_experience_requirement(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+    client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", b"Arjeet Anand\narjeet@example.com\nPython FastAPI RAG", "text/plain")},
+    )
+    imported = client.post(
+        "/jobs/import-url",
+        json={
+            "job_url": "https://example.com/jobs/experience",
+            "title": "AI Engineer",
+            "company": "ExampleAI",
+            "description": "Build Python APIs. Minimum 2 years of experience required.",
+            "skills": ["Python", "FastAPI"],
+        },
+    )
+    assert imported.status_code == 200
+    assert imported.json()["experience_requirement"]["min_years"] == 2
+
+    row = client.get("/jobs").json()["jobs"][0]
+    assert row["experience_fit"]["label"]
+    assert row["experience_fit"]["status"] in {"meets", "stretch", "below"}
 
 
 def test_application_packet_requires_review_items_when_missing_assets():
@@ -1356,6 +1404,11 @@ def test_supervised_apply_detector_accepts_linkedin_apply_button_label():
     assert result["clicked"] is True
     assert result["reason"] == "clicked_linkedin_apply_button"
     assert result["clicked_text"] == "Apply to this job"
+
+
+def test_supervised_apply_can_use_profile_experience_for_form_questions():
+    user = sample_user()
+    assert SupervisedLinkedInApplyAgent._profile_value_for_label("How many years of professional experience do you have?", user) == "3"
 
 
 def test_apply_queue_resume_uses_approved_answers_and_mark_submitted(tmp_path, monkeypatch):

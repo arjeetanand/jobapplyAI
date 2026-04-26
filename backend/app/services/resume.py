@@ -799,7 +799,12 @@ class ResumeTailoringAgent:
         if selected_projects:
             names = [str(project.get("name")) for project in selected_projects if project.get("name")]
             if names:
-                changes.append(f"Selected strongest project evidence for this JD: {', '.join(names[:3])}.")
+                if has_docx_template:
+                    changes.append(
+                        "Preserved the Word Projects section exactly; GitHub/project matches are kept in debug metadata only."
+                    )
+                else:
+                    changes.append(f"Selected strongest project evidence for this JD: {', '.join(names[:3])}.")
         return changes
 
     def auto_refinement_instructions(self, user: User, job: Job) -> str:
@@ -821,13 +826,25 @@ class ResumeTailoringAgent:
                 else "Preserve the uploaded LaTeX format and make minimal targeted edits only."
             ),
             "Rewrite the summary/profile and targeted skills focus for this exact role.",
-            "Reorder or replace the Projects section with the strongest verified GitHub/resume projects for the JD.",
             "Remove low-signal lines only when stronger verified project or skill evidence is available.",
         ]
+        if self.has_docx_template(user):
+            parts.append(
+                "Do not reorder, replace, remove, or add Projects in the Word resume; keep project evidence in metadata/debug unless it already exists in the uploaded Word document."
+            )
+        else:
+            parts.append("Reorder or replace the Projects section with the strongest verified GitHub/resume projects for the JD.")
         if focus:
             parts.append("Emphasize verified overlap already present in the resume: " + ", ".join(focus) + ".")
         if selected_projects:
-            parts.append("Prioritize project evidence: " + ", ".join(str(project.get("name")) for project in selected_projects[:3]) + ".")
+            if self.has_docx_template(user):
+                parts.append(
+                    "Relevant project evidence available for scoring/debug only: "
+                    + ", ".join(str(project.get("name")) for project in selected_projects[:3])
+                    + "."
+                )
+            else:
+                parts.append("Prioritize project evidence: " + ", ".join(str(project.get("name")) for project in selected_projects[:3]) + ".")
         if weak:
             parts.append("Do not claim missing skills; keep these only as gaps or recommended learning if needed: " + ", ".join(weak[:8]) + ".")
         parts.append("Do not invent companies, metrics, titles, projects, or tools.")
