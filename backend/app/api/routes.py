@@ -31,6 +31,7 @@ from app.models.entities import (
 )
 from app.schemas.api import (
     ApplicationAnswerIn,
+    BrowserAssistBulkImportIn,
     BrowserImportIn,
     BulkApplicationAnswersIn,
     ClaimLedgerIn,
@@ -39,6 +40,7 @@ from app.schemas.api import (
     JobSearchIn,
     LinkedInAssistIn,
     LinkedInImportIn,
+    LinkedInSupervisedImportIn,
     OnboardingIn,
     ResumeProfileUpdateIn,
     SafetySettingsOut,
@@ -54,6 +56,7 @@ from app.services.oci_genai import OCIGenerativeAIProvider
 from app.services.resume import ResumeTailoringAgent
 from app.services.resume_extraction import ResumeExtractionService
 from app.services.safety import SafetyComplianceAgent
+from app.services.supervised_linkedin import SupervisedLinkedInImporter
 from app.services.text import extract_keywords
 
 router = APIRouter()
@@ -765,6 +768,79 @@ def linkedin_assist_search(payload: LinkedInAssistIn, db: Session = Depends(get_
     }
 
 
+@router.post("/linkedin/assist/import-supervised")
+def linkedin_supervised_import(payload: LinkedInSupervisedImportIn, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, payload.user_id) if payload.user_id else _default_user(db)
+    preferences = _preferences_for(db, user)
+    discovery_preferences = _discovery_preferences_for(db, user)
+    plans = LinkedInAssistAgent().build_search_plans(
+        preferences=preferences,
+        keywords=discovery_preferences.keywords or None,
+        location=discovery_preferences.location,
+        date_since_posted=discovery_preferences.date_since_posted,
+        work_mode=discovery_preferences.work_mode,
+        easy_apply=discovery_preferences.easy_apply,
+        limit=discovery_preferences.limit,
+    )
+    result = SupervisedLinkedInImporter(get_settings().resolved_storage_root).import_jobs(
+        plans,
+        max_jobs=max(1, min(payload.max_jobs, 50)),
+        include_descriptions=payload.include_descriptions,
+        wait_seconds=max(10, min(payload.wait_seconds, 180)),
+    )
+
+    imported = []
+    for item in result.jobs:
+        saved = _import_visible_job_payload(
+            db,
+            user=user,
+            page_url=item.job_url,
+            source_site=item.source_site,
+            title=item.title,
+            company=item.company,
+            location=item.location,
+            description=item.description,
+            visible_text=item.description,
+            apply_url=item.apply_url,
+            skills=item.skills,
+            agent_name="Supervised LinkedIn Import",
+        )
+        imported.append(
+            {
+                "job_id": saved["job_id"],
+                "title": item.title,
+                "company": item.company,
+                "job_url": item.job_url,
+                "apply_url": item.apply_url,
+                "deduped": saved["deduped"],
+                "parser_confidence": saved["parser_confidence"],
+            }
+        )
+
+    if not result.jobs:
+        db.add(
+            AgentRun(
+                agent_name="Supervised LinkedIn Import",
+                input_summary=f"user_id={user.id}",
+                output_summary=result.message,
+                status=result.status,
+            )
+        )
+        db.commit()
+
+    return {
+        "status": result.status,
+        "message": result.message,
+        "action_required": result.action_required,
+        "steps": result.steps,
+        "errors": result.errors,
+        "jobs_found": len(result.jobs),
+        "jobs_added": sum(1 for item in imported if not item["deduped"]),
+        "jobs_deduped": sum(1 for item in imported if item["deduped"]),
+        "jobs": imported,
+    }
+
+
 @router.post("/linkedin/assist/import-visible")
 def linkedin_import_visible(payload: LinkedInImportIn, db: Session = Depends(get_db)) -> dict:
     parsed = LinkedInAssistAgent().parse_visible_job_text(payload.visible_text)
@@ -839,6 +915,44 @@ def browser_assist_import(payload: BrowserImportIn, db: Session = Depends(get_db
     )
 
 
+@router.post("/browser-assist/import-visible-jobs")
+def browser_assist_import_visible_jobs(payload: BrowserAssistBulkImportIn, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
+    imported = []
+    for item in payload.jobs:
+        result = _import_visible_job_payload(
+            db,
+            user=user,
+            page_url=str(item.page_url),
+            source_site=item.source_site or payload.source_site,
+            title=item.title,
+            company=item.company,
+            location=item.location,
+            description=item.description,
+            visible_text=item.visible_text,
+            apply_url=item.apply_url,
+            salary=item.salary,
+            skills=item.skills,
+            agent_name="Visible Jobs Bulk Import",
+        )
+        imported.append(
+            {
+                "job_id": result["job_id"],
+                "deduped": result["deduped"],
+                "parser_confidence": result["parser_confidence"],
+                "missing_fields": result["missing_fields"],
+            }
+        )
+
+    return {
+        "message": f"Imported {sum(1 for item in imported if not item['deduped'])} new visible job(s); {sum(1 for item in imported if item['deduped'])} already existed.",
+        "jobs_seen": len(imported),
+        "jobs_added": sum(1 for item in imported if not item["deduped"]),
+        "jobs_deduped": sum(1 for item in imported if item["deduped"]),
+        "jobs": imported,
+    }
+
+
 @router.post("/browser-assist/import-bookmarklet")
 async def browser_assist_import_bookmarklet(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     body = await request.body()
@@ -866,33 +980,69 @@ async def browser_assist_import_bookmarklet(request: Request, db: Session = Depe
 
     user = db.scalar(select(User).order_by(User.id.desc()))
     source_site = str(payload.get("source_site") or _source_site_from_url(page_url))
-    raw_skills = payload.get("skills") or []
-    skills = raw_skills if isinstance(raw_skills, list) else _split_answer_list(str(raw_skills))
-    result = _import_visible_job_payload(
-        db,
-        user=user,
-        page_url=page_url,
-        source_site=source_site,
-        title=payload.get("title"),
-        company=payload.get("company"),
-        location=payload.get("location"),
-        description=payload.get("description"),
-        visible_text=payload.get("visible_text"),
-        apply_url=payload.get("apply_url") or page_url,
-        salary=payload.get("salary"),
-        skills=skills,
-        agent_name="Browser Assist Bookmarklet",
-    )
+    raw_jobs = payload.get("jobs") if isinstance(payload.get("jobs"), list) else []
+    imported = []
+    if raw_jobs:
+        for item in raw_jobs[:50]:
+            if not isinstance(item, dict):
+                continue
+            item_url = str(item.get("page_url") or item.get("apply_url") or "")
+            if not item_url.startswith(("http://", "https://")):
+                continue
+            raw_skills = item.get("skills") or []
+            skills = raw_skills if isinstance(raw_skills, list) else _split_answer_list(str(raw_skills))
+            imported.append(
+                _import_visible_job_payload(
+                    db,
+                    user=user,
+                    page_url=item_url,
+                    source_site=str(item.get("source_site") or source_site),
+                    title=item.get("title"),
+                    company=item.get("company"),
+                    location=item.get("location"),
+                    description=item.get("description"),
+                    visible_text=item.get("visible_text"),
+                    apply_url=item.get("apply_url") or item_url,
+                    salary=item.get("salary"),
+                    skills=skills,
+                    agent_name="Browser Assist Bulk Bookmarklet",
+                )
+            )
+    else:
+        raw_skills = payload.get("skills") or []
+        skills = raw_skills if isinstance(raw_skills, list) else _split_answer_list(str(raw_skills))
+        imported.append(
+            _import_visible_job_payload(
+                db,
+                user=user,
+                page_url=page_url,
+                source_site=source_site,
+                title=payload.get("title"),
+                company=payload.get("company"),
+                location=payload.get("location"),
+                description=payload.get("description"),
+                visible_text=payload.get("visible_text"),
+                apply_url=payload.get("apply_url") or page_url,
+                salary=payload.get("salary"),
+                skills=skills,
+                agent_name="Browser Assist Bookmarklet",
+            )
+        )
 
-    status = "Already imported" if result["deduped"] else "Imported"
+    if not imported:
+        raise HTTPException(status_code=400, detail="No visible jobs were found in the bookmarklet payload.")
+
+    added = sum(1 for item in imported if not item["deduped"])
+    deduped = sum(1 for item in imported if item["deduped"])
+    status = f"Imported {added} new job(s)" if added else "All visible jobs already existed"
     html = f"""
     <!doctype html>
     <html>
       <head><title>SeekApply Import</title></head>
       <body style="font-family: system-ui, sans-serif; margin: 32px; color: #111;">
-        <h1>{escape(status)} job {result["job_id"]}</h1>
-        <p>{escape(result["message"])}</p>
-        <p>Parser confidence: {escape(result["parser_confidence"])}</p>
+        <h1>{escape(status)}</h1>
+        <p>Visible jobs received: {len(imported)}. New: {added}. Already saved: {deduped}.</p>
+        <p>These jobs are now available in Match &amp; Resume.</p>
         <p><a href="http://127.0.0.1:5173/">Open SeekApply</a></p>
       </body>
     </html>

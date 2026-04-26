@@ -148,7 +148,7 @@ export default function App() {
               {active === "resume" && <ResumeIntake onNotice={setNotice} />}
               {active === "onboarding" && <Onboarding onNotice={setNotice} onRefresh={refresh} />}
               {active === "search" && <JobSearch onNotice={setNotice} />}
-              {active === "linkedin" && <LinkedInAssist onNotice={setNotice} />}
+              {active === "linkedin" && <LinkedInAssist onNotice={setNotice} onGoReview={() => setActive("review")} />}
               {active === "browser" && <BrowserAssist onNotice={setNotice} />}
               {active === "review" && <MatchReview onNotice={setNotice} onRefresh={refresh} />}
               {(active === "answers" || active === "questions") && <AnswerBank onNotice={setNotice} />}
@@ -688,7 +688,7 @@ function RunHistory({ onNotice }: { onNotice: (message: string) => void }) {
   );
 }
 
-function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
+function LinkedInAssist({ onNotice, onGoReview }: { onNotice: (message: string) => void; onGoReview: () => void }) {
   const [keywords, setKeywords] = useState("AI Engineer, Generative AI Engineer, ML Engineer");
   const [location, setLocation] = useState("India");
   const [workMode, setWorkMode] = useState("remote");
@@ -701,6 +701,9 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
   const [visibleText, setVisibleText] = useState(
     "Generative AI Engineer\nExampleAI\nRemote India\nBuild LLM applications with Python, FastAPI, RAG, vector databases, evaluation, and production APIs."
   );
+  const [importedJobs, setImportedJobs] = useState<JobRow[]>([]);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importResult, setImportResult] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
   const bookmarkletHref = useMemo(() => buildBrowserAssistBookmarklet(`${API_URL}/browser-assist/import-bookmarklet`), []);
 
@@ -715,7 +718,15 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
 
   useEffect(() => {
     api.linkedinPreferences().then(applyDiscoveryPreferences).catch((error) => onNotice(error.message));
+    loadImportedJobs().catch((error) => onNotice(error.message));
   }, []);
+
+  const loadImportedJobs = async () => {
+    const data = await api.listJobs();
+    setImportedJobs(
+      data.jobs.filter((job) => job.source.includes("linkedin") || job.source.includes("browser_assist")).slice(0, 12)
+    );
+  };
 
   const preferencePayload = () => ({
     keywords: split(keywords),
@@ -740,8 +751,36 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
     onNotice(result.message);
   };
 
+  const runSupervisedImport = async () => {
+    setImportBusy(true);
+    setImportResult(["Opening supervised browser. Complete login or prompts there if LinkedIn asks."]);
+    try {
+      const saved = await api.saveLinkedinPreferences(preferencePayload());
+      applyDiscoveryPreferences(saved.preferences);
+      const result = await api.supervisedLinkedinImport({
+        max_jobs: Math.max(1, Math.min(limit, 50)),
+        include_descriptions: true,
+        wait_seconds: 90
+      });
+      setImportResult([
+        `${result.status}: ${result.message}`,
+        `Found ${result.jobs_found}; added ${result.jobs_added}; already saved ${result.jobs_deduped}.`,
+        ...(result.action_required ? [result.action_required] : []),
+        ...result.errors
+      ]);
+      await loadImportedJobs();
+      onNotice(`LinkedIn import finished: ${result.jobs_added} new job(s), ${result.jobs_deduped} duplicate(s).`);
+    } catch (error: any) {
+      setImportResult([error.message]);
+      onNotice(error.message);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
   const importVisible = async () => {
     const result = await api.linkedinImportVisible({ job_url: jobUrl, visible_text: visibleText });
+    await loadImportedJobs();
     onNotice(`${result.message} Job ID: ${result.job_id}`);
   };
 
@@ -790,11 +829,23 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
             <Button onClick={() => buildPlans().catch((error) => onNotice(error.message))}>
               <Linkedin size={16} /> Generate And Save
             </Button>
+            <Button disabled={importBusy} onClick={() => runSupervisedImport()}>
+              <Sparkles size={16} /> {importBusy ? "Importing..." : "Auto Import Jobs"}
+            </Button>
             <Button variant="secondary" onClick={() => savePreferences().catch((error) => onNotice(error.message))}>
               <Save size={16} /> Save Preferences
             </Button>
           </div>
         </div>
+        {importResult.length > 0 && (
+          <div className="mt-5 grid gap-2">
+            {importResult.map((line, index) => (
+              <div key={`${line}-${index}`} className="rounded border border-line bg-field px-3 py-2 text-xs text-slate-700">
+                {line}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="mt-5 grid gap-3 border-t border-line pt-5">
           <div className="flex flex-wrap items-center gap-2">
             <a
@@ -805,16 +856,16 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
                 copyBookmarklet().catch((error) => onNotice(error.message));
               }}
               draggable
-              title="Drag this to your bookmarks bar, then click it on an open job page."
+              title="Drag this to your bookmarks bar, then click it on a LinkedIn search results page or job page."
             >
-              <ClipboardCheck size={16} /> Save Visible Job to SeekApply
+              <ClipboardCheck size={16} /> Save Visible Jobs to SeekApply
             </a>
             <Button variant="secondary" onClick={() => copyBookmarklet().catch((error) => onNotice(error.message))}>
               <Save size={16} /> {copied ? "Copied" : "Copy"}
             </Button>
           </div>
           <div className="rounded border border-line bg-field p-3 text-xs leading-5 text-slate-600">
-            Add this once to your bookmarks bar. On a LinkedIn job page, click it and the visible job details are saved here automatically.
+            Add this once to your bookmarks bar. Open a LinkedIn search page, scroll to load jobs, then click it to save all visible job cards.
           </div>
         </div>
         <div className="mt-5 grid gap-2">
@@ -837,6 +888,34 @@ function LinkedInAssist({ onNotice }: { onNotice: (message: string) => void }) {
               </div>
             ))}
           </div>
+        </Panel>
+        <Panel className="p-5">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-base font-semibold">Imported Jobs</h2>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" onClick={() => loadImportedJobs().catch((error) => onNotice(error.message))}>
+                <RefreshCcw size={15} /> Refresh
+              </Button>
+              <Button onClick={onGoReview}>
+                <Gauge size={15} /> Match &amp; Resume
+              </Button>
+            </div>
+          </div>
+          {importedJobs.length ? (
+            <div className="grid gap-3">
+              {importedJobs.map((job) => (
+                <div key={job.id} className="rounded border border-line bg-white p-3 text-sm">
+                  <div className="font-semibold text-ink">{job.title}</div>
+                  <div className="mt-1 text-slate-600">{job.company}{job.location ? ` · ${job.location}` : ""}</div>
+                  <div className="mt-1 text-xs text-slate-500">{job.status} · score {job.match_score ?? "-"}</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded border border-line bg-field p-3 text-sm text-slate-500">
+              No imported LinkedIn jobs yet. Open a search link, scroll the results, then click the bookmarklet.
+            </div>
+          )}
         </Panel>
         <Panel className="p-5">
           <h2 className="mb-4 text-base font-semibold">Manual Fallback</h2>
@@ -1288,6 +1367,6 @@ function formatBytes(value: number | null | undefined) {
 }
 
 function buildBrowserAssistBookmarklet(endpoint: string) {
-  const script = `(function(){function q(s){var e=document.querySelector(s);return e&&e.innerText?e.innerText.trim():""}var href=window.location.href;var host=window.location.hostname.replace(/^www\\./,"");var title=q(".job-details-jobs-unified-top-card__job-title,.topcard__title,[data-test-job-title],h1")||document.title;var company=q(".job-details-jobs-unified-top-card__company-name,.topcard__org-name-link,[data-test-job-company-name]");var loc=q(".job-details-jobs-unified-top-card__primary-description-container,.topcard__flavor--bullet,[data-test-job-location]");var desc=q(".jobs-description-content__text,.description__text,.jobs-box__html-content,[data-test-job-description],main")||document.body.innerText;var payload={page_url:href,source_site:host,title:title,company:company,location:loc,description:desc.slice(0,12000),visible_text:document.body.innerText.slice(0,12000),apply_url:href};var f=document.createElement("form");f.method="POST";f.action=${JSON.stringify(endpoint)};f.target="_blank";var i=document.createElement("input");i.type="hidden";i.name="payload";i.value=JSON.stringify(payload);f.appendChild(i);document.body.appendChild(f);f.submit();setTimeout(function(){f.remove()},1000);})();`;
+  const script = `(function(){function txt(root,sel){var e=root.querySelector(sel);return e&&e.innerText?e.innerText.trim():""}function cleanUrl(u){try{var x=new URL(u,location.href);x.search="";return x.href}catch(e){return u||location.href}}var host=location.hostname.replace(/^www\\./,"");var seen={};var jobs=[];var cards=[].slice.call(document.querySelectorAll("li.jobs-search-results__list-item,.job-card-container,.base-card,[data-job-id]"));cards.forEach(function(card){var a=card.querySelector('a[href*="/jobs/view/"],a.base-card__full-link,a[href*="/jobs/"]');var url=cleanUrl(a?a.getAttribute("href"):"");if(!url||seen[url])return;seen[url]=true;var lines=(card.innerText||"").split("\\n").map(function(x){return x.trim()}).filter(Boolean);var title=txt(card,'.job-card-list__title,.base-search-card__title,.artdeco-entity-lockup__title,a[href*="/jobs/view/"]')||lines[0]||document.title;var company=txt(card,'.job-card-container__primary-description,.base-search-card__subtitle,.artdeco-entity-lockup__subtitle')||lines[1]||"";var loc=txt(card,'.job-card-container__metadata-item,.job-search-card__location,.artdeco-entity-lockup__caption')||lines[2]||"";jobs.push({page_url:url,source_site:host,title:title,company:company,location:loc,description:(card.innerText||"").slice(0,4000),visible_text:(card.innerText||"").slice(0,4000),apply_url:url});});if(!jobs.length){var title=txt(document,".job-details-jobs-unified-top-card__job-title,.topcard__title,[data-test-job-title],h1")||document.title;var company=txt(document,".job-details-jobs-unified-top-card__company-name,.topcard__org-name-link,[data-test-job-company-name]");var loc=txt(document,".job-details-jobs-unified-top-card__primary-description-container,.topcard__flavor--bullet,[data-test-job-location]");var desc=txt(document,".jobs-description-content__text,.description__text,.jobs-box__html-content,[data-test-job-description],main")||document.body.innerText;jobs=[{page_url:location.href,source_site:host,title:title,company:company,location:loc,description:desc.slice(0,12000),visible_text:document.body.innerText.slice(0,12000),apply_url:location.href}];}var payload={page_url:location.href,source_site:host,jobs:jobs,visible_text:document.body.innerText.slice(0,12000)};var f=document.createElement("form");f.method="POST";f.action=${JSON.stringify(endpoint)};f.target="_blank";var i=document.createElement("input");i.type="hidden";i.name="payload";i.value=JSON.stringify(payload);f.appendChild(i);document.body.appendChild(f);f.submit();setTimeout(function(){f.remove()},1000);})();`;
   return `javascript:${script}`;
 }

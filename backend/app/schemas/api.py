@@ -97,6 +97,13 @@ class DiscoveryPreferencesIn(BaseModel):
     user_id: int | None = None
 
 
+class LinkedInSupervisedImportIn(BaseModel):
+    user_id: int | None = None
+    max_jobs: int = 20
+    include_descriptions: bool = True
+    wait_seconds: int = 90
+
+
 class LinkedInImportIn(BaseModel):
     job_url: HttpUrl
     visible_text: str
@@ -131,6 +138,26 @@ class BrowserImportIn(BaseModel):
     apply_url: str | None = None
     salary: str | None = None
     skills: list[str] = Field(default_factory=list)
+    user_id: int | None = None
+
+
+class BrowserAssistVisibleJobIn(BaseModel):
+    page_url: HttpUrl
+    source_site: str = "browser_assist"
+    title: str | None = None
+    company: str | None = None
+    location: str | None = None
+    description: str | None = None
+    visible_text: str | None = None
+    apply_url: str | None = None
+    salary: str | None = None
+    skills: list[str] = Field(default_factory=list)
+
+
+class BrowserAssistBulkImportIn(BaseModel):
+    page_url: HttpUrl | None = None
+    source_site: str = "browser_assist"
+    jobs: list[BrowserAssistVisibleJobIn] = Field(default_factory=list)
     user_id: int | None = None
 
 

@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.routes import router
 from app.db.session import Base, get_db
-from app.models.entities import ApplicationAnswer
+from app.models.entities import ApplicationAnswer, Job
 from app.services.email_outreach import EmailOutreachAgent
 from app.services.application_packet import ApplicationPacketAgent
 from app.services.linkedin_assist import LinkedInAssistAgent
@@ -401,7 +401,7 @@ def test_bookmarklet_import_saves_visible_job(tmp_path, monkeypatch):
 
     imported = client.post("/browser-assist/import-bookmarklet", data={"payload": json.dumps(payload)})
     assert imported.status_code == 200
-    assert "Imported job" in imported.text
+    assert "Imported 1 new job" in imported.text
 
     jobs = client.get("/jobs")
     assert jobs.status_code == 200
@@ -409,3 +409,96 @@ def test_bookmarklet_import_saves_visible_job(tmp_path, monkeypatch):
     assert row["title"] == "Generative AI Engineer"
     assert row["company"] == "ExampleAI"
     assert row["source"] == "browser_assist:linkedin.com"
+
+
+def test_bookmarklet_bulk_import_saves_visible_search_results(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+    client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", b"Arjeet Anand\narjeet@example.com\nPython FastAPI RAG", "text/plain")},
+    )
+    payload = {
+        "page_url": "https://www.linkedin.com/jobs/search/?keywords=AI",
+        "source_site": "linkedin.com",
+        "jobs": [
+            {
+                "page_url": "https://www.linkedin.com/jobs/view/111",
+                "source_site": "linkedin.com",
+                "title": "AI Engineer",
+                "company": "OneAI",
+                "location": "Bengaluru",
+                "description": "Python FastAPI RAG LLMs",
+                "visible_text": "AI Engineer\nOneAI\nBengaluru\nPython FastAPI RAG LLMs",
+            },
+            {
+                "page_url": "https://www.linkedin.com/jobs/view/222",
+                "source_site": "linkedin.com",
+                "title": "ML Engineer",
+                "company": "TwoAI",
+                "location": "Remote",
+                "description": "Machine learning Python APIs",
+                "visible_text": "ML Engineer\nTwoAI\nRemote\nMachine learning Python APIs",
+            },
+        ],
+    }
+
+    imported = client.post("/browser-assist/import-bookmarklet", data={"payload": json.dumps(payload)})
+    assert imported.status_code == 200
+    assert "Visible jobs received: 2" in imported.text
+
+    jobs = client.get("/jobs").json()["jobs"]
+    assert len(jobs) == 2
+    assert {job["title"] for job in jobs} == {"AI Engineer", "ML Engineer"}
+
+
+def test_supervised_linkedin_import_endpoint_saves_jobs(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.txt", b"Arjeet Anand\narjeet@example.com\nPython FastAPI RAG", "text/plain")},
+    )
+    user_id = upload.json()["user_id"]
+    client.patch(
+        "/linkedin/assist/preferences",
+        json={"user_id": user_id, "keywords": ["AI Engineer"], "location": "Remote", "limit": 1},
+    )
+
+    class FakeImporter:
+        def __init__(self, storage_root):
+            self.storage_root = storage_root
+
+        def import_jobs(self, plans, *, max_jobs, include_descriptions, wait_seconds):
+            assert plans
+            assert max_jobs == 1
+            return obj(
+                status="completed",
+                message="Imported visible data for 1 LinkedIn job(s).",
+                jobs=[
+                    obj(
+                        title="AI Engineer",
+                        company="ExampleAI",
+                        location="Remote",
+                        description="Build Python FastAPI RAG systems.",
+                        job_url="https://www.linkedin.com/jobs/view/333",
+                        apply_url="https://company.example/apply/333",
+                        source_site="linkedin.com",
+                        skills=["python", "fastapi", "rag"],
+                    )
+                ],
+                steps=["Opened browser"],
+                errors=[],
+                action_required=None,
+            )
+
+    monkeypatch.setattr("app.api.routes.SupervisedLinkedInImporter", FakeImporter)
+    imported = client.post("/linkedin/assist/import-supervised", json={"max_jobs": 1})
+    assert imported.status_code == 200
+    body = imported.json()
+    assert body["status"] == "completed"
+    assert body["jobs_added"] == 1
+
+    with session_factory() as db:
+        job = db.scalar(select(Job).where(Job.job_url == "https://www.linkedin.com/jobs/view/333"))
+        assert job is not None
+        assert job.apply_url == "https://company.example/apply/333"
+        assert job.source == "browser_assist:linkedin.com"
