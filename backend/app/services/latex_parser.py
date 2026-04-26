@@ -148,7 +148,7 @@ def parse_latex_resume(source: str) -> ParsedResume:
     # --- Projects ---
     projects: list[ParsedProject] = []
     proj_section = re.search(
-        r"\\section\{Projects\}(.*?)(?=\\section\{|$)",
+        r"\\section\{(?:AI Projects|Projects)\}(.*?)(?=\\section\{|$)",
         source, re.DOTALL
     )
     if proj_section:

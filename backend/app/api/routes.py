@@ -105,6 +105,58 @@ def _configured_match_threshold(preferences: JobPreference | None = None) -> int
     return max(0, min(int(threshold or 60), 100))
 
 
+def _dedupe_strings(values: list[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        clean = str(value).strip()
+        key = re.sub(r"[^a-z0-9+#.]+", " ", clean.lower()).strip()
+        if clean and key and key not in seen:
+            seen.add(key)
+            output.append(clean)
+    return output
+
+
+def _merge_github_project_evidence(user: User, repositories: list[dict]) -> int:
+    if not repositories:
+        return 0
+    existing = list(user.github_repositories or [])
+    seen = {
+        re.sub(r"[^a-z0-9]+", " ", str(item.get("url") or item.get("name") or "").lower()).strip()
+        for item in existing
+    }
+    added = 0
+    for repo in repositories[:20]:
+        url = str(repo.get("url") or repo.get("repo_url") or "").strip()
+        name = str(repo.get("name") or "").strip()
+        if not name and url:
+            name = url.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ").title()
+        summary = str(repo.get("summary") or repo.get("description") or repo.get("notes") or "").strip()
+        raw_skills = repo.get("skills") or []
+        if isinstance(raw_skills, str):
+            raw_skills = [item.strip() for item in raw_skills.split(",") if item.strip()]
+        skills = _dedupe_strings([str(skill) for skill in raw_skills] + extract_keywords(" ".join([name, summary]), limit=8))
+        raw_bullets = repo.get("bullets") or []
+        if isinstance(raw_bullets, str):
+            raw_bullets = [item.strip() for item in re.split(r"[\n;]+", raw_bullets) if item.strip()]
+        item = {
+            "name": name or "GitHub Project",
+            "url": url or None,
+            "summary": summary,
+            "skills": skills,
+            "bullets": [str(bullet).strip() for bullet in raw_bullets if str(bullet).strip()][:4],
+            "source": "step4_auto_refine",
+        }
+        key = re.sub(r"[^a-z0-9]+", " ", str(item.get("url") or item.get("name") or "").lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        existing.append(item)
+        added += 1
+    user.github_repositories = existing
+    return added
+
+
 def _score_job_for_user(db: Session, user: User | None, job: Job) -> object | None:
     if not user:
         return None
@@ -971,12 +1023,26 @@ def _score_tailored_resume_payload(
     resume_text: str,
     metadata: dict,
 ) -> dict:
-    verified_resume_skills = metadata.get("ordered_verified_skills") or user.skills or []
+    selected_projects = metadata.get("selected_projects") or user.projects or []
+    project_skills = [
+        str(skill)
+        for project in selected_projects
+        for skill in (project.get("skills") or [])
+        if str(skill).strip()
+    ]
+    extracted_tailored_skills = ResumeExtractionService._extract_skills(resume_text or "")
+    verified_resume_skills = _dedupe_strings(
+        [
+            *(metadata.get("ordered_verified_skills") or user.skills or []),
+            *project_skills,
+            *extracted_tailored_skills,
+        ]
+    )
     proxy = SimpleNamespace(
         skills=verified_resume_skills,
         base_resume_text=resume_text,
         experience_years=user.experience_years,
-        projects=user.projects or [],
+        projects=selected_projects or user.projects or [],
         certifications=user.certifications or [],
         achievements=user.achievements or [],
         experience=user.experience or [],
@@ -2718,6 +2784,7 @@ def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = De
     job = _job_or_404(db, job_id)
     threshold = _configured_match_threshold(preferences)
     base_score = JobMatchingAgent().score(user, preferences, job)
+    added_repo_count = _merge_github_project_evidence(user, payload.github_repositories)
     job.match_score = base_score.score
     job.score_reasons = base_score.reasons
     job.score_concerns = base_score.concerns
@@ -2781,7 +2848,8 @@ def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = De
             input_summary=f"job_id={job.id}",
             output_summary=(
                 f"Created resume version {version.id}; score "
-                f"{base_score.score}->{score_payload['tailored_resume_score']}"
+                f"{base_score.score}->{score_payload['tailored_resume_score']}; "
+                f"github_project_evidence_added={added_repo_count}"
             ),
         )
     )
@@ -2799,6 +2867,7 @@ def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = De
         "lab": lab,
         "auto_refined": auto_refined,
         "instructions_used": instructions,
+        "github_project_evidence_added": added_repo_count,
     }
 
 

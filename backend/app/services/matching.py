@@ -144,10 +144,12 @@ class JobMatchingAgent:
             concerns.append("Location does not clearly match preferences.")
 
         # ---- 7. Project evidence (max 10) ----
+        project_sources = [*(user.projects or []), *(getattr(user, "github_repositories", None) or [])]
         project_hits = [
             project.get("name", "")
-            for project in user.projects or []
+            for project in project_sources
             if any(normalize(skill) in description for skill in project.get("skills", []))
+            or any(token and token in description for token in normalize(str(project.get("summary") or project.get("description") or "")).split()[:16])
         ]
         if project_hits:
             score += 10

@@ -574,6 +574,7 @@ export const api = {
         minimal_latex_edit?: boolean;
       };
       lab: ResumeLab;
+      github_project_evidence_added?: number;
     }>(`/jobs/${jobId}/refine-resume`, { method: "POST", body: JSON.stringify(payload) }),
   resumePreview: (versionId: number) => request<ResumePreview>(`/resume-versions/${versionId}/preview`),
   jobDebug: (jobId: number) => request<JobDebug>(`/jobs/${jobId}/debug`),

@@ -301,6 +301,7 @@ def write_latex(
             tex = _replace_user_template_summary(tex, summary_block)
         paragraph_skills = _skills_from_paragraphs(sectioned)
         tex = _tune_user_template_skills(tex, skills or paragraph_skills)
+        tex = _tune_user_template_projects(tex, projects)
         path.write_text(tex, encoding="utf-8")
         return
 
@@ -492,6 +493,66 @@ def _replace_or_insert_focus_line(tex: str, section_name: str, focus_line: str) 
 
     replacement = match.group(1) + block
     return tex[: match.start()] + replacement + tex[match.end():]
+
+
+def _tune_user_template_projects(tex: str, projects: list[dict]) -> str:
+    selected = [project for project in projects if project.get("name")][:3]
+    if not selected:
+        return tex
+    for section_name in ["AI Projects", "Projects"]:
+        current = _section_body(tex, section_name)
+        if current is None:
+            continue
+        if r"\resumeProjectHeading" in current:
+            block = _latex_project_macro_block(selected)
+        elif r"\begin{itemize}" in current:
+            block = _latex_plain_projects_block(selected)
+        else:
+            continue
+        updated = _replace_section(tex, section_name, block)
+        if updated != tex:
+            return updated
+    return tex
+
+
+def _section_body(tex: str, section_name: str) -> str | None:
+    import re
+
+    pattern = (
+        r"\\section\*?\{" + re.escape(section_name) + r"\}"
+        r"(.*?)"
+        r"(?=\\section\*?\{|\\end\{document\})"
+    )
+    match = re.search(pattern, tex, re.DOTALL)
+    return match.group(1) if match else None
+
+
+def _latex_project_macro_block(projects: list[dict]) -> str:
+    lines = [r"    \vspace{-7pt}", r"    \resumeSubHeadingListStart", ""]
+    for project in projects[:3]:
+        name = _latex_escape(str(project.get("name", "Project"))[:80])
+        skills = [str(skill) for skill in project.get("skills", []) if str(skill).strip()]
+        skill_line = ", ".join(_latex_escape(skill) for skill in skills[:9]) or "Verified project evidence"
+        url = str(project.get("url") or project.get("repo_url") or "").strip()
+        link = rf"{{\href{{{url}}}{{\faGithub}}}}" if url.startswith(("http://", "https://")) else "{}"
+        bullets = [str(item).strip() for item in project.get("bullets", []) if str(item).strip()]
+        summary = str(project.get("summary") or project.get("description") or "").strip()
+        if summary:
+            bullets.insert(0, summary)
+        bullets = bullets[:3] or ["Project evidence retained from the uploaded resume or GitHub project notes."]
+        lines.extend(
+            [
+                r"    \resumeProjectHeading",
+                rf"      {{\textbf{{{name}}} $|$ \emph{{{skill_line}}}}}",
+                rf"      {link}",
+                r"    \resumeItemListStart",
+            ]
+        )
+        for bullet in bullets:
+            lines.append(r"      \resumeItem{" + _latex_escape(bullet) + "}")
+        lines.extend([r"    \resumeItemListEnd", r"    \vspace{-5pt}", ""])
+    lines.extend([r"    \resumeSubHeadingListEnd", r"\vspace{-12pt}"])
+    return "\n".join(lines)
 
 
 def _latex_focus_itemize(focus_line: str) -> str:

@@ -14,6 +14,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.core.config import get_settings
 from app.models.entities import Job, ResumeVersion, User
@@ -36,6 +37,19 @@ class TailoredResume:
     tex_path: Path | None
     metadata_path: Path
     ai_generated: bool = False
+
+
+def SimpleUserProxy(user: User, projects: list[dict]) -> SimpleNamespace:
+    """Small prompt-only user proxy so LLM sees the selected project evidence."""
+    return SimpleNamespace(
+        name=user.name,
+        current_role=user.current_role,
+        experience_years=user.experience_years,
+        skills=user.skills or [],
+        experience=user.experience or [],
+        projects=projects or user.projects or [],
+        base_resume_text=user.base_resume_text,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +196,7 @@ class ResumeTailoringAgent:
         overlap, missing = keyword_overlap(verified_skills, job_keywords)
         requested_focus = self._requested_focus_skills(verified_skills, manual_instructions)
         emphasized = self._dedupe_skills([*requested_focus, *self._emphasized_verified_skills(verified_skills, job)])[:12]
+        selected_projects = self._project_candidates(user, job)
         recommended_projects = self._recommended_projects(missing)
         resume_id = self._resume_id(job, resume_id_suffix)
         version_dir = self.storage_root / "resume_versions"
@@ -193,21 +208,28 @@ class ResumeTailoringAgent:
         # --- Try LLM tailoring first ---
         ai_generated = False
         paragraphs: list[str] = []
-        if not latex_template_source:
-            try:
-                from app.services.oci_genai import OCIGenerativeAIProvider
-                provider = OCIGenerativeAIProvider()
-                if provider.status().configured:
-                    prompt = _build_prompt(user, job, match_score, emphasized)
-                    llm_text = provider.chat(prompt)
-                    paragraphs = _parse_llm_response(llm_text)
-                    ai_generated = True
-                    logger.info("AI resume tailoring succeeded for job %s", job.id)
-            except Exception as exc:
-                logger.warning("AI tailoring failed, using template fallback: %s", exc)
+        try:
+            from app.services.oci_genai import OCIGenerativeAIProvider
+            provider = OCIGenerativeAIProvider()
+            if provider.status().configured:
+                prompt_user = SimpleUserProxy(user, selected_projects)
+                prompt = _build_prompt(prompt_user, job, match_score, emphasized)
+                llm_text = provider.chat(prompt)
+                paragraphs = _parse_llm_response(llm_text)
+                ai_generated = True
+                logger.info("AI resume tailoring succeeded for job %s", job.id)
+        except Exception as exc:
+            logger.warning("AI tailoring failed, using deterministic ATS fallback: %s", exc)
 
         if not paragraphs:
-            paragraphs = self._build_resume_text(user, job, emphasized, recommended_projects, manual_instructions)
+            paragraphs = self._build_resume_text(
+                user,
+                job,
+                emphasized,
+                recommended_projects,
+                manual_instructions,
+                selected_projects=selected_projects,
+            )
 
         title = f"{user.name} - {job.title} at {job.company}"
 
@@ -223,7 +245,7 @@ class ResumeTailoringAgent:
             user_name=user.name or "Candidate",
             skills=ordered_skills,
             experience=user.experience or [],
-            projects=user.projects or [],
+            projects=selected_projects or user.projects or [],
             job_title=job.title,
             company=job.company,
             paragraphs=paragraphs,
@@ -262,6 +284,7 @@ class ResumeTailoringAgent:
                 requested_focus,
                 bool(manual_instructions and manual_instructions.strip()),
                 auto_refined,
+                selected_projects,
             ),
             "ordered_verified_skills": ordered_skills,
             "verified_skills_source": "uploaded_resume_and_profile",
@@ -269,6 +292,7 @@ class ResumeTailoringAgent:
             "manual_refinement_notes": manual_instructions.strip() if manual_instructions else None,
             "auto_refined_from_job_description": auto_refined,
             "requested_focus_skills": requested_focus,
+            "selected_projects": selected_projects,
         }
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -294,13 +318,14 @@ class ResumeTailoringAgent:
 
         paragraphs = self._export_paragraphs(user, version, job)
         verified_skills = self._verified_resume_skills(user)
+        metadata = self._version_metadata(version)
         write_latex(
             path=tex_path,
             template_source=self._latex_template_source(user),
             user_name=user.name or "Candidate",
             skills=self._ordered_verified_skills(verified_skills, version.skills_emphasized or []),
             experience=user.experience or [],
-            projects=user.projects or [],
+            projects=metadata.get("selected_projects") or user.projects or [],
             job_title=version.role,
             company=version.company,
             paragraphs=paragraphs,
@@ -342,6 +367,18 @@ class ResumeTailoringAgent:
         except Exception as exc:
             logger.warning("Could not update PDF generation metadata for resume version %s: %s", version.id, exc)
 
+    @staticmethod
+    def _version_metadata(version: ResumeVersion) -> dict:
+        if not version.metadata_path:
+            return {}
+        metadata_path = Path(version.metadata_path)
+        if not metadata_path.exists():
+            return {}
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
     def _version_export_path(self, version: ResumeVersion, suffix: str) -> Path:
         version_dir = self.storage_root / "resume_versions"
         role = re.sub(r"[^a-z0-9]+", "-", version.role.lower()).strip("-")[:40]
@@ -350,6 +387,8 @@ class ResumeTailoringAgent:
 
     def _export_paragraphs(self, user: User, version: ResumeVersion, job: Job | None = None) -> list[str]:
         skills = version.skills_emphasized or user.skills[:12] or (job.skills if job else [])
+        metadata = self._version_metadata(version)
+        project_source = metadata.get("selected_projects") or user.projects or []
         role_label = self._role_label(user)
         experience_phrase = self._experience_phrase(user)
         paragraphs = [
@@ -379,8 +418,8 @@ class ResumeTailoringAgent:
             paragraphs.append("Experience details were not provided during onboarding.")
 
         paragraphs.append("__HEADING__Projects")
-        if user.projects:
-            for project in user.projects[:4]:
+        if project_source:
+            for project in project_source[:4]:
                 name = project.get("name", "Project")
                 summary = project.get("summary", "")
                 project_skills = ", ".join(project.get("skills", []))
@@ -526,6 +565,79 @@ class ResumeTailoringAgent:
                 selected.append(str(skill))
         return selected[:60]
 
+    def _project_candidates(self, user: User, job: Job) -> list[dict]:
+        job_text = normalize(" ".join([job.title or "", job.description or "", *[str(skill) for skill in job.skills or []]]))
+        candidates: list[dict] = []
+        for project in user.projects or []:
+            normalized = self._normalize_project(project)
+            if normalized:
+                candidates.append(normalized)
+        latex_source = self._latex_template_source(user)
+        if latex_source:
+            try:
+                from app.services.latex_parser import parse_latex_resume
+                parsed = parse_latex_resume(latex_source)
+                for project in parsed.projects:
+                    normalized = self._normalize_project(project.__dict__)
+                    if normalized:
+                        candidates.append(normalized)
+            except Exception as exc:
+                logger.warning("Could not parse LaTeX projects for tailoring: %s", exc)
+        for repo in getattr(user, "github_repositories", None) or []:
+            normalized = self._normalize_project(repo)
+            if normalized:
+                candidates.append(normalized)
+
+        seen: set[str] = set()
+        scored: list[tuple[int, dict]] = []
+        for project in candidates:
+            key = normalize(str(project.get("url") or project.get("name") or project.get("summary") or ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            evidence_text = normalize(
+                " ".join(
+                    [
+                        str(project.get("name") or ""),
+                        str(project.get("summary") or project.get("description") or ""),
+                        " ".join(str(item) for item in project.get("skills", []) or []),
+                        " ".join(str(item) for item in project.get("bullets", []) or []),
+                    ]
+                )
+            )
+            evidence_tokens = set(token for token in re.split(r"[^a-z0-9+#.]+", evidence_text) if len(token) > 1)
+            job_tokens = set(token for token in re.split(r"[^a-z0-9+#.]+", job_text) if len(token) > 1)
+            overlap = len(evidence_tokens & job_tokens)
+            scored.append((overlap, project))
+
+        scored.sort(key=lambda item: (item[0], len(item[1].get("skills", []) or [])), reverse=True)
+        selected = [project for score, project in scored if score > 0][:4]
+        if not selected:
+            selected = [project for _, project in scored[:3]]
+        return selected
+
+    @staticmethod
+    def _normalize_project(project: dict) -> dict:
+        name = str(project.get("name") or project.get("repo") or project.get("full_name") or "").strip()
+        url = str(project.get("url") or project.get("repo_url") or project.get("html_url") or "").strip()
+        if not name and url:
+            name = url.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ").title()
+        summary = str(project.get("summary") or project.get("description") or project.get("notes") or "").strip()
+        raw_skills = project.get("skills") or project.get("topics") or []
+        if isinstance(raw_skills, str):
+            raw_skills = [item.strip() for item in raw_skills.split(",") if item.strip()]
+        inferred = extract_keywords(" ".join([name, summary]), limit=10)
+        skills = ResumeTailoringAgent._dedupe_skills([str(skill) for skill in raw_skills] + inferred)[:12]
+        raw_bullets = project.get("bullets") or []
+        if isinstance(raw_bullets, str):
+            raw_bullets = [item.strip() for item in re.split(r"[\n;]+", raw_bullets) if item.strip()]
+        bullets = [str(item).strip() for item in raw_bullets if str(item).strip()]
+        if not bullets and summary:
+            bullets = [summary]
+        if not name and not summary:
+            return {}
+        return {"name": name or "GitHub Project", "summary": summary, "skills": skills, "url": url or None, "bullets": bullets[:4]}
+
     @classmethod
     def _emphasized_verified_skills(cls, verified_skills: list[str], job: Job) -> list[str]:
         job_text = normalize(" ".join([job.title or "", job.description or "", *[str(skill) for skill in job.skills or []]]))
@@ -565,6 +677,7 @@ class ResumeTailoringAgent:
         requested_focus: list[str] | None = None,
         manual_refinement: bool = False,
         auto_refinement: bool = False,
+        selected_projects: list[dict] | None = None,
     ) -> list[str]:
         changes = []
         if has_latex_template:
@@ -587,11 +700,16 @@ class ResumeTailoringAgent:
                 changes.append(f"Applied your refinement comments where they matched verified skills: {', '.join(requested_focus[:8])}.")
             else:
                 changes.append("Saved your refinement comments for review; no unsupported new skills were added.")
+        if selected_projects:
+            names = [str(project.get("name")) for project in selected_projects if project.get("name")]
+            if names:
+                changes.append(f"Selected strongest project evidence for this JD: {', '.join(names[:3])}.")
         return changes
 
     def auto_refinement_instructions(self, user: User, job: Job) -> str:
         verified_skills = self._verified_resume_skills(user)
         overlap = self._emphasized_verified_skills(verified_skills, job)
+        selected_projects = self._project_candidates(user, job)
         job_keywords = self._job_keywords(job)
         focus = overlap[:10] or [skill for skill in verified_skills[:10] if normalize(str(skill)) in normalize(job.description or "")]
         weak = [
@@ -603,9 +721,13 @@ class ResumeTailoringAgent:
             "AUTO_FROM_JD: Use the target job description to truthfully improve ATS alignment.",
             "Preserve the uploaded LaTeX format and make minimal targeted edits only.",
             "Rewrite the summary/profile and targeted skills focus for this exact role.",
+            "Reorder or replace the Projects section with the strongest verified GitHub/resume projects for the JD.",
+            "Remove low-signal lines only when stronger verified project or skill evidence is available.",
         ]
         if focus:
             parts.append("Emphasize verified overlap already present in the resume: " + ", ".join(focus) + ".")
+        if selected_projects:
+            parts.append("Prioritize project evidence: " + ", ".join(str(project.get("name")) for project in selected_projects[:3]) + ".")
         if weak:
             parts.append("Do not claim missing skills; keep these only as gaps or recommended learning if needed: " + ", ".join(weak[:8]) + ".")
         parts.append("Do not invent companies, metrics, titles, projects, or tools.")
@@ -649,6 +771,7 @@ class ResumeTailoringAgent:
         emphasized: list[str],
         recommended: list[str],
         manual_instructions: str | None = None,
+        selected_projects: list[dict] | None = None,
     ) -> list[str]:
         """Deterministic template fallback — used when LLM is unavailable."""
         role_label = ResumeTailoringAgent._role_label(user)
@@ -684,8 +807,9 @@ class ResumeTailoringAgent:
             paragraphs.append("Experience details were not provided during onboarding.")
 
         paragraphs.append("__HEADING__Projects")
-        if user.projects:
-            for project in user.projects[:4]:
+        project_source = selected_projects or user.projects or []
+        if project_source:
+            for project in project_source[:4]:
                 name = project.get("name", "Project")
                 summary = project.get("summary", "")
                 skills = ", ".join(project.get("skills", []))

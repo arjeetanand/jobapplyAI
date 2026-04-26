@@ -1392,6 +1392,33 @@ function compactResumeChanges(changes?: string[] | null) {
     });
 }
 
+function parseGithubProjectEvidence(text: string) {
+  return text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const url = line.match(/https?:\/\/[^\s)]+/i)?.[0] || "";
+      let afterUrl = url ? line.replace(url, "").trim() : line;
+      while (afterUrl && "-:|,".includes(afterUrl[0])) {
+        afterUrl = afterUrl.slice(1).trim();
+      }
+      const rawName = url ? url.replace(/\/$/, "").split("/").pop() || afterUrl : afterUrl.split(" - ")[0].split(":")[0].split("|")[0];
+      const name = rawName.replace(/[-_]/g, " ").trim() || "GitHub Project";
+      const skillsMatch = line.match(/\[(.*?)\]|\((.*?)\)/);
+      const skills = (skillsMatch?.[1] || skillsMatch?.[2] || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      return {
+        name,
+        url: url || null,
+        summary: afterUrl || line,
+        skills,
+      };
+    });
+}
+
 function PdfPreviewGrid({ preview }: { preview: ResumePreview }) {
   const baseUrl = previewUrl(preview.pdf_preview?.base_pdf_url);
   const tailoredUrl = previewUrl(preview.pdf_preview?.tailored_pdf_url);
@@ -1417,11 +1444,15 @@ function PdfPreviewGrid({ preview }: { preview: ResumePreview }) {
         <div className="grid gap-2">
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs font-semibold uppercase text-slate-500">
-              {usesUploadedPdf ? "Application PDF" : "Tailored PDF"}
+              {usesUploadedPdf ? "Tailored LaTeX Preview" : "Tailored PDF"}
             </div>
-            {usesUploadedPdf && <span className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">Same visual PDF</span>}
+            {usesUploadedPdf && <span className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">Compile LaTeX to render PDF</span>}
           </div>
-          {tailoredUrl ? (
+          {usesUploadedPdf ? (
+            <div className="h-[62vh] overflow-auto rounded border border-line bg-white p-4 font-mono text-xs leading-5 text-slate-800">
+              {preview.tailored_preview || "Tailored LaTeX is not ready yet. Run Auto Refine first."}
+            </div>
+          ) : tailoredUrl ? (
             <iframe className="h-[62vh] w-full rounded border border-line bg-white" src={tailoredUrl} title="Tailored resume PDF preview" />
           ) : (
             <div className="grid h-[62vh] place-items-center rounded border border-line bg-white p-6 text-center text-sm text-slate-500">
@@ -1511,6 +1542,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
   const [labs, setLabs] = useState<Record<number, ResumeLab>>({});
   const [selectedVersions, setSelectedVersions] = useState<Record<number, number>>({});
   const [refineNotes, setRefineNotes] = useState<Record<number, string>>({});
+  const [repoEvidence, setRepoEvidence] = useState<Record<number, string>>({});
   const [preview, setPreview] = useState<ResumePreview | null>(null);
   const [previewMode, setPreviewMode] = useState<"pdf" | "diff" | "before" | "after">("pdf");
   const [debugData, setDebugData] = useState<JobDebug | null>(null);
@@ -1667,20 +1699,27 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
 
   const handleRefine = async (job: JobRow) => {
     const instructions = (refineNotes[job.id] || "").trim();
+    const github_repositories = parseGithubProjectEvidence(repoEvidence[job.id] || "");
     setBusyFor(job.id, true);
     try {
-      const result = await api.refineResume(job.id, { instructions: instructions || null, force_new_version: true });
+      const result = await api.refineResume(job.id, {
+        instructions: instructions || null,
+        github_repositories,
+        force_new_version: true,
+      });
       setLabs((prev) => ({ ...prev, [job.id]: result.lab }));
       setSelectedVersions((prev) => ({ ...prev, [job.id]: result.resume_version_id }));
       setResultFor(job.id, [
         result.message,
         result.auto_refined ? "Refinement source: job description and verified resume evidence." : "Refinement source: your notes and verified resume evidence.",
+        result.github_project_evidence_added ? `Added GitHub project evidence: ${result.github_project_evidence_added}` : "",
         `Original resume score: ${result.comparison.original_match_score}/100`,
         `Refined resume score: ${result.comparison.tailored_resume_score}/100 (${result.comparison.score_delta > 0 ? "+" : ""}${result.comparison.score_delta})`,
         result.comparison.pdf_generation ? `PDF: ${resumePdfStatusLabel(result.comparison.pdf_generation)}` : "",
         ...compactResumeChanges(result.comparison.resume_changes).map((change) => `Changed: ${change}`),
       ], result.resume_version_id);
       setRefineNotes((prev) => ({ ...prev, [job.id]: "" }));
+      setRepoEvidence((prev) => ({ ...prev, [job.id]: "" }));
       await loadJobs();
       await onRefresh();
     } finally {
@@ -1691,7 +1730,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
   const handlePreview = async (versionId: number) => {
     const data = await api.resumePreview(versionId);
     setPreview(data);
-    setPreviewMode("pdf");
+    setPreviewMode(data.pdf_preview?.pdf_generation === "base_pdf_fallback" ? "diff" : "pdf");
   };
 
   const handleDebug = async (jobId: number) => {
@@ -1709,15 +1748,19 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         resume_version_id: selectedResumeId ?? undefined,
       });
       const task = result.tasks[0];
+      const startResult = task ? await api.startApplyTask(task.id) : null;
       setResultFor(job.id, [
         result.message,
         task ? `Apply task ${task.id}: ${task.status}` : "Job was not eligible for the supervised LinkedIn queue.",
         task?.message || "",
+        startResult ? `Auto apply status: ${startResult.status}` : "",
+        startResult?.message || "",
+        startResult?.action_required ? `Action required: ${startResult.action_required}` : "",
         result.skipped.length ? `Skipped: ${JSON.stringify(result.skipped)}` : "",
         task?.resume?.id ? `Queued resume version: ${task.resume.id}` : "",
         task?.resume?.pdf_generation ? `PDF: ${resumePdfStatusLabel(task.resume.pdf_generation)}` : "",
       ].filter(Boolean));
-      onNotice(task ? `Queued ${job.title} for supervised apply.` : "Job was not queued. Check source details.");
+      onNotice(startResult?.action_required || startResult?.message || (task ? `Started supervised apply for ${job.title}.` : "Job was not queued. Check source details."));
       await loadJobs();
       await onRefresh();
     } finally {
@@ -1883,7 +1926,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
                 title="Automatically refine from this job description using only verified resume evidence."
               >
-                <Sparkles size={13} /> Auto Refine
+                <Sparkles size={13} /> Auto Build Resume
               </button>
               <button
                 disabled={isBusy}
@@ -1904,7 +1947,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 onClick={() => handleQueue(job).catch((e) => onNotice(e.message))}
                 className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
               >
-                <Send size={13} /> Add to Apply Queue
+                <Send size={13} /> Queue + Auto Apply
               </button>
               <button
                 disabled={isBusy}
@@ -2073,12 +2116,20 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                       onChange={(event) => setRefineNotes((prev) => ({ ...prev, [job.id]: event.target.value }))}
                     />
                   </Field>
+                  <Field label="GitHub project evidence (optional)">
+                    <textarea
+                      className={textareaClass}
+                      placeholder="Paste one repo per line. Example: https://github.com/you/rag-agent - RAG agent with FastAPI, LangGraph, Docker [Python, FastAPI, LangGraph, Docker]"
+                      value={repoEvidence[job.id] || ""}
+                      onChange={(event) => setRepoEvidence((prev) => ({ ...prev, [job.id]: event.target.value }))}
+                    />
+                  </Field>
                   <div className="flex flex-wrap gap-2">
                     <Button disabled={isBusy} onClick={() => handleRefine(job).catch((e) => onNotice(e.message))}>
-                      <Sparkles size={15} /> Auto Refine &amp; Rescore
+                      <Sparkles size={15} /> Auto Build Best Resume
                     </Button>
                     <Button variant="secondary" disabled={isBusy} onClick={() => handleQueue(job).catch((e) => onNotice(e.message))}>
-                      <Send size={15} /> Queue Selected Resume
+                      <Send size={15} /> Queue + Auto Apply
                     </Button>
                   </div>
                 </div>
@@ -2099,9 +2150,9 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         );
       })}
       {preview && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
           <div className="flex max-h-[92vh] w-full max-w-7xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
-            <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="sticky top-0 z-10 flex flex-wrap items-start justify-between gap-3 border-b border-line bg-[#fffdf7] pb-3">
               <div>
                 <h3 className="flex items-center gap-2 text-base font-semibold">
                   <Eye size={17} className="text-cobalt" /> Resume PDF Preview
@@ -2167,6 +2218,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
 function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => void; onRefresh: () => Promise<void> }) {
   const [tasks, setTasks] = useState<ApplyQueueTask[]>([]);
   const [busy, setBusy] = useState<Record<number, boolean>>({});
+  const [queueBusy, setQueueBusy] = useState(false);
   const [answerTask, setAnswerTask] = useState<ApplyQueueTask | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [debugData, setDebugData] = useState<ApplyTaskDebug | null>(null);
@@ -2187,6 +2239,42 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
     setTasks(result.tasks);
     onNotice(`${result.message} Threshold: ${result.threshold}. Skipped: ${result.skipped.length}.`);
     await onRefresh();
+  };
+
+  const runQueue = async () => {
+    setQueueBusy(true);
+    try {
+      const latest = await api.applyQueue();
+      const runnable = latest.tasks.filter((task) =>
+        ["queued", "needs_login", "needs_user_action", "failed"].includes(task.status)
+      );
+      if (!runnable.length) {
+        onNotice("No queued tasks are ready to auto-run. Answer missing questions or build the queue first.");
+        return;
+      }
+      for (const task of runnable) {
+        setBusyFor(task.id, true);
+        try {
+          const result = ["needs_login", "needs_user_action", "failed"].includes(task.status)
+            ? await api.resumeApplyTask(task.id)
+            : await api.startApplyTask(task.id);
+          if (result.missing_questions.length) {
+            setAnswerTask(result.task);
+            setAnswers(Object.fromEntries(result.missing_questions.map((question) => [question, ""])));
+          }
+          if (["ready_for_submit", "needs_login", "needs_answers", "needs_user_action", "failed"].includes(result.status)) {
+            onNotice(result.action_required || result.message);
+            break;
+          }
+        } finally {
+          setBusyFor(task.id, false);
+          await load();
+          await onRefresh();
+        }
+      }
+    } finally {
+      setQueueBusy(false);
+    }
   };
 
   const runTask = async (task: ApplyQueueTask, mode: "start" | "resume") => {
@@ -2266,6 +2354,9 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
             </Button>
             <Button onClick={() => buildQueue().catch((error) => onNotice(error.message))}>
               <Send size={15} /> Build Queue
+            </Button>
+            <Button disabled={queueBusy} onClick={() => runQueue().catch((error) => onNotice(error.message))}>
+              <Play size={15} /> {queueBusy ? "Running..." : "Run Queue"}
             </Button>
           </div>
         </div>

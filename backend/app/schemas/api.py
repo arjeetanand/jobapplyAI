@@ -144,6 +144,7 @@ class ResumeProfileUpdateIn(BaseModel):
 class ResumeRefineIn(BaseModel):
     user_id: int | None = None
     instructions: str | None = Field(default=None, max_length=2000)
+    github_repositories: list[dict[str, Any]] = Field(default_factory=list)
     force_new_version: bool = True
 
 
