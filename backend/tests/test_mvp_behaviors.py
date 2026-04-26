@@ -237,8 +237,122 @@ KEEP_OVERLEAF_EXPERIENCE
     assert "Original profile" not in tex
     assert "Targeted Focus" in tex
     assert tailored.metadata["minimal_latex_edit"] is True
-    assert tailored.metadata["pdf_generation"] == "base_pdf_fallback"
-    assert tailored.pdf_path.read_bytes() == base_pdf.read_bytes()
+    assert tailored.metadata["pdf_generation"] == "styled_pdf_fallback"
+    assert tailored.pdf_path.read_bytes() != base_pdf.read_bytes()
+    assert tailored.pdf_path.read_bytes().startswith(b"%PDF")
+
+
+def test_docx_tailoring_prefers_word_template_for_resume_updates(tmp_path, monkeypatch):
+    from docx import Document
+
+    template_path = tmp_path / "base_resume.docx"
+    doc = Document()
+    doc.add_paragraph("Arjeet Anand")
+    doc.add_paragraph("Profile")
+    doc.add_paragraph("Old generic summary should be replaced.")
+    doc.add_paragraph("Technical Skills")
+    doc.add_paragraph("Python, SQL, RAG")
+    doc.add_paragraph("Projects")
+    doc.add_paragraph("Existing Oracle GenAI Project")
+    doc.save(template_path)
+
+    user = sample_user()
+    user.base_resume_path = str(template_path)
+    user.base_resume_text = ResumeExtractionService._docx_text(template_path.read_bytes())
+    user.latex_template_source = "\\documentclass{article}\\begin{document}LATEX_SHOULD_NOT_BE_PRIMARY\\end{document}"
+
+    monkeypatch.setattr(
+        "app.services.resume.get_settings",
+        lambda: obj(resolved_storage_root=tmp_path, docx_template_path=template_path, latex_template_path=None),
+    )
+    monkeypatch.setattr("app.services.resume.convert_docx_to_pdf", lambda docx_path, pdf_path: False)
+
+    job = sample_job(
+        title="Data Scientist",
+        company="InCommon",
+        description="Python SQL RAG analytics machine learning",
+        skills=["Python", "SQL", "RAG"],
+    )
+    tailored = ResumeTailoringAgent(storage_root=tmp_path).tailor(user, job, 52)
+    text = ResumeExtractionService._docx_text(tailored.docx_path.read_bytes())
+
+    assert tailored.metadata["source_format"] == "docx_template"
+    assert tailored.metadata["minimal_docx_edit"] is True
+    assert tailored.metadata["minimal_latex_edit"] is False
+    assert "Old generic summary should be replaced" not in text
+    assert "Targeted Focus for Data Scientist" in text
+    assert "Existing Oracle GenAI Project" in text
+    assert any("Word resume template" in change for change in tailored.metadata["resume_changes"])
+    assert tailored.pdf_path.read_bytes().startswith(b"%PDF")
+
+
+def test_docx_tailoring_does_not_duplicate_existing_projects(tmp_path, monkeypatch):
+    from docx import Document
+
+    template_path = tmp_path / "base_resume.docx"
+    doc = Document()
+    doc.add_paragraph("Arjeet Anand")
+    doc.add_paragraph("Profile")
+    doc.add_paragraph("Old summary.")
+    doc.add_paragraph("Technical Skills")
+    doc.add_paragraph("Python, FastAPI, RAG")
+    doc.add_paragraph("Targeted Focus for Old Role: stale line should be removed")
+    doc.add_paragraph("AI Projects")
+    doc.add_paragraph("Targeted Project Evidence for Old Role:")
+    doc.add_paragraph("DataMind: stale duplicate should be removed")
+    doc.add_paragraph("DataMind | Python, ClickHouse, Kafka")
+    doc.add_paragraph("PromptMesh | Python, FastAPI, OCI GenAI")
+    doc.add_paragraph("Targeted Project Focus for Old Role: stale focus should be removed")
+    doc.save(template_path)
+
+    user = sample_user()
+    user.base_resume_path = str(template_path)
+    user.base_resume_text = ResumeExtractionService._docx_text(template_path.read_bytes())
+    user.github_repositories = [
+        {
+            "name": "DataMind",
+            "summary": "Engineered a high-performance Hot/Cold Split Architecture.",
+            "skills": ["Python", "ClickHouse", "Kafka", "FastAPI"],
+            "bullets": ["Engineered a high-performance Hot/Cold Split Architecture."],
+        },
+        {
+            "name": "PromptMesh",
+            "summary": "Built a prompt evaluation platform.",
+            "skills": ["Python", "FastAPI", "OCI GenAI"],
+            "bullets": ["Built a prompt evaluation platform."],
+        },
+        {
+            "name": "DataMind",
+            "summary": "Duplicate repo evidence should not be inserted twice.",
+            "skills": ["Python"],
+        },
+    ]
+    monkeypatch.setattr(
+        "app.services.resume.get_settings",
+        lambda: obj(resolved_storage_root=tmp_path, docx_template_path=template_path, latex_template_path=None),
+    )
+    monkeypatch.setattr("app.services.resume.convert_docx_to_pdf", lambda docx_path, pdf_path: False)
+
+    job = sample_job(
+        title="GEN AI Engineer",
+        company="Infosys",
+        description="Python FastAPI GenAI RAG OCI Kafka",
+        skills=["Python", "FastAPI", "RAG"],
+    )
+    tailored = ResumeTailoringAgent(storage_root=tmp_path).tailor(user, job, 70)
+    text = ResumeExtractionService._docx_text(tailored.docx_path.read_bytes())
+
+    assert "Targeted Project Focus for GEN AI Engineer" in text
+    assert "Targeted Project Evidence" not in text
+    assert "Old Role" not in text
+    assert "stale duplicate" not in text
+    assert "DataMind:" not in text
+    assert "PromptMesh:" not in text
+    assert text.count("DataMind |") == 1
+    assert text.count("PromptMesh |") == 1
+    selected_names = [project["name"] for project in tailored.metadata["selected_projects"]]
+    assert selected_names.count("DataMind") == 1
+    assert selected_names.count("PromptMesh") == 1
 
 
 def test_resume_reuse_for_similar_job(tmp_path):
@@ -1190,6 +1304,58 @@ def test_supervised_apply_uses_persistent_profile_on_worker_thread(tmp_path, mon
     SupervisedLinkedInApplyAgent.close(123)
     assert fake_context.closed is True
     assert fake_playwright.stopped is True
+
+
+def test_supervised_apply_easy_apply_detector_retries_and_reports_buttons():
+    class FakePage:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, _script):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "clicked": False,
+                    "reason": "easy_apply_not_found",
+                    "visible_apply_buttons": ["Apply", "Save"],
+                }
+            return {
+                "clicked": True,
+                "reason": "clicked_easy_apply",
+                "clicked_text": "Easy Apply to Data Scientist at InCommon",
+                "visible_apply_buttons": ["Easy Apply", "Save"],
+            }
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    result = SupervisedLinkedInApplyAgent._click_easy_apply(FakePage(), wait_seconds=3)
+
+    assert result["clicked"] is True
+    assert result["clicked_text"] == "Easy Apply to Data Scientist at InCommon"
+    assert result["visible_apply_buttons"] == ["Easy Apply", "Save"]
+
+
+def test_supervised_apply_detector_accepts_linkedin_apply_button_label():
+    class FakePage:
+        def evaluate(self, script):
+            assert "jobs-apply-button" in script
+            assert "clicked_linkedin_apply_button" in script
+            return {
+                "clicked": True,
+                "reason": "clicked_linkedin_apply_button",
+                "clicked_text": "Apply to this job",
+                "visible_apply_buttons": ["Apply to this job"],
+            }
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    result = SupervisedLinkedInApplyAgent._click_easy_apply(FakePage(), wait_seconds=3)
+
+    assert result["clicked"] is True
+    assert result["reason"] == "clicked_linkedin_apply_button"
+    assert result["clicked_text"] == "Apply to this job"
 
 
 def test_apply_queue_resume_uses_approved_answers_and_mark_submitted(tmp_path, monkeypatch):

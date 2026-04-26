@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -21,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 def latex_compiler_available() -> bool:
     return any(shutil.which(engine) for engine in ["latexmk", "xelatex", "pdflatex", "lualatex"])
+
+
+def docx_pdf_converter_available() -> bool:
+    return any(shutil.which(engine) for engine in ["soffice", "libreoffice"]) or _microsoft_word_available()
+
+
+def _microsoft_word_available() -> bool:
+    enabled = os.getenv("SEEKAPPLY_ENABLE_MS_WORD_PDF", "").strip().lower() in {"1", "true", "yes"}
+    return enabled and Path("/Applications/Microsoft Word.app").exists() and shutil.which("osascript") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +86,199 @@ def write_docx_rich(path: Path, title: str, paragraphs: list[str]) -> None:
     except ImportError:
         # Fallback to raw XML writer
         write_docx(path, title, paragraphs)
+
+
+def write_docx_from_template(
+    path: Path,
+    template_path: Path,
+    *,
+    job_title: str,
+    company: str,
+    paragraphs: list[str],
+    emphasized_skills: list[str],
+    selected_projects: list[dict],
+) -> bool:
+    """Create a tailored DOCX by making small edits to an uploaded Word resume.
+
+    The goal is to keep the user's Word layout intact while replacing only the
+    profile/summary and adding compact targeted evidence. If python-docx cannot
+    load the template, the caller can fall back to the clean DOCX writer.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from docx import Document
+        from docx.oxml import OxmlElement
+        from docx.text.paragraph import Paragraph
+    except ImportError:
+        return False
+
+    if not template_path.exists() or template_path.suffix.lower() != ".docx":
+        return False
+
+    def section_lines(header: str) -> list[str]:
+        capture = False
+        lines: list[str] = []
+        for item in paragraphs:
+            text = item.replace("__HEADING__", "").strip()
+            if not text:
+                continue
+            if item.startswith("__HEADING__"):
+                if capture:
+                    break
+                capture = text.lower() == header.lower()
+                continue
+            if capture:
+                lines.append(text)
+        return lines
+
+    def all_paragraphs(document) -> list:
+        items = list(document.paragraphs)
+        for table in document.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    items.extend(cell.paragraphs)
+        return items
+
+    def norm(value: str) -> str:
+        return " ".join(value.lower().strip().split())
+
+    def compact_key(value: str) -> str:
+        return "".join(ch for ch in value.lower() if ch.isalnum())
+
+    def project_name(project: dict) -> str:
+        name = str(project.get("name") or "").strip()
+        if name:
+            return name
+        url = str(project.get("url") or project.get("repo_url") or "").strip()
+        return url.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ").title() if url else "Project"
+
+    def unique_projects(projects: list[dict]) -> list[dict]:
+        selected: list[dict] = []
+        seen: set[str] = set()
+        for project in projects:
+            name = project_name(project)
+            key = compact_key(name) or compact_key(str(project.get("url") or project.get("repo_url") or ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            selected.append(project)
+        return selected
+
+    def replace_text(paragraph, text: str) -> None:
+        if paragraph.runs:
+            paragraph.runs[0].text = text
+            for run in paragraph.runs[1:]:
+                run.text = ""
+        else:
+            paragraph.add_run(text)
+
+    def insert_after(paragraph, text: str) -> Paragraph:
+        new_p = OxmlElement("w:p")
+        paragraph._p.addnext(new_p)
+        new_para = Paragraph(new_p, paragraph._parent)
+        try:
+            new_para.style = paragraph.style
+        except Exception:
+            pass
+        new_para.add_run(text)
+        return new_para
+
+    def remove_paragraph(paragraph) -> None:
+        element = paragraph._element
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+            paragraph._p = paragraph._element = None
+
+    def clean_previous_targeted_edits(document) -> None:
+        paragraphs = all_paragraphs(document)
+        remove_next_project_lines = 0
+        for paragraph in list(paragraphs):
+            text = norm(paragraph.text)
+            if not text:
+                continue
+            if text.startswith("targeted focus for "):
+                remove_paragraph(paragraph)
+                continue
+            if text.startswith("targeted project focus for "):
+                remove_paragraph(paragraph)
+                remove_next_project_lines = 0
+                continue
+            if text.startswith("targeted project evidence for "):
+                remove_paragraph(paragraph)
+                remove_next_project_lines = 3
+                continue
+            if remove_next_project_lines > 0:
+                if ":" in paragraph.text and norm(paragraph.text) not in {"experience", "technical skills", "skills", "projects", "ai projects", "education"}:
+                    remove_paragraph(paragraph)
+                    remove_next_project_lines -= 1
+                    continue
+                remove_next_project_lines = 0
+
+    def heading_index(items: list, names: set[str]) -> int | None:
+        for index, paragraph in enumerate(items):
+            if norm(paragraph.text) in names:
+                return index
+        return None
+
+    try:
+        doc = Document(str(template_path))
+    except Exception as exc:
+        logger.warning("Could not open DOCX resume template %s: %s", template_path, exc)
+        return False
+
+    clean_previous_targeted_edits(doc)
+    doc.core_properties.title = f"{job_title} at {company}"
+    profile_text = " ".join(section_lines("Professional Summary")[:2]).strip()
+    if not profile_text:
+        profile_text = f"Profile updated for {job_title} at {company} using verified resume evidence."
+
+    skills_text = ", ".join(emphasized_skills[:10])
+    selected_projects = unique_projects(selected_projects)
+
+    items = all_paragraphs(doc)
+    profile_idx = heading_index(items, {"profile", "professional summary", "summary"})
+    if profile_idx is not None:
+        for paragraph in items[profile_idx + 1:]:
+            if norm(paragraph.text) in {"experience", "technical skills", "skills", "projects", "education"}:
+                break
+            if paragraph.text.strip():
+                replace_text(paragraph, profile_text)
+                break
+
+    items = all_paragraphs(doc)
+    skills_idx = heading_index(items, {"technical skills", "skills"})
+    if skills_idx is not None and skills_text:
+        insert_after(items[skills_idx], f"Targeted Focus for {job_title}: {skills_text}")
+
+    items = all_paragraphs(doc)
+    projects_idx = heading_index(items, {"projects", "ai projects", "selected projects"})
+    if projects_idx is not None and selected_projects:
+        existing_text_key = compact_key(" ".join(paragraph.text for paragraph in items))
+        focus_names: list[str] = []
+        new_projects: list[dict] = []
+        for project in selected_projects[:5]:
+            name = project_name(project)
+            if name not in focus_names:
+                focus_names.append(name)
+            if compact_key(name) and compact_key(name) not in existing_text_key:
+                new_projects.append(project)
+
+        anchor = insert_after(items[projects_idx], f"Targeted Project Focus for {job_title}: {', '.join(focus_names[:5])}")
+        for project in new_projects[:3]:
+            name = project_name(project)
+            summary = str(project.get("summary") or "").strip()
+            skills = ", ".join(str(skill) for skill in (project.get("skills") or [])[:6])
+            line = f"{name}: {summary}{f' ({skills})' if skills else ''}".strip()
+            if line:
+                anchor = insert_after(anchor, line)
+
+    try:
+        doc.save(str(path))
+        return True
+    except Exception as exc:
+        logger.warning("Could not save tailored DOCX %s: %s", path, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +462,86 @@ def compile_latex_to_pdf(tex_path: Path, pdf_path: Path) -> bool:
                 shutil.copyfile(generated, pdf_path)
                 return True
             logger.warning("LaTeX compilation failed with %s: %s", engine[0], result.stderr[-1000:])
+    return False
+
+
+def convert_docx_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
+    """Convert DOCX to PDF with a real document renderer when available.
+
+    LibreOffice is preferred for headless servers. On macOS development
+    machines, Microsoft Word can be enabled explicitly with
+    SEEKAPPLY_ENABLE_MS_WORD_PDF=1. It is disabled by default because Word's
+    AppleScript PDF export is slow and can hang or reject commands on some
+    installations.
+    """
+    executable = shutil.which("soffice") or shutil.which("libreoffice")
+    if not docx_path.exists():
+        return False
+
+    if executable:
+        with tempfile.TemporaryDirectory(prefix="seekapply_docx_pdf_") as tmp:
+            tmp_path = Path(tmp)
+            try:
+                result = subprocess.run(
+                    [
+                        executable,
+                        "--headless",
+                        "--convert-to",
+                        "pdf",
+                        "--outdir",
+                        str(tmp_path),
+                        str(docx_path),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+            except Exception as exc:
+                logger.warning("DOCX to PDF conversion could not start with %s: %s", executable, exc)
+            else:
+                generated = tmp_path / f"{docx_path.stem}.pdf"
+                if result.returncode == 0 and generated.exists():
+                    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(generated, pdf_path)
+                    return True
+                logger.warning("DOCX to PDF conversion failed for %s: %s", docx_path, result.stderr or result.stdout)
+
+    if _microsoft_word_available() and _convert_docx_to_pdf_with_word(docx_path, pdf_path):
+        return True
+    return False
+
+
+def _convert_docx_to_pdf_with_word(docx_path: Path, pdf_path: Path) -> bool:
+    script = """
+on run argv
+  set inputPath to item 1 of argv
+  set outputPath to item 2 of argv
+  set inputFile to POSIX file inputPath
+  tell application "Microsoft Word"
+    launch
+    set visible to false
+    set theDoc to open inputFile
+    save as theDoc file name outputPath file format format PDF
+    close theDoc saving no
+  end tell
+end run
+"""
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script, str(docx_path), str(pdf_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+    except Exception as exc:
+        logger.warning("Microsoft Word DOCX to PDF conversion could not start: %s", exc)
+        return False
+    if result.returncode == 0 and pdf_path.exists():
+        return True
+    logger.warning("Microsoft Word DOCX to PDF conversion failed for %s: %s", docx_path, result.stderr or result.stdout)
     return False
 
 
@@ -496,17 +779,20 @@ def _replace_or_insert_focus_line(tex: str, section_name: str, focus_line: str) 
 
 
 def _tune_user_template_projects(tex: str, projects: list[dict]) -> str:
-    selected = [project for project in projects if project.get("name")][:3]
+    selected = [project for project in projects if project.get("name")]
     if not selected:
         return tex
     for section_name in ["AI Projects", "Projects"]:
         current = _section_body(tex, section_name)
         if current is None:
             continue
+        additions = _new_projects_only(current, selected)
+        if not additions:
+            return tex
         if r"\resumeProjectHeading" in current:
-            block = _latex_project_macro_block(selected)
+            block = _append_project_macro_entries(current, additions)
         elif r"\begin{itemize}" in current:
-            block = _latex_plain_projects_block(selected)
+            block = _append_plain_project_items(current, additions)
         else:
             continue
         updated = _replace_section(tex, section_name, block)
@@ -527,9 +813,45 @@ def _section_body(tex: str, section_name: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _latex_project_macro_block(projects: list[dict]) -> str:
-    lines = [r"    \vspace{-7pt}", r"    \resumeSubHeadingListStart", ""]
-    for project in projects[:3]:
+def _new_projects_only(current_section: str, projects: list[dict]) -> list[dict]:
+    current = _normalize_latex_text(current_section)
+    selected: list[dict] = []
+    for project in projects:
+        name = _normalize_latex_text(str(project.get("name") or ""))
+        url = _normalize_latex_text(str(project.get("url") or project.get("repo_url") or ""))
+        if not name:
+            continue
+        if name in current or (url and url in current):
+            continue
+        selected.append(project)
+        if len(selected) >= 3:
+            break
+    return selected
+
+
+def _normalize_latex_text(value: str) -> str:
+    import re
+
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _append_project_macro_entries(current_section: str, projects: list[dict]) -> str:
+    entries = _latex_project_macro_entries(projects)
+    if r"\resumeSubHeadingListEnd" in current_section:
+        return current_section.replace(r"\resumeSubHeadingListEnd", entries + "\n    " + r"\resumeSubHeadingListEnd", 1)
+    return current_section.rstrip() + "\n" + entries + "\n"
+
+
+def _append_plain_project_items(current_section: str, projects: list[dict]) -> str:
+    entries = "\n".join(_latex_plain_project_item(project) for project in projects)
+    if r"\end{itemize}" in current_section:
+        return current_section.replace(r"\end{itemize}", entries + "\n" + r"\end{itemize}", 1)
+    return current_section.rstrip() + "\n" + entries + "\n"
+
+
+def _latex_project_macro_entries(projects: list[dict]) -> str:
+    lines: list[str] = []
+    for project in projects:
         name = _latex_escape(str(project.get("name", "Project"))[:80])
         skills = [str(skill) for skill in project.get("skills", []) if str(skill).strip()]
         skill_line = ", ".join(_latex_escape(skill) for skill in skills[:9]) or "Verified project evidence"
@@ -551,8 +873,15 @@ def _latex_project_macro_block(projects: list[dict]) -> str:
         for bullet in bullets:
             lines.append(r"      \resumeItem{" + _latex_escape(bullet) + "}")
         lines.extend([r"    \resumeItemListEnd", r"    \vspace{-5pt}", ""])
-    lines.extend([r"    \resumeSubHeadingListEnd", r"\vspace{-12pt}"])
     return "\n".join(lines)
+
+
+def _latex_plain_project_item(project: dict) -> str:
+    name = _latex_escape(str(project.get("name", "Project"))[:80])
+    summary = _latex_escape(str(project.get("summary") or project.get("description") or "Verified GitHub project evidence."))
+    skills = ", ".join(_latex_escape(str(skill)) for skill in (project.get("skills") or [])[:8])
+    details = summary + (f" ({skills})" if skills else "")
+    return r"    \item \textbf{" + name + r"}: " + details
 
 
 def _latex_focus_itemize(focus_line: str) -> str:

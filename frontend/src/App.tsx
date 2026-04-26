@@ -3,9 +3,11 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
   ArrowDownWideNarrow,
+  BellRing,
   Bot,
   Bug,
   CheckCircle2,
+  Clock3,
   ClipboardCheck,
   Download,
   Eye,
@@ -24,6 +26,7 @@ import {
   Sparkles,
   Upload,
   Workflow,
+  X,
   Zap
 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -132,7 +135,7 @@ export default function App() {
               <RefreshCcw size={16} /> Refresh Data
             </Button>
             <span className="rounded-full border border-[#d6eba0] bg-[#effbcf] px-3 py-1 text-xs font-semibold text-[#2f3f13]">
-              Threshold: 85%
+              Supervised apply · submit stays manual
             </span>
           </div>
         </header>
@@ -1294,6 +1297,40 @@ function DebugModal({ title, data, onClose }: { title: string; data: JobDebug | 
             </div>
           </div>
 
+          {"fill_report" in data && data.fill_report && (
+            <div className="rounded border border-line bg-white p-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">Browser Snapshot</div>
+              <div className="mt-2 grid gap-2 text-xs text-slate-700">
+                {typeof data.fill_report.page_title === "string" && data.fill_report.page_title && (
+                  <div><span className="font-semibold text-ink">Title:</span> {data.fill_report.page_title}</div>
+                )}
+                {typeof data.fill_report.current_url === "string" && data.fill_report.current_url && (
+                  <div className="break-all"><span className="font-semibold text-ink">URL:</span> {data.fill_report.current_url}</div>
+                )}
+                {Array.isArray(data.fill_report.buttons_seen) && data.fill_report.buttons_seen.length > 0 && (
+                  <div>
+                    <div className="font-semibold text-ink">Visible buttons</div>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {data.fill_report.buttons_seen.slice(0, 16).map((button: unknown, index: number) => (
+                        <span key={`${String(button)}-${index}`} className="rounded bg-field px-2 py-1">{String(button)}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {Array.isArray(data.fill_report.fields_seen) && data.fill_report.fields_seen.length > 0 && (
+                  <div>
+                    <div className="font-semibold text-ink">Visible fields</div>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {data.fill_report.fields_seen.slice(0, 16).map((field: unknown, index: number) => (
+                        <span key={`${String(field)}-${index}`} className="rounded bg-field px-2 py-1">{String(field)}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {trace.length > 0 && (
             <div className="rounded border border-line bg-white p-3">
               <div className="text-xs font-semibold uppercase text-slate-500">Agent Trace</div>
@@ -1335,6 +1372,210 @@ function DebugModal({ title, data, onClose }: { title: string; data: JobDebug | 
   );
 }
 
+type ApplyRunSnapshot = {
+  task: ApplyQueueTask;
+  status: string;
+  message: string;
+  action_required: string | null;
+  missing_questions: string[];
+  fill_report: Record<string, unknown>;
+  steps: string[];
+  errors: string[];
+};
+
+function applyNeedsIntervention(status: string) {
+  return ["needs_login", "needs_answers", "needs_user_action", "ready_for_submit", "failed"].includes(status);
+}
+
+function applySnapshotFromTask(task: ApplyQueueTask): ApplyRunSnapshot {
+  return {
+    task,
+    status: task.status,
+    message: task.message || "Apply agent is waiting for the next action.",
+    action_required: null,
+    missing_questions: task.missing_questions || [],
+    fill_report: task.fill_report || {},
+    steps: task.steps || [],
+    errors: task.last_error ? [task.last_error] : [],
+  };
+}
+
+function interventionTitle(status: string) {
+  if (status === "needs_login") return "User Input Required: Login or Verification";
+  if (status === "needs_answers") return "User Input Required: New Questions";
+  if (status === "ready_for_submit") return "Ready For Final Review";
+  if (status === "failed") return "Apply Agent Needs Debugging";
+  return "User Input Required";
+}
+
+function ApplyInterventionModal({
+  snapshot,
+  busy,
+  onClose,
+  onAnswer,
+  onResume,
+  onMarkSubmitted,
+  onDebug,
+}: {
+  snapshot: ApplyRunSnapshot;
+  busy?: boolean;
+  onClose: () => void;
+  onAnswer: () => void;
+  onResume: () => void;
+  onMarkSubmitted: () => void;
+  onDebug: () => void;
+}) {
+  const report = snapshot.fill_report || {};
+  const buttons = Array.isArray(report.buttons_seen) ? report.buttons_seen.slice(0, 10) : [];
+  const fields = Array.isArray(report.fields_seen) ? report.fields_seen.slice(0, 10) : [];
+  const currentUrl = typeof report.current_url === "string" ? report.current_url : "";
+  const canAnswer = snapshot.missing_questions.length > 0 || snapshot.status === "needs_answers";
+  const canSubmit = snapshot.status === "ready_for_submit";
+  const canResume = ["needs_login", "needs_user_action", "failed"].includes(snapshot.status);
+
+  return (
+    <div className="fixed inset-0 z-[60] grid place-items-center bg-black/45 p-4">
+      <div className="flex max-h-[90vh] w-full max-w-3xl flex-col rounded-[18px] border border-line bg-[#fffdf7] shadow-float">
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-line p-5">
+          <div>
+            <div className="inline-flex items-center gap-2 rounded bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-800">
+              <BellRing size={14} /> {snapshot.status.replace(/_/g, " ")}
+            </div>
+            <h3 className="mt-3 text-lg font-semibold text-ink">{interventionTitle(snapshot.status)}</h3>
+            <div className="mt-1 text-sm text-slate-600">
+              {snapshot.task.job.company} · {snapshot.task.job.title}
+            </div>
+          </div>
+          <button className="rounded p-2 text-slate-500 hover:bg-field hover:text-ink" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="grid gap-4 overflow-auto p-5">
+          <div className="rounded border border-line bg-field p-3 text-sm leading-6 text-slate-700">
+            {snapshot.action_required || snapshot.message}
+          </div>
+
+          {currentUrl && (
+            <div className="break-all rounded border border-line bg-white p-3 text-xs text-slate-600">
+              <span className="font-semibold text-ink">Browser URL:</span> {currentUrl}
+            </div>
+          )}
+
+          {snapshot.missing_questions.length > 0 && (
+            <div className="grid gap-2 rounded border border-amber-200 bg-amber-50 p-3">
+              <div className="text-xs font-semibold uppercase text-amber-800">Questions to answer and save</div>
+              {snapshot.missing_questions.map((question) => (
+                <div key={question} className="rounded border border-amber-200 bg-white px-3 py-2 text-sm text-slate-700">
+                  {question}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(buttons.length > 0 || fields.length > 0) && (
+            <div className="grid gap-3 md:grid-cols-2">
+              {buttons.length > 0 && (
+                <div className="rounded border border-line bg-white p-3">
+                  <div className="text-xs font-semibold uppercase text-slate-500">Agent saw buttons</div>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {buttons.map((button, index) => (
+                      <span key={`${String(button)}-${index}`} className="rounded bg-field px-2 py-1 text-xs text-slate-600">{String(button)}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {fields.length > 0 && (
+                <div className="rounded border border-line bg-white p-3">
+                  <div className="text-xs font-semibold uppercase text-slate-500">Agent saw fields</div>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {fields.map((field, index) => (
+                      <span key={`${String(field)}-${index}`} className="rounded bg-field px-2 py-1 text-xs text-slate-600">{String(field)}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {snapshot.steps.length > 0 && (
+            <div className="rounded border border-line bg-white p-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">Latest agent steps</div>
+              <div className="mt-2 grid gap-1 text-xs text-slate-700">
+                {snapshot.steps.slice(-6).map((step, index) => (
+                  <div key={`${step}-${index}`} className="flex gap-2">
+                    <span className="text-slate-400">{index + 1}</span>
+                    <span>{step}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex flex-wrap justify-end gap-2 border-t border-line p-5">
+          <Button variant="secondary" onClick={onDebug}>
+            <Bug size={15} /> Debug
+          </Button>
+          {canAnswer && (
+            <Button onClick={onAnswer}>
+              <ListChecks size={15} /> Answer Questions
+            </Button>
+          )}
+          {canResume && (
+            <Button disabled={busy} onClick={onResume}>
+              <RefreshCcw size={15} /> {busy ? "Resuming..." : "Resume Agent"}
+            </Button>
+          )}
+          {canSubmit && (
+            <Button onClick={onMarkSubmitted}>
+              <CheckCircle2 size={15} /> Mark Submitted
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ApplyAgentProgress({ task }: { task: ApplyQueueTask }) {
+  const report = task.fill_report || {};
+  const hasBrowser = Boolean(report.current_url || task.trace?.some((step) => step.name === "browser_agent"));
+  const filledCount = Number(report.profile_fields_filled || 0) + Number(report.answers_filled || 0);
+  const resumeUploaded = Boolean(report.resume_uploaded);
+  const finalReady = task.status === "ready_for_submit" || task.status === "submitted_by_user";
+  const needsInput = applyNeedsIntervention(task.status) && !finalReady;
+  const steps = [
+    { label: "Resume", detail: task.resume ? `#${task.resume.id}` : "Preparing", done: Boolean(task.resume) },
+    { label: "Browser", detail: hasBrowser ? applyModeLabelFromTask(task) : "Not opened", done: hasBrowser },
+    { label: "Fill", detail: resumeUploaded || filledCount ? `${resumeUploaded ? "resume" : ""}${resumeUploaded && filledCount ? " + " : ""}${filledCount || ""} field${filledCount === 1 ? "" : "s"}` : "Waiting", done: resumeUploaded || filledCount > 0 },
+    { label: "Input", detail: needsInput ? "Required" : "Clear", done: !needsInput },
+    { label: "Submit", detail: task.status === "submitted_by_user" ? "Confirmed" : finalReady ? "Review" : "Manual final", done: finalReady },
+  ];
+
+  return (
+    <div className="mt-4 grid gap-2 rounded border border-line bg-white p-3 md:grid-cols-5">
+      {steps.map((step, index) => (
+        <div key={step.label} className="flex min-w-0 items-center gap-2">
+          <div className={`grid h-7 w-7 shrink-0 place-items-center rounded-full text-xs font-semibold ${step.done ? "bg-emerald-100 text-emerald-700" : index === 3 && needsInput ? "bg-amber-100 text-amber-700" : "bg-field text-slate-500"}`}>
+            {step.done ? <CheckCircle2 size={14} /> : <Clock3 size={14} />}
+          </div>
+          <div className="min-w-0">
+            <div className="truncate text-xs font-semibold text-ink">{step.label}</div>
+            <div className="truncate text-[11px] text-slate-500">{step.detail}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function applyModeLabelFromTask(task: ApplyQueueTask) {
+  const mode = String(task.fill_report?.mode || task.source || "");
+  if (mode === "linkedin_easy_apply") return "Easy Apply";
+  if (mode === "external_from_linkedin") return "External link";
+  if (mode === "external_site") return "External site";
+  return mode.replace(/_/g, " ") || "Browser";
+}
+
 function previewUrl(path: string | null | undefined) {
   if (!path) return null;
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
@@ -1342,22 +1583,25 @@ function previewUrl(path: string | null | undefined) {
 }
 
 function resumePdfStatusLabel(mode?: string | null) {
+  if (mode === "docx_converter") return "Tailored PDF converted from Word";
   if (mode === "latex_compiler") return "Tailored PDF compiled from LaTeX";
-  if (mode === "base_pdf_fallback") return "Uploaded PDF kept for apply";
-  if (mode === "styled_pdf_fallback") return "Simple PDF generated";
+  if (mode === "base_pdf_fallback") return "Legacy uploaded PDF fallback";
+  if (mode === "styled_pdf_fallback") return "Updated ATS PDF generated";
   return "PDF pending";
 }
 
 function resumePdfStatusNote(mode?: string | null, fallback?: string | null) {
+  if (mode === "docx_converter") return "The visual PDF preview includes the latest tailored Word resume edits.";
   if (mode === "latex_compiler") return "The visual PDF preview includes the latest tailored LaTeX edits.";
   if (mode === "base_pdf_fallback") {
-    return "Your application PDF keeps the original Overleaf formatting. Open Difference to see the saved LaTeX edits; install a local LaTeX compiler to render those edits into the same PDF format.";
+    return "This older version used the uploaded PDF fallback. Download PDF again to regenerate an updated ATS PDF, or install a local LaTeX compiler for exact Overleaf rendering.";
   }
-  if (mode === "styled_pdf_fallback") return "SeekApply generated a simple preview PDF because no uploaded PDF or local LaTeX compiler was available.";
+  if (mode === "styled_pdf_fallback") return fallback || "SeekApply generated an updated ATS PDF fallback because no layout-preserving converter was available.";
   return fallback || "Run Resume Decision or Auto Refine to prepare a resume PDF.";
 }
 
 function resumePdfStatusClass(mode?: string | null) {
+  if (mode === "docx_converter") return "border-emerald-200 bg-emerald-50 text-emerald-800";
   if (mode === "latex_compiler") return "border-emerald-200 bg-emerald-50 text-emerald-800";
   if (mode === "base_pdf_fallback") return "border-amber-200 bg-amber-50 text-amber-800";
   if (mode === "styled_pdf_fallback") return "border-sky-200 bg-sky-50 text-sky-800";
@@ -1366,9 +1610,13 @@ function resumePdfStatusClass(mode?: string | null) {
 
 function compactResumeChange(change: string) {
   const clean = change.replace(/^Changed:\s*/i, "").replace(/\.$/, "").trim();
+  if (/Kept the uploaded Word resume template/i.test(clean)) return "Kept your Word layout";
+  if (/Updated the Profile\/Summary section in the Word resume/i.test(clean)) return "Retargeted Word Profile/Summary";
+  if (/Added a compact Targeted Focus line in the Word resume/i.test(clean)) return "Updated Word Targeted Focus";
   if (/Kept the uploaded LaTeX resume template/i.test(clean)) return "Kept your Overleaf layout";
   if (/Updated the Profile\/Summary section/i.test(clean)) return "Retargeted Profile/Summary";
   if (/Added a compact Targeted Focus line/i.test(clean)) return "Updated Targeted Focus skills";
+  if (/Generated a clean ATS resume/i.test(clean)) return "Generated a clean ATS resume";
   if (/Generated a clean LaTeX resume/i.test(clean)) return "Generated a LaTeX resume template";
   if (/Emphasized verified overlap:/i.test(clean)) return clean.replace("Emphasized verified overlap:", "Emphasized verified skills:");
   if (/Kept verified skills visible:/i.test(clean)) return clean.replace("Kept verified skills visible:", "Kept verified skills:");
@@ -1424,20 +1672,29 @@ function PdfPreviewGrid({ preview }: { preview: ResumePreview }) {
   const tailoredUrl = previewUrl(preview.pdf_preview?.tailored_pdf_url);
   const mode = preview.pdf_preview?.pdf_generation ?? preview.version.pdf_generation;
   const usesUploadedPdf = mode === "base_pdf_fallback";
+  const wordFallback = preview.version.source_format === "docx_template" && mode === "styled_pdf_fallback";
+  const baseLabel = preview.base_source_type === "uploaded_word_template" ? "Original Word Resume" : "Original Uploaded PDF";
+  const docxUrl = previewUrl(preview.version.download_urls?.docx);
   return (
     <div className="mt-4 grid gap-3">
       <div className={`rounded border p-3 text-xs leading-5 ${resumePdfStatusClass(mode)}`}>
-        <div className="font-semibold">{resumePdfStatusLabel(mode)}</div>
-        <div className="mt-1">{resumePdfStatusNote(mode, preview.pdf_preview?.note)}</div>
+        <div className="font-semibold">{wordFallback ? "Edited Word resume ready" : resumePdfStatusLabel(mode)}</div>
+        <div className="mt-1">
+          {wordFallback
+            ? "The Word document is the layout-preserving resume. The PDF fallback is not shown here because it does not preserve your Word format."
+            : resumePdfStatusNote(mode, preview.pdf_preview?.note)}
+        </div>
       </div>
       <div className="grid gap-3 xl:grid-cols-2">
         <div className="grid gap-2">
-          <div className="text-xs font-semibold uppercase text-slate-500">Original Uploaded PDF</div>
+          <div className="text-xs font-semibold uppercase text-slate-500">{baseLabel}</div>
           {baseUrl ? (
             <iframe className="h-[62vh] w-full rounded border border-line bg-white" src={baseUrl} title="Uploaded resume PDF preview" />
           ) : (
             <div className="grid h-[62vh] place-items-center rounded border border-line bg-white p-6 text-center text-sm text-slate-500">
-              No uploaded base PDF is available. Upload the original Overleaf PDF along with the LaTeX source to compare visually.
+              {preview.base_source_type === "uploaded_word_template"
+                ? "The Word resume is the editable source. PDF preview is available after DOCX conversion or ATS PDF fallback."
+                : "No uploaded base PDF is available. Upload the original resume PDF if you want side-by-side visual comparison."}
             </div>
           )}
         </div>
@@ -1448,7 +1705,24 @@ function PdfPreviewGrid({ preview }: { preview: ResumePreview }) {
             </div>
             {usesUploadedPdf && <span className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">Compile LaTeX to render PDF</span>}
           </div>
-          {usesUploadedPdf ? (
+          {wordFallback ? (
+            <div className="grid h-[62vh] gap-3 overflow-auto rounded border border-line bg-white p-4 text-sm leading-6 text-slate-700">
+              <div>
+                <div className="font-semibold text-ink">Use the tailored DOCX for the preserved layout.</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  Microsoft Word/LibreOffice conversion is required to create a matching PDF. Until then, SeekApply will upload the edited DOCX for apply flows when the portal accepts it.
+                </div>
+              </div>
+              {docxUrl && (
+                <a href={docxUrl} className="inline-flex w-fit items-center gap-2 rounded bg-moss px-3 py-2 text-xs font-semibold text-white">
+                  <Download size={13} /> Download Tailored DOCX
+                </a>
+              )}
+              <div className="rounded border border-line bg-field p-3 whitespace-pre-wrap text-xs leading-5">
+                {preview.tailored_preview || "Tailored Word resume text is not ready yet. Run Auto Build Resume first."}
+              </div>
+            </div>
+          ) : usesUploadedPdf ? (
             <div className="h-[62vh] overflow-auto rounded border border-line bg-white p-4 font-mono text-xs leading-5 text-slate-800">
               {preview.tailored_preview || "Tailored LaTeX is not ready yet. Run Auto Refine first."}
             </div>
@@ -1491,6 +1765,11 @@ function ResumeDifferenceView({ preview }: { preview: ResumePreview }) {
           The PDF panes look the same because no local LaTeX compiler is installed. These differences show the actual saved LaTeX edits that will render into a tailored PDF once LaTeX compilation is available.
         </div>
       )}
+      {preview.version.source_format === "docx_template" && mode === "styled_pdf_fallback" && (
+        <div className="rounded border border-sky-200 bg-sky-50 p-3 text-xs leading-5 text-sky-800">
+          The tailored DOCX is updated from your Word resume. Install LibreOffice if you want the PDF to preserve the exact Word layout; otherwise SeekApply uses the ATS PDF fallback.
+        </div>
+      )}
       <div className="grid gap-2 md:grid-cols-3">
         <div className="rounded border border-line bg-field p-3">
           <div className="text-[11px] font-semibold uppercase text-slate-500">Uploaded Resume Score</div>
@@ -1518,7 +1797,9 @@ function ResumeDifferenceView({ preview }: { preview: ResumePreview }) {
         </div>
       )}
       <div className="overflow-hidden rounded border border-line bg-white">
-        <div className="border-b border-line bg-field px-3 py-2 text-xs font-semibold uppercase text-slate-500">Detailed LaTeX Difference</div>
+        <div className="border-b border-line bg-field px-3 py-2 text-xs font-semibold uppercase text-slate-500">
+          Detailed {preview.tailored_source_type === "docx" ? "Word" : "LaTeX"} Difference
+        </div>
         {preview.diff.length ? (
           <div className="max-h-[52vh] overflow-auto font-mono text-xs leading-5">
             {preview.diff.map((line, index) => (
@@ -1545,7 +1826,10 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
   const [repoEvidence, setRepoEvidence] = useState<Record<number, string>>({});
   const [preview, setPreview] = useState<ResumePreview | null>(null);
   const [previewMode, setPreviewMode] = useState<"pdf" | "diff" | "before" | "after">("pdf");
-  const [debugData, setDebugData] = useState<JobDebug | null>(null);
+  const [answerTask, setAnswerTask] = useState<ApplyQueueTask | null>(null);
+  const [applyIntervention, setApplyIntervention] = useState<ApplyRunSnapshot | null>(null);
+  const [applyAnswers, setApplyAnswers] = useState<Record<string, string>>({});
+  const [debugData, setDebugData] = useState<JobDebug | ApplyTaskDebug | null>(null);
   const [appStatus, setAppStatus] = useState<Record<number, string>>({});
 
   const loadJobs = async () => {
@@ -1749,6 +2033,21 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
       });
       const task = result.tasks[0];
       const startResult = task ? await api.startApplyTask(task.id) : null;
+      if (startResult?.missing_questions.length) {
+        setAnswerTask(startResult.task);
+        setApplyAnswers(Object.fromEntries(startResult.missing_questions.map((question) => [question, ""])));
+      } else if (startResult && applyNeedsIntervention(startResult.status)) {
+        setApplyIntervention({
+          task: startResult.task,
+          status: startResult.status,
+          message: startResult.message,
+          action_required: startResult.action_required,
+          missing_questions: startResult.missing_questions,
+          fill_report: startResult.fill_report,
+          steps: startResult.steps,
+          errors: startResult.errors,
+        });
+      }
       setResultFor(job.id, [
         result.message,
         task ? `Apply task ${task.id}: ${task.status}` : "Job was not eligible for the supervised LinkedIn queue.",
@@ -1766,6 +2065,77 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     } finally {
       setBusyFor(job.id, false);
     }
+  };
+
+  const saveApplyAnswers = async () => {
+    if (!answerTask) return;
+    const items = answerTask.missing_questions
+      .map((question) => ({
+        question_text: question,
+        answer_text: applyAnswers[question] || "",
+        source: "match_resume_auto_apply_missing_question",
+        sensitive: true,
+        approved: true,
+      }))
+      .filter((item) => item.answer_text.trim());
+    if (!items.length) {
+      onNotice("Add at least one answer before saving.");
+      return;
+    }
+    await api.bulkAnswers({ answers: items });
+    const result = await api.resumeApplyTask(answerTask.id);
+    setAnswerTask(null);
+    setApplyAnswers({});
+    if (applyNeedsIntervention(result.status)) {
+      setApplyIntervention({
+        task: result.task,
+        status: result.status,
+        message: result.message,
+        action_required: result.action_required,
+        missing_questions: result.missing_questions,
+        fill_report: result.fill_report,
+        steps: result.steps,
+        errors: result.errors,
+      });
+    }
+    onNotice(result.action_required || result.message);
+    await loadJobs();
+    await onRefresh();
+  };
+
+  const resumeIntervention = async () => {
+    if (!applyIntervention) return;
+    const result = await api.resumeApplyTask(applyIntervention.task.id);
+    if (result.missing_questions.length) {
+      setAnswerTask(result.task);
+      setApplyAnswers(Object.fromEntries(result.missing_questions.map((question) => [question, ""])));
+      setApplyIntervention(null);
+    } else if (applyNeedsIntervention(result.status)) {
+      setApplyIntervention({
+        task: result.task,
+        status: result.status,
+        message: result.message,
+        action_required: result.action_required,
+        missing_questions: result.missing_questions,
+        fill_report: result.fill_report,
+        steps: result.steps,
+        errors: result.errors,
+      });
+    } else {
+      setApplyIntervention(null);
+    }
+    onNotice(result.action_required || result.message);
+    await loadJobs();
+    await onRefresh();
+  };
+
+  const markInterventionSubmitted = async () => {
+    if (!applyIntervention) return;
+    const result = await api.markApplySubmitted(applyIntervention.task.id);
+    setApplyIntervention(null);
+    onNotice(`Application ${result.application_id} marked as ${result.status}.`);
+    await loadJobs();
+    await onRefresh();
   };
 
   const scoreColor = (score: number | null) => {
@@ -2007,12 +2377,14 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 >
                   <Download size={12} /> Download DOCX
                 </button>
-                <button
-                  onClick={() => api.downloadResumeTex(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
-                  className="flex items-center gap-1.5 rounded border border-indigo-400 px-3 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-50"
-                >
-                  <Download size={12} /> Download LaTeX
-                </button>
+                {selectedVersion?.source_format !== "docx_template" && (
+                  <button
+                    onClick={() => api.downloadResumeTex(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
+                    className="flex items-center gap-1.5 rounded border border-indigo-400 px-3 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-50"
+                  >
+                    <Download size={12} /> Download LaTeX
+                  </button>
+                )}
                 <button
                   onClick={() => handlePreview(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
                   className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field"
@@ -2211,6 +2583,54 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
       {debugData && (
         <DebugModal title="Job Debug" data={debugData} onClose={() => setDebugData(null)} />
       )}
+      {applyIntervention && (
+        <ApplyInterventionModal
+          snapshot={applyIntervention}
+          busy={busy[applyIntervention.task.id]}
+          onClose={() => setApplyIntervention(null)}
+          onAnswer={() => {
+            setAnswerTask(applyIntervention.task);
+            setApplyAnswers(Object.fromEntries(applyIntervention.missing_questions.map((question) => [question, ""])));
+            setApplyIntervention(null);
+          }}
+          onResume={() => resumeIntervention().catch((error) => onNotice(error.message))}
+          onMarkSubmitted={() => markInterventionSubmitted().catch((error) => onNotice(error.message))}
+          onDebug={() => api.applyTaskDebug(applyIntervention.task.id).then(setDebugData).catch((error) => onNotice(error.message))}
+        />
+      )}
+      {answerTask && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <div className="inline-flex items-center gap-2 rounded bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-800">
+                  <BellRing size={14} /> Agent paused
+                </div>
+                <h3 className="mt-3 text-base font-semibold">Answer New Application Questions</h3>
+                <div className="mt-1 text-sm text-slate-500">Answers are saved to the Knowledge Base and reused on later applications.</div>
+              </div>
+              <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setAnswerTask(null)}>Close</button>
+            </div>
+            <div className="grid max-h-[60vh] gap-4 overflow-auto pr-1">
+              {answerTask.missing_questions.map((question) => (
+                <Field key={question} label={question}>
+                  <textarea
+                    className={textareaClass}
+                    value={applyAnswers[question] || ""}
+                    onChange={(event) => setApplyAnswers((prev) => ({ ...prev, [question]: event.target.value }))}
+                  />
+                </Field>
+              ))}
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <Button variant="secondary" onClick={() => setAnswerTask(null)}>Cancel</Button>
+              <Button onClick={() => saveApplyAnswers().catch((error) => onNotice(error.message))}>
+                <Save size={15} /> Save to KB &amp; Resume Apply
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2220,6 +2640,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
   const [busy, setBusy] = useState<Record<number, boolean>>({});
   const [queueBusy, setQueueBusy] = useState(false);
   const [answerTask, setAnswerTask] = useState<ApplyQueueTask | null>(null);
+  const [intervention, setIntervention] = useState<ApplyRunSnapshot | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [debugData, setDebugData] = useState<ApplyTaskDebug | null>(null);
 
@@ -2261,6 +2682,17 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
           if (result.missing_questions.length) {
             setAnswerTask(result.task);
             setAnswers(Object.fromEntries(result.missing_questions.map((question) => [question, ""])));
+          } else if (applyNeedsIntervention(result.status)) {
+            setIntervention({
+              task: result.task,
+              status: result.status,
+              message: result.message,
+              action_required: result.action_required,
+              missing_questions: result.missing_questions,
+              fill_report: result.fill_report,
+              steps: result.steps,
+              errors: result.errors,
+            });
           }
           if (["ready_for_submit", "needs_login", "needs_answers", "needs_user_action", "failed"].includes(result.status)) {
             onNotice(result.action_required || result.message);
@@ -2285,6 +2717,17 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
       if (result.missing_questions.length) {
         setAnswerTask(result.task);
         setAnswers(Object.fromEntries(result.missing_questions.map((question) => [question, ""])));
+      } else if (applyNeedsIntervention(result.status)) {
+        setIntervention({
+          task: result.task,
+          status: result.status,
+          message: result.message,
+          action_required: result.action_required,
+          missing_questions: result.missing_questions,
+          fill_report: result.fill_report,
+          steps: result.steps,
+          errors: result.errors,
+        });
       }
       await load();
       await onRefresh();
@@ -2332,6 +2775,20 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
     await runTask(task, "resume");
   };
 
+  const resumeIntervention = async () => {
+    if (!intervention) return;
+    const task = intervention.task;
+    setIntervention(null);
+    await runTask(task, "resume");
+  };
+
+  const markInterventionSubmitted = async () => {
+    if (!intervention) return;
+    const task = intervention.task;
+    setIntervention(null);
+    await markSubmitted(task);
+  };
+
   const statusClass = (status: string) => {
     if (status === "ready_for_submit") return "bg-emerald-100 text-emerald-700";
     if (status === "needs_answers" || status === "needs_login" || status === "needs_user_action") return "bg-amber-100 text-amber-700";
@@ -2339,6 +2796,22 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
     if (status === "submitted_by_user") return "bg-cobalt text-white";
     return "bg-slate-100 text-slate-600";
   };
+
+  const applyModeLabel = (task: ApplyQueueTask) => {
+    const mode = String(task.fill_report?.mode || task.source || "");
+    if (mode === "linkedin_easy_apply") return "LinkedIn Easy Apply";
+    if (mode === "external_from_linkedin") return "LinkedIn external apply";
+    if (mode === "external_site") return "External site";
+    return mode.replace(/_/g, " ") || "Apply agent";
+  };
+
+  const easyApplyDetection = (task: ApplyQueueTask) => {
+    const report = task.fill_report?.easy_apply_detection;
+    if (!report || typeof report !== "object") return null;
+    return report as { clicked?: boolean; reason?: string; clicked_text?: string; visible_apply_buttons?: string[] };
+  };
+
+  const attentionTasks = tasks.filter((task) => applyNeedsIntervention(task.status));
 
   return (
     <div className="grid gap-4">
@@ -2362,6 +2835,19 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         </div>
       </Panel>
 
+      {attentionTasks.length > 0 && (
+        <div className="rounded border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-semibold">
+              <BellRing size={16} /> {attentionTasks.length} apply agent task{attentionTasks.length !== 1 ? "s" : ""} need attention
+            </div>
+            <Button variant="secondary" onClick={() => setIntervention(applySnapshotFromTask(attentionTasks[0]))}>
+              Open Prompt
+            </Button>
+          </div>
+        </div>
+      )}
+
       {tasks.length ? (
         <div className="grid gap-3">
           {tasks.map((task) => {
@@ -2377,6 +2863,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                       <span className={`rounded px-2 py-1 font-semibold ${statusClass(task.status)}`}>{task.status}</span>
                       <span className="text-slate-500">{task.application_status || "No application yet"}</span>
+                      <span className="rounded bg-slate-100 px-2 py-1 font-semibold text-slate-600">{applyModeLabel(task)}</span>
                       {task.resume && (
                         <span className="text-slate-500">
                           Resume #{task.resume.id}
@@ -2399,12 +2886,31 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                     <Button variant="secondary" disabled={isBusy || !["ready_for_submit", "needs_user_action"].includes(task.status)} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
                       <CheckCircle2 size={15} /> Mark Submitted
                     </Button>
+                    {applyNeedsIntervention(task.status) && (
+                      <Button variant="secondary" disabled={isBusy} onClick={() => setIntervention(applySnapshotFromTask(task))}>
+                        <BellRing size={15} /> Agent Prompt
+                      </Button>
+                    )}
                     <Button variant="secondary" disabled={isBusy} onClick={() => debugTask(task).catch((error) => onNotice(error.message))}>
                       <Shield size={15} /> Debug
                     </Button>
                   </div>
                 </div>
+                <ApplyAgentProgress task={task} />
                 {task.message && <div className="mt-3 rounded border border-line bg-field px-3 py-2 text-sm text-slate-700">{task.message}</div>}
+                {easyApplyDetection(task) && !easyApplyDetection(task)?.clicked && (
+                  <div className="mt-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    LinkedIn Apply detector: {easyApplyDetection(task)?.reason?.replace(/_/g, " ") || "not opened"}.
+                    {easyApplyDetection(task)?.visible_apply_buttons?.length
+                      ? ` Visible apply actions: ${easyApplyDetection(task)?.visible_apply_buttons?.join(", ")}.`
+                      : " No visible LinkedIn Apply action was found on the loaded LinkedIn page."}
+                  </div>
+                )}
+                {typeof task.fill_report?.manual_review_reason === "string" && (
+                  <div className="mt-3 rounded border border-line bg-white px-3 py-2 text-sm text-slate-700">
+                    Manual review reason: {task.fill_report.manual_review_reason}
+                  </div>
+                )}
                 {task.trace && task.trace.length > 0 && (
                   <details className="mt-3 rounded border border-line bg-white px-3 py-2 text-xs text-slate-700">
                     <summary className="cursor-pointer font-semibold text-ink">Agent trace</summary>
@@ -2442,11 +2948,33 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         </Panel>
       )}
 
+      {intervention && (
+        <ApplyInterventionModal
+          snapshot={intervention}
+          busy={busy[intervention.task.id]}
+          onClose={() => setIntervention(null)}
+          onAnswer={() => {
+            setAnswerTask(intervention.task);
+            setAnswers(Object.fromEntries(intervention.missing_questions.map((question) => [question, ""])));
+            setIntervention(null);
+          }}
+          onResume={() => resumeIntervention().catch((error) => onNotice(error.message))}
+          onMarkSubmitted={() => markInterventionSubmitted().catch((error) => onNotice(error.message))}
+          onDebug={() => debugTask(intervention.task).catch((error) => onNotice(error.message))}
+        />
+      )}
+
       {answerTask && (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
           <div className="w-full max-w-2xl rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
             <div className="mb-4 flex items-center justify-between gap-3">
-              <h3 className="text-base font-semibold">Answer Application Questions</h3>
+              <div>
+                <div className="inline-flex items-center gap-2 rounded bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-800">
+                  <BellRing size={14} /> Agent paused
+                </div>
+                <h3 className="mt-3 text-base font-semibold">Answer Application Questions</h3>
+                <div className="mt-1 text-sm text-slate-500">These answers are approved into the KB, then the apply agent resumes automatically.</div>
+              </div>
               <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setAnswerTask(null)}>Close</button>
             </div>
             <div className="grid max-h-[60vh] gap-4 overflow-auto pr-1">

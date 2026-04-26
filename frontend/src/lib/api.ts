@@ -47,6 +47,8 @@ export type ResumeVersion = {
   resume_changes?: string[];
   pdf_generation?: string | null;
   pdf_note?: string;
+  source_format?: string | null;
+  minimal_docx_edit?: boolean;
   minimal_latex_edit?: boolean;
   manual_refinement_notes?: string | null;
   requested_focus_skills?: string[];
@@ -76,6 +78,7 @@ export type ResumeLab = {
     resume_path: string | null;
   };
   selected_resume_version_id: number | null;
+  docx_template_available?: boolean;
   latex_template_available: boolean;
   latex_compiler_available: boolean;
   versions: ResumeVersion[];
@@ -285,9 +288,11 @@ export type ApplyQueueTask = {
   application_status: string | null;
   resume: {
     id: number;
+    file_path?: string;
     pdf_path: string;
     docx_path: string;
     tex_path?: string | null;
+    source_format?: string | null;
     pdf_generation?: string | null;
     score_delta?: number | null;
     tailored_score?: number | null;
@@ -614,7 +619,7 @@ export const api = {
       missing_questions: string[];
       fill_report: Record<string, unknown>;
       auto_submit: false;
-    }>(`/apply-queue/${taskId}/start`, { method: "POST", body: JSON.stringify({ wait_seconds: 90 }) }),
+    }>(`/apply-queue/${taskId}/start`, { method: "POST", body: JSON.stringify({ wait_seconds: 240 }) }),
   resumeApplyTask: (taskId: number) =>
     request<{
       task: ApplyQueueTask;
@@ -626,7 +631,7 @@ export const api = {
       missing_questions: string[];
       fill_report: Record<string, unknown>;
       auto_submit: false;
-    }>(`/apply-queue/${taskId}/resume`, { method: "POST", body: JSON.stringify({ wait_seconds: 90 }) }),
+    }>(`/apply-queue/${taskId}/resume`, { method: "POST", body: JSON.stringify({ wait_seconds: 240 }) }),
   markApplySubmitted: (taskId: number) =>
     request<{ task: ApplyQueueTask; application_id: number; status: string; auto_submit: false }>(
       `/apply-queue/${taskId}/mark-submitted`,

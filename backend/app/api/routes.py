@@ -561,12 +561,15 @@ def _latest_resume_for_job(db: Session, user: User, job: Job) -> ResumeVersion |
 
 def _store_tailored_resume_version(db: Session, user: User, job: Job, score: int) -> ResumeVersion:
     tailored = ResumeTailoringAgent().tailor(user, job, score)
+    primary_path = tailored.pdf_path
+    if tailored.metadata.get("source_format") == "docx_template" and tailored.metadata.get("pdf_generation") != "docx_converter":
+        primary_path = tailored.docx_path
     version = ResumeVersion(
         user_id=user.id,
         company=job.company,
         role=job.title,
         job_id=job.id,
-        file_path=str(tailored.pdf_path),
+        file_path=str(primary_path),
         docx_path=str(tailored.docx_path),
         pdf_path=str(tailored.pdf_path),
         tex_path=str(tailored.tex_path) if tailored.tex_path else None,
@@ -578,6 +581,21 @@ def _store_tailored_resume_version(db: Session, user: User, job: Job, score: int
     db.add(version)
     db.flush()
     return version
+
+
+def _resume_application_file(agent: ResumeTailoringAgent, user: User, version: ResumeVersion, job: Job | None = None) -> Path:
+    metadata = _resume_version_metadata(version.metadata_path)
+    docx_path = Path(version.docx_path)
+    if metadata.get("source_format") == "docx_template" and metadata.get("pdf_generation") != "docx_converter" and docx_path.exists():
+        # Do not force Word/LibreOffice conversion while starting browser apply.
+        # If a layout-preserving PDF has not already been created, upload the
+        # tailored DOCX directly; many portals accept it, and it avoids long
+        # converter calls holding SQLite write locks.
+        version.file_path = str(docx_path)
+        return docx_path
+    pdf_path = agent.ensure_pdf_export(user, version, job, force=True)
+    version.file_path = str(pdf_path)
+    return pdf_path
 
 
 def _ensure_queue_resume(
@@ -594,19 +612,19 @@ def _ensure_queue_resume(
     version = version or _latest_resume_for_job(db, user, job)
     agent = ResumeTailoringAgent()
     if version:
-        pdf_path = agent.ensure_pdf_export(user, version, job, force=True)
+        resume_path = _resume_application_file(agent, user, version, job)
         task.resume_version_id = version.id
         application.resume_version_id = version.id
-        return pdf_path
+        return resume_path
 
     score = job.match_score if job.match_score is not None else JobMatchingAgent().score(user, preferences, job).score
-    if agent.has_latex_template(user):
+    if agent.has_docx_template(user) or agent.has_latex_template(user):
         version = _store_tailored_resume_version(db, user, job, score)
         task.resume_version_id = version.id
         application.resume_version_id = version.id
         job.status = "Resume tailored"
         application.status = "Resume tailored"
-        return Path(version.pdf_path)
+        return _resume_application_file(agent, user, version, job)
 
     base_path = Path(user.base_resume_path).expanduser() if user.base_resume_path else None
     if base_path and base_path.exists() and base_path.suffix.lower() == ".pdf":
@@ -617,7 +635,7 @@ def _ensure_queue_resume(
     application.resume_version_id = version.id
     job.status = "Resume tailored"
     application.status = "Resume tailored"
-    return Path(version.pdf_path)
+    return _resume_application_file(agent, user, version, job)
 
 
 def _apply_queue_task_payload(db: Session, task: ApplyQueueTask) -> dict:
@@ -652,9 +670,11 @@ def _apply_queue_task_payload(db: Session, task: ApplyQueueTask) -> dict:
         "application_status": application.status if application else None,
         "resume": {
             "id": resume.id,
+            "file_path": resume.file_path,
             "pdf_path": resume.pdf_path,
             "docx_path": resume.docx_path,
             "tex_path": resume.tex_path,
+            "source_format": _resume_version_metadata(resume.metadata_path).get("source_format"),
             "pdf_generation": _resume_version_metadata(resume.metadata_path).get("pdf_generation"),
             "score_delta": _resume_version_metadata(resume.metadata_path).get("score_delta"),
             "tailored_score": _resume_version_metadata(resume.metadata_path).get("tailored_resume_score"),
@@ -850,20 +870,27 @@ def _persist_resume_score_report(
     metadata["resume_changes"] = score_payload.get("resume_changes", metadata.get("resume_changes", []))
     metadata["pdf_generation"] = score_payload.get("pdf_generation", metadata.get("pdf_generation"))
     metadata["minimal_latex_edit"] = score_payload.get("minimal_latex_edit", metadata.get("minimal_latex_edit", False))
+    metadata["minimal_docx_edit"] = score_payload.get("minimal_docx_edit", metadata.get("minimal_docx_edit", False))
+    metadata["source_format"] = score_payload.get("source_format", metadata.get("source_format"))
     return _write_resume_version_metadata(version, metadata)
 
 
 def _pdf_generation_note(metadata: dict) -> str:
     mode = metadata.get("pdf_generation")
+    source_format = metadata.get("source_format")
+    if mode == "docx_converter":
+        return "Tailored PDF was converted from the edited Word resume."
     if mode == "latex_compiler":
         return "Tailored PDF was compiled from the edited LaTeX resume."
     if mode == "base_pdf_fallback":
         return (
-            "Application PDF keeps your original Overleaf formatting. Tailored LaTeX edits are saved for review; "
-            "install a local LaTeX compiler to render those edits into the same PDF format."
+            "Legacy resume version used the uploaded PDF fallback. Download PDF again to regenerate an updated ATS PDF, "
+            "or install a local LaTeX compiler for exact Overleaf rendering."
         )
     if mode == "styled_pdf_fallback":
-        return "SeekApply generated a simple PDF because no uploaded PDF or local LaTeX compiler was available."
+        if source_format == "docx_template":
+            return "The edited Word resume is ready. SeekApply could not create a layout-preserving PDF, so the DOCX should be used for upload."
+        return "SeekApply generated an updated ATS PDF from the tailored resume because no local LaTeX compiler was available."
     return "PDF status will be finalized when you download or queue this resume."
 
 
@@ -905,6 +932,8 @@ def _resume_version_payload(
         "resume_changes": metadata.get("resume_changes", []),
         "pdf_generation": metadata.get("pdf_generation"),
         "pdf_note": _pdf_generation_note(metadata),
+        "source_format": metadata.get("source_format"),
+        "minimal_docx_edit": metadata.get("minimal_docx_edit", False),
         "minimal_latex_edit": metadata.get("minimal_latex_edit", False),
         "manual_refinement_notes": metadata.get("manual_refinement_notes"),
         "requested_focus_skills": metadata.get("requested_focus_skills", []),
@@ -1003,13 +1032,18 @@ def _resume_lab_payload(db: Session, *, user: User, preferences: JobPreference, 
             "resume_path": user.base_resume_path,
         },
         "selected_resume_version_id": selected_id,
+        "docx_template_available": ResumeTailoringAgent().has_docx_template(user),
         "latex_template_available": ResumeTailoringAgent().has_latex_template(user),
         "latex_compiler_available": latex_compiler_available(),
         "versions": versions_payload,
         "pdf_note": (
+            "Tailored Word resume edits are ready. Install LibreOffice to render the edited DOCX into a layout-preserving PDF."
+            if ResumeTailoringAgent().has_docx_template(user)
+            else (
             "Tailored LaTeX edits are ready. Install a local LaTeX compiler to render them into the same Overleaf PDF format."
             if ResumeTailoringAgent().has_latex_template(user) and not latex_compiler_available()
             else "Tailored PDF generation is available."
+            )
         ),
     }
 
@@ -1056,6 +1090,8 @@ def _score_tailored_resume_payload(
         "resume_changes": metadata.get("resume_changes", []),
         "pdf_generation": metadata.get("pdf_generation"),
         "minimal_latex_edit": metadata.get("minimal_latex_edit", False),
+        "minimal_docx_edit": metadata.get("minimal_docx_edit", False),
+        "source_format": metadata.get("source_format"),
     }
 
 
@@ -1064,6 +1100,14 @@ def _tailored_resume_text(tailored_or_version, fallback: str = "") -> str:
     paragraphs = getattr(tailored_or_version, "paragraphs", None)
     if paragraphs:
         parts.append("\n".join(str(item) for item in paragraphs))
+    docx_path_value = getattr(tailored_or_version, "docx_path", None)
+    if docx_path_value:
+        docx_path = Path(docx_path_value)
+        if docx_path.exists() and docx_path.suffix.lower() == ".docx":
+            try:
+                parts.append(ResumeExtractionService._docx_text(docx_path.read_bytes()))
+            except Exception:
+                pass
     tex_path_value = getattr(tailored_or_version, "tex_path", None)
     if tex_path_value:
         tex_path = Path(tex_path_value)
@@ -1074,6 +1118,12 @@ def _tailored_resume_text(tailored_or_version, fallback: str = "") -> str:
 
 def _base_resume_preview_source(user: User) -> tuple[str, str]:
     agent = ResumeTailoringAgent()
+    docx_path = agent._docx_template_path(user)
+    if docx_path:
+        try:
+            return "uploaded_word_template", ResumeExtractionService._docx_text(docx_path.read_bytes())
+        except Exception:
+            pass
     latex_source = agent._latex_template_source(user)
     if latex_source:
         return "uploaded_latex_template", latex_source
@@ -1184,12 +1234,21 @@ def _resume_preview_payload(db: Session, version: ResumeVersion) -> dict:
         raise HTTPException(status_code=404, detail="Resume owner not found.")
     job = db.get(Job, version.job_id) if version.job_id else None
     agent = ResumeTailoringAgent()
-    tex_path = agent.ensure_latex_export(user, version, job, force=False)
-    pdf_path = agent.ensure_pdf_export(user, version, job, force=False)
-    base_pdf_path = agent.base_pdf_path(user)
     metadata = _resume_version_metadata(version.metadata_path)
+    uses_docx_source = metadata.get("source_format") == "docx_template"
+    tex_path = agent.ensure_latex_export(user, version, job, force=False) if not uses_docx_source else None
+    pdf_path = agent.ensure_pdf_export(user, version, job, force=True)
+    base_pdf_path = agent.base_pdf_path(user)
     source_type, base_source = _base_resume_preview_source(user)
-    tailored_source = tex_path.read_text(encoding="utf-8", errors="ignore") if tex_path.exists() else ""
+    if uses_docx_source and Path(version.docx_path).exists():
+        try:
+            tailored_source = ResumeExtractionService._docx_text(Path(version.docx_path).read_bytes())
+        except Exception:
+            tailored_source = ""
+        tailored_source_type = "docx"
+    else:
+        tailored_source = tex_path.read_text(encoding="utf-8", errors="ignore") if tex_path and tex_path.exists() else ""
+        tailored_source_type = "latex"
     diff_lines = list(
         difflib.unified_diff(
             base_source.splitlines(),
@@ -1203,7 +1262,7 @@ def _resume_preview_payload(db: Session, version: ResumeVersion) -> dict:
         "version": _resume_version_payload(db, version, user=user, job=job, selected=True),
         "base_source_type": source_type,
         "base_preview": _preview_excerpt(base_source),
-        "tailored_source_type": "latex",
+        "tailored_source_type": tailored_source_type,
         "tailored_preview": _preview_excerpt(tailored_source),
         "diff": [_preview_excerpt(line, limit=600) for line in diff_lines[:240]],
         "diff_truncated": len(diff_lines) > 240,
@@ -3051,10 +3110,17 @@ def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db))
             if task.resume_version_id:
                 queued_version = db.get(ResumeVersion, task.resume_version_id)
                 metadata = _resume_version_metadata(queued_version.metadata_path if queued_version else None)
-                notes.append("Prepared PDF from the selected LaTeX-backed resume version.")
+                if metadata.get("source_format") == "docx_template" and Path(resume_path).suffix.lower() == ".docx":
+                    notes.append("Prepared the edited Word resume for upload so the original layout is preserved.")
+                elif metadata.get("source_format") == "docx_template":
+                    notes.append("Prepared a layout-preserving PDF converted from the edited Word resume.")
+                elif metadata.get("source_format") == "latex_template" or metadata.get("minimal_latex_edit"):
+                    notes.append("Prepared PDF from the selected LaTeX-backed resume version.")
+                else:
+                    notes.append("Prepared PDF from the selected resume version.")
                 notes.append(_pdf_generation_note(metadata))
             elif resume_path == (Path(user.base_resume_path).expanduser() if user.base_resume_path else None):
-                notes.append("Using the uploaded base PDF because no LaTeX template is available.")
+                notes.append("Using the uploaded base PDF because no editable resume template is available.")
             task.message = " ".join(notes)
             application.status = "Queued for supervised apply"
         except Exception as exc:
@@ -3102,13 +3168,33 @@ def debug_apply_queue_task(task_id: int, user_id: int | None = None, db: Session
     application = db.get(Application, task.application_id) if task.application_id else None
     resume = db.get(ResumeVersion, task.resume_version_id) if task.resume_version_id else None
     metadata = _resume_version_metadata(resume.metadata_path if resume else None)
+    fill_report = task.fill_report or {}
     diagnosis = []
+    mode = str(fill_report.get("mode") or task.source or "")
+    easy_apply_detection = fill_report.get("easy_apply_detection") if isinstance(fill_report, dict) else None
+    if mode == "external_from_linkedin":
+        reason = ""
+        visible_buttons = []
+        if isinstance(easy_apply_detection, dict):
+            reason = str(easy_apply_detection.get("reason") or "")
+            visible_buttons = easy_apply_detection.get("visible_apply_buttons") or []
+        detail = f" Reason: {reason.replace('_', ' ')}." if reason else ""
+        if visible_buttons:
+            detail += f" Visible apply actions: {', '.join(str(item) for item in visible_buttons[:6])}."
+        diagnosis.append(
+            "LinkedIn in-page Apply was not opened, so SeekApply switched to the external/company apply flow." + detail
+        )
     if task.status == "needs_login":
         diagnosis.append("Login/CAPTCHA/verification is blocking the browser agent. Complete it in the visible browser, then Resume.")
     if task.status == "needs_answers":
         diagnosis.append("The portal asked questions that do not have approved KB answers yet.")
     if task.status == "needs_user_action":
-        diagnosis.append("The portal was opened but has unsupported or ambiguous controls; continue manually in the visible browser.")
+        manual_reason = fill_report.get("manual_review_reason") if isinstance(fill_report, dict) else None
+        diagnosis.append(
+            str(manual_reason)
+            if manual_reason
+            else "The portal was opened but has unsupported or ambiguous controls; continue manually in the visible browser."
+        )
     if task.status == "failed" and task.last_error:
         diagnosis.append(task.last_error)
     if not diagnosis:
@@ -3127,7 +3213,7 @@ def debug_apply_queue_task(task_id: int, user_id: int | None = None, db: Session
         "resume": _resume_version_payload(db, resume, user=user, job=job) if resume else None,
         "resume_metadata": metadata,
         "trace": normalize_trace(task.steps or []),
-        "fill_report": task.fill_report or {},
+        "fill_report": fill_report,
         "diagnosis": diagnosis,
         "agent_runs": _debug_agent_runs(db, job_id=job.id, task_id=task.id),
     }
@@ -3165,6 +3251,13 @@ def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, r
         {"resume_existing": resume_existing, "source": task.source, "job_url": job.job_url, "apply_url": job.apply_url},
     )
     db.flush()
+    db.commit()
+
+    task = db.get(ApplyQueueTask, task_id)
+    user = db.get(User, payload.user_id) if payload.user_id else db.get(User, task.user_id)
+    job = _job_or_404(db, task.job_id)
+    preferences = _preferences_for(db, user)
+    application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
 
     resume_path = _ensure_queue_resume(db, user=user, preferences=preferences, job=job, application=application, task=task)
     _trace_task(
@@ -3187,15 +3280,48 @@ def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, r
         f"Loaded {approved_answer_count} approved reusable answer(s).",
         {"approved_answers": approved_answer_count, "total_answers": len(answers)},
     )
+    user_snapshot = SimpleNamespace(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        phone=user.phone,
+        location=user.location,
+        linkedin_url=user.linkedin_url,
+        github_url=user.github_url,
+        portfolio_url=getattr(user, "portfolio_url", None),
+    )
+    job_snapshot = SimpleNamespace(
+        id=job.id,
+        title=job.title,
+        company=job.company,
+        job_url=job.job_url,
+        apply_url=job.apply_url,
+    )
+    answer_snapshots = [
+        SimpleNamespace(
+            question_key=answer.question_key,
+            question_text=answer.question_text,
+            answer_text=answer.answer_text,
+            approved=answer.approved,
+        )
+        for answer in answers
+    ]
+    db.flush()
+    db.commit()
+
     result = SupervisedLinkedInApplyAgent(get_settings().resolved_storage_root).start(
         task_id=task.id,
-        user=user,
-        job=job,
+        user=user_snapshot,
+        job=job_snapshot,
         resume_path=resume_path,
-        answers=answers,
+        answers=answer_snapshots,
         wait_seconds=max(15, min(payload.wait_seconds, 240)),
     )
 
+    task = db.get(ApplyQueueTask, task_id)
+    user = db.get(User, payload.user_id) if payload.user_id else db.get(User, task.user_id)
+    job = _job_or_404(db, task.job_id)
+    application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
     if result.missing_questions:
         _save_apply_missing_questions(db, user, job, result.missing_questions)
     task.status = result.status

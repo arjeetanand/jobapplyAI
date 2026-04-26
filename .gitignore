@@ -32,7 +32,11 @@ venv/
 ENV/
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
 backend/seekapply.db
+backend/seekapply.db-wal
+backend/seekapply.db-shm
 
 # Node / Frontend
 node_modules/
@@ -62,3 +66,6 @@ storage/vector_index/*
 !storage/resume_versions/.gitkeep
 !storage/metadata/.gitkeep
 !storage/vector_index/.gitkeep
+
+*.DOCX
+*.tex

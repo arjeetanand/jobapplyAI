@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
     match_threshold: int = 60
     latex_template_path: Path | None = None
+    docx_template_path: Path | None = None
 
     oci_config_file: str = "~/.oci/config"
     oci_profile: str = "DEFAULT"

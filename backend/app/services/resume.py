@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +17,14 @@ from types import SimpleNamespace
 
 from app.core.config import get_settings
 from app.models.entities import Job, ResumeVersion, User
-from app.services.documents import compile_latex_to_pdf, write_docx_rich, write_latex, write_pdf
+from app.services.documents import (
+    compile_latex_to_pdf,
+    convert_docx_to_pdf,
+    write_docx_from_template,
+    write_docx_rich,
+    write_latex,
+    write_pdf,
+)
 from app.services.resume_extraction import ResumeExtractionService
 from app.services.text import clean_job_skills, extract_keywords, keyword_overlap, normalize
 
@@ -190,6 +196,7 @@ class ResumeTailoringAgent:
         resume_id_suffix: str | None = None,
         auto_refined: bool = False,
     ) -> TailoredResume:
+        docx_template_path = self._docx_template_path(user)
         latex_template_source = self._latex_template_source(user)
         verified_skills = self._verified_resume_skills(user)
         job_keywords = self._job_keywords(job)
@@ -205,13 +212,16 @@ class ResumeTailoringAgent:
         pdf_path = version_dir / f"{resume_id}.pdf"
         metadata_path = metadata_dir / f"{resume_id}.json"
 
-        # --- Try LLM tailoring first ---
+        # --- Try LLM tailoring first for generated resumes.
+        # For uploaded Word templates we intentionally use the deterministic
+        # editor below: it preserves layout and avoids LLM-invented project text
+        # leaking into the user's source resume.
         ai_generated = False
         paragraphs: list[str] = []
         try:
             from app.services.oci_genai import OCIGenerativeAIProvider
             provider = OCIGenerativeAIProvider()
-            if provider.status().configured:
+            if provider.status().configured and not docx_template_path:
                 prompt_user = SimpleUserProxy(user, selected_projects)
                 prompt = _build_prompt(prompt_user, job, match_score, emphasized)
                 llm_text = provider.chat(prompt)
@@ -233,7 +243,19 @@ class ResumeTailoringAgent:
 
         title = f"{user.name} - {job.title} at {job.company}"
 
-        write_docx_rich(docx_path, title, paragraphs)
+        docx_template_used = False
+        if docx_template_path:
+            docx_template_used = write_docx_from_template(
+                docx_path,
+                docx_template_path,
+                job_title=job.title,
+                company=job.company,
+                paragraphs=paragraphs,
+                emphasized_skills=emphasized,
+                selected_projects=selected_projects,
+            )
+        if not docx_template_used:
+            write_docx_rich(docx_path, title, paragraphs)
 
         # Always generate a LaTeX export. If the user uploaded a .tex template,
         # the writer keeps that structure; otherwise it creates a clean fallback.
@@ -251,16 +273,14 @@ class ResumeTailoringAgent:
             paragraphs=paragraphs,
         )
 
-        compiled_pdf = compile_latex_to_pdf(tex_path, pdf_path)
-        pdf_generation = "latex_compiler" if compiled_pdf else "styled_pdf_fallback"
+        if docx_template_used:
+            compiled_pdf = convert_docx_to_pdf(docx_path, pdf_path)
+            pdf_generation = "docx_converter" if compiled_pdf else "styled_pdf_fallback"
+        else:
+            compiled_pdf = compile_latex_to_pdf(tex_path, pdf_path)
+            pdf_generation = "latex_compiler" if compiled_pdf else "styled_pdf_fallback"
         if not compiled_pdf:
-            base_pdf = self._base_pdf_path(user)
-            if latex_template_source and base_pdf:
-                pdf_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(base_pdf, pdf_path)
-                pdf_generation = "base_pdf_fallback"
-            else:
-                write_pdf(pdf_path, title, paragraphs)
+            write_pdf(pdf_path, title, paragraphs)
 
         plain_paragraphs = [p.replace("__HEADING__", "") for p in paragraphs]
 
@@ -273,12 +293,16 @@ class ResumeTailoringAgent:
             "skills_emphasized": emphasized,
             "created_at": datetime.now(UTC).date().isoformat(),
             "based_on_resume": "base_resume_v1",
+            "source_format": "docx_template" if docx_template_used else ("latex_template" if latex_template_source else "generated_ats"),
+            "docx_template_path": str(docx_template_path) if docx_template_used and docx_template_path else None,
             "truthfulness_check": "passed",
             "ai_generated": ai_generated,
-            "minimal_latex_edit": bool(latex_template_source),
+            "minimal_docx_edit": docx_template_used,
+            "minimal_latex_edit": bool(latex_template_source and not docx_template_used),
             "pdf_generation": pdf_generation,
             "resume_changes": self._resume_changes(
-                bool(latex_template_source),
+                bool(latex_template_source and not docx_template_used),
+                docx_template_used,
                 emphasized,
                 ordered_skills,
                 requested_focus,
@@ -336,17 +360,18 @@ class ResumeTailoringAgent:
     def ensure_pdf_export(self, user: User, version: ResumeVersion, job: Job | None = None, *, force: bool = False) -> Path:
         pdf_path = Path(version.pdf_path)
         paragraphs = self._export_paragraphs(user, version, job)
-        tex_path = self.ensure_latex_export(user, version, job, force=force)
+        metadata = self._version_metadata(version)
         if force or not pdf_path.exists():
             title = f"{user.name} - {version.role} at {version.company}"
-            pdf_generation = "latex_compiler"
-            if not compile_latex_to_pdf(tex_path, pdf_path):
-                base_pdf = self._base_pdf_path(user)
-                if self._latex_template_source(user) and base_pdf:
-                    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(base_pdf, pdf_path)
-                    pdf_generation = "base_pdf_fallback"
-                else:
+            if metadata.get("source_format") == "docx_template" and Path(version.docx_path).exists():
+                converted = convert_docx_to_pdf(Path(version.docx_path), pdf_path)
+                pdf_generation = "docx_converter" if converted else "styled_pdf_fallback"
+                if not converted:
+                    write_pdf(pdf_path, title, paragraphs)
+            else:
+                tex_path = self.ensure_latex_export(user, version, job, force=force)
+                pdf_generation = "latex_compiler"
+                if not compile_latex_to_pdf(tex_path, pdf_path):
                     write_pdf(pdf_path, title, paragraphs)
                     pdf_generation = "styled_pdf_fallback"
             self._update_pdf_generation_metadata(version, pdf_generation)
@@ -434,6 +459,42 @@ class ResumeTailoringAgent:
 
     def has_latex_template(self, user: User) -> bool:
         return bool(self._latex_template_source(user))
+
+    def has_docx_template(self, user: User) -> bool:
+        return bool(self._docx_template_path(user))
+
+    def _docx_template_path(self, user: User) -> Path | None:
+        settings = get_settings()
+        candidates: list[Path] = []
+        base_path_value = getattr(user, "base_resume_path", None)
+        if base_path_value:
+            candidates.append(Path(base_path_value).expanduser())
+
+        configured_path = getattr(settings, "docx_template_path", None)
+        repo_root = Path(__file__).resolve().parents[3]
+        if configured_path:
+            configured = Path(configured_path).expanduser()
+            if configured.is_absolute():
+                candidates.append(configured)
+            else:
+                candidates.extend([Path.cwd() / configured, repo_root / configured, repo_root / "backend" / configured])
+
+        base_resume_dir = self.storage_root / "base_resumes"
+        if base_resume_dir.exists():
+            candidates.extend(sorted(base_resume_dir.glob("*.docx"), key=lambda path: path.stat().st_mtime, reverse=True))
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                path = candidate.expanduser().resolve()
+            except Exception:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            if path.exists() and path.suffix.lower() == ".docx":
+                return path
+        return None
 
     def _latex_template_source(self, user: User) -> str | None:
         source = getattr(user, "latex_template_source", None)
@@ -553,9 +614,11 @@ class ResumeTailoringAgent:
     def _verified_resume_skills(self, user: User) -> list[str]:
         selected: list[str] = []
         seen: set[str] = set()
+        docx_template_text = self._docx_template_text(user)
         raw_sources = [
             *(user.skills or []),
             *ResumeExtractionService._extract_skills(getattr(user, "base_resume_text", "") or ""),
+            *ResumeExtractionService._extract_skills(docx_template_text),
             *ResumeExtractionService._extract_skills(self._latex_template_source(user) or ""),
         ]
         for skill in raw_sources:
@@ -564,6 +627,16 @@ class ResumeTailoringAgent:
                 seen.add(key)
                 selected.append(str(skill))
         return selected[:60]
+
+    def _docx_template_text(self, user: User) -> str:
+        path = self._docx_template_path(user)
+        if not path:
+            return ""
+        try:
+            return ResumeExtractionService._docx_text(path.read_bytes())
+        except Exception as exc:
+            logger.warning("Could not read DOCX template text %s: %s", path, exc)
+            return ""
 
     def _project_candidates(self, user: User, job: Job) -> list[dict]:
         job_text = normalize(" ".join([job.title or "", job.description or "", *[str(skill) for skill in job.skills or []]]))
@@ -588,13 +661,9 @@ class ResumeTailoringAgent:
             if normalized:
                 candidates.append(normalized)
 
-        seen: set[str] = set()
-        scored: list[tuple[int, dict]] = []
+        raw_scored: list[tuple[int, int, dict]] = []
+        job_tokens = set(token for token in re.split(r"[^a-z0-9+#.]+", job_text) if len(token) > 1)
         for project in candidates:
-            key = normalize(str(project.get("url") or project.get("name") or project.get("summary") or ""))
-            if not key or key in seen:
-                continue
-            seen.add(key)
             evidence_text = normalize(
                 " ".join(
                     [
@@ -606,15 +675,37 @@ class ResumeTailoringAgent:
                 )
             )
             evidence_tokens = set(token for token in re.split(r"[^a-z0-9+#.]+", evidence_text) if len(token) > 1)
-            job_tokens = set(token for token in re.split(r"[^a-z0-9+#.]+", job_text) if len(token) > 1)
             overlap = len(evidence_tokens & job_tokens)
-            scored.append((overlap, project))
+            richness = len(project.get("skills", []) or []) + len(project.get("bullets", []) or []) + (1 if project.get("summary") else 0)
+            raw_scored.append((overlap, richness, project))
 
-        scored.sort(key=lambda item: (item[0], len(item[1].get("skills", []) or [])), reverse=True)
-        selected = [project for score, project in scored if score > 0][:4]
+        raw_scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        seen: set[str] = set()
+        scored: list[tuple[int, dict]] = []
+        for overlap, _richness, project in raw_scored:
+            keys = self._project_identity_keys(project)
+            if keys and any(key in seen for key in keys):
+                continue
+            seen.update(keys)
+            scored.append((overlap, project))
+        selected = [project for score, project in scored if score > 0][:8]
         if not selected:
-            selected = [project for _, project in scored[:3]]
+            selected = [project for _, project in scored[:6]]
         return selected
+
+    @staticmethod
+    def _project_identity_keys(project: dict) -> set[str]:
+        keys: set[str] = set()
+        name = normalize(str(project.get("name") or ""))
+        url = str(project.get("url") or project.get("repo_url") or project.get("html_url") or "").strip().lower()
+        if name:
+            keys.add(name)
+            keys.add(re.sub(r"[^a-z0-9]+", "", name))
+        if url:
+            keys.add(url.rstrip("/"))
+            keys.add(normalize(url.rstrip("/").split("/")[-1]))
+            keys.add(re.sub(r"[^a-z0-9]+", "", url.rstrip("/").split("/")[-1]))
+        return {key for key in keys if key}
 
     @staticmethod
     def _normalize_project(project: dict) -> dict:
@@ -672,6 +763,7 @@ class ResumeTailoringAgent:
     @staticmethod
     def _resume_changes(
         has_latex_template: bool,
+        has_docx_template: bool,
         emphasized: list[str],
         ordered_skills: list[str],
         requested_focus: list[str] | None = None,
@@ -680,12 +772,16 @@ class ResumeTailoringAgent:
         selected_projects: list[dict] | None = None,
     ) -> list[str]:
         changes = []
-        if has_latex_template:
+        if has_docx_template:
+            changes.append("Kept the uploaded Word resume template and preserved core formatting.")
+            changes.append("Updated the Profile/Summary section in the Word resume for the selected role.")
+            changes.append("Added a compact Targeted Focus line in the Word resume using only verified resume skills.")
+        elif has_latex_template:
             changes.append("Kept the uploaded LaTeX resume template and preserved core formatting.")
             changes.append("Updated the Profile/Summary section to target the selected role.")
             changes.append("Added a compact Targeted Focus line in Technical Skills using only verified resume skills.")
         else:
-            changes.append("Generated a clean LaTeX resume because no uploaded LaTeX template was available.")
+            changes.append("Generated a clean ATS resume because no editable Word or LaTeX template was available.")
         if emphasized:
             changes.append(f"Emphasized verified overlap: {', '.join(emphasized[:8])}.")
         elif ordered_skills:
@@ -719,7 +815,11 @@ class ResumeTailoringAgent:
         ]
         parts = [
             "AUTO_FROM_JD: Use the target job description to truthfully improve ATS alignment.",
-            "Preserve the uploaded LaTeX format and make minimal targeted edits only.",
+            (
+                "Preserve the uploaded Word resume format and make minimal targeted edits only."
+                if self.has_docx_template(user)
+                else "Preserve the uploaded LaTeX format and make minimal targeted edits only."
+            ),
             "Rewrite the summary/profile and targeted skills focus for this exact role.",
             "Reorder or replace the Projects section with the strongest verified GitHub/resume projects for the JD.",
             "Remove low-signal lines only when stronger verified project or skill evidence is available.",
