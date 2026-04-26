@@ -2,9 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
+  Bot,
+  Bug,
   CheckCircle2,
   ClipboardCheck,
   Download,
+  Eye,
   ExternalLink,
   FileText,
   Gauge,
@@ -12,16 +15,18 @@ import {
   Linkedin,
   ListChecks,
   MailPlus,
+  Play,
   RefreshCcw,
   Save,
   Send,
   Shield,
   Sparkles,
   Upload,
+  Workflow,
   Zap
 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, API_URL, Analytics, Answer, ApplyQueueTask, Claim, CurrentResume, DiscoveryPreferences, JobRow, LinkedInPlan, ResumeVersion, TrackerRow } from "./lib/api";
+import { api, API_URL, AgentCatalogItem, AgentPipelineStatus, AgentRunResult, Analytics, Answer, ApplyQueueTask, ApplyTaskDebug, Claim, CurrentResume, DiscoveryPreferences, JobDebug, JobRow, LinkedInPlan, ResumeLab, ResumePreview, ResumeVersion, TrackerRow } from "./lib/api";
 import { Button, Field, inputClass, Panel, textareaClass } from "./components/ui";
 import { SectionId, Sidebar } from "./components/Sidebar";
 import { StatCard } from "./components/StatCard";
@@ -71,7 +76,7 @@ const defaultPreferences = {
 };
 
 export default function App() {
-  const [active, setActive] = useState<SectionId>("resume");
+  const [active, setActive] = useState<SectionId>("cockpit");
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [tracker, setTracker] = useState<TrackerRow[]>([]);
   const [resumes, setResumes] = useState<ResumeVersion[]>([]);
@@ -105,19 +110,19 @@ export default function App() {
         <header className="border-b border-line bg-[#fffaf0] px-6 py-8 max-lg:px-4">
           <div className="grid items-end gap-6 lg:grid-cols-[1fr_280px]">
             <div className="fade-slide-up">
-              <div className="section-kicker">01 / 13 Workflow System</div>
-              <h1 className="hero-title mt-3 text-ink">Resume-First Job Application Playbook</h1>
+              <div className="section-kicker">01 / 09 Agent Pipeline</div>
+              <h1 className="hero-title mt-3 text-ink">Agent Cockpit for Supervised Applications</h1>
               <p className="mt-3 max-w-3xl text-sm leading-6 text-[#5f574b]">
-                Upload once, extract verified profile data, match jobs against the configured threshold, reuse or tailor resume versions, and preserve every portal question in your knowledge base.
+                Run named agents for resume intake, job discovery, JD import, scoring, resume building, preview, questions, supervised apply, and tracking. Every stage writes trace output for debugging.
               </p>
             </div>
             <div className="rounded-[18px] border border-[#2f2f2f] bg-[#111111] p-4 text-[#f7f2e8] shadow-float fade-slide-up">
               <div className="section-kicker text-[#b7ff29]">Run Index</div>
               <div className="mt-2 text-xs leading-5">
-                <div>02 / Extract Profile</div>
-                <div>03 / Find Jobs</div>
-                <div>04 / Decide Resume</div>
-                <div>05 / Track Questions</div>
+                <div>02 / Find Jobs</div>
+                <div>03 / Score Match</div>
+                <div>04 / Build Resume</div>
+                <div>05 / Supervised Apply</div>
               </div>
             </div>
           </div>
@@ -145,6 +150,7 @@ export default function App() {
               transition={{ duration: 0.16 }}
               className="fade-slide-up"
             >
+              {active === "cockpit" && <AgentCockpit onNotice={setNotice} onRefresh={refresh} />}
               {active === "resume" && <ResumeIntake onNotice={setNotice} />}
               {active === "onboarding" && <Onboarding onNotice={setNotice} onRefresh={refresh} />}
               {active === "search" && <JobSearch onNotice={setNotice} />}
@@ -165,6 +171,295 @@ export default function App() {
           </AnimatePresence>
         </div>
       </main>
+    </div>
+  );
+}
+
+function AgentCockpit({ onNotice, onRefresh }: { onNotice: (message: string) => void; onRefresh: () => Promise<void> }) {
+  const [catalog, setCatalog] = useState<AgentCatalogItem[]>([]);
+  const [status, setStatus] = useState<AgentPipelineStatus | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [latestRun, setLatestRun] = useState<AgentRunResult | null>(null);
+  const [debugRun, setDebugRun] = useState<AgentRunResult | null>(null);
+  const [previewMode, setPreviewMode] = useState<"diff" | "before" | "after">("diff");
+
+  const load = async () => {
+    const [catalogData, pipelineData] = await Promise.all([api.agentCatalog(), api.agentPipelineStatus()]);
+    setCatalog(catalogData.agents);
+    setStatus(pipelineData);
+  };
+
+  useEffect(() => {
+    load().catch((error) => onNotice(error.message));
+  }, []);
+
+  const contextPayload = () => ({
+    job_id: status?.latest_job_id ?? undefined,
+    task_id: status?.latest_task_id ?? undefined,
+    resume_version_id: status?.selected_resume_version_id ?? undefined,
+  });
+
+  const runNext = async () => {
+    setBusy("pipeline");
+    try {
+      const result = await api.runPipeline(contextPayload());
+      setLatestRun(result.result);
+      setStatus(result.pipeline);
+      onNotice(`${result.result.agent_label}: ${result.result.message}`);
+      await onRefresh();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runAgent = async (agentKey: string, extra: Record<string, unknown> = {}) => {
+    setBusy(agentKey);
+    try {
+      const result = await api.runAgent(agentKey, { ...contextPayload(), ...extra });
+      setLatestRun(result);
+      await load();
+      onNotice(`${result.agent_label}: ${result.message}`);
+      await onRefresh();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const loadRun = async (runId: number) => {
+    setDebugRun(await api.agentRun(runId));
+  };
+
+  const statusClass = (value: string) => {
+    if (value === "completed") return "bg-emerald-100 text-emerald-700";
+    if (value === "ready") return "bg-blue-100 text-cobalt";
+    if (value === "running") return "bg-indigo-100 text-indigo-700";
+    if (value === "needs_user_action" || value === "needs_answers" || value === "needs_login" || value === "ready_for_submit") return "bg-amber-100 text-amber-700";
+    if (value === "failed") return "bg-red-100 text-red-700";
+    return "bg-slate-100 text-slate-600";
+  };
+
+  const preview = latestRun?.artifacts?.preview as ResumePreview | undefined;
+  const builderResume = latestRun?.artifacts?.resume_version as ResumeVersion | undefined;
+  const builderComparison = latestRun?.artifacts?.comparison as
+    | {
+        original_match_score?: number;
+        tailored_resume_score?: number;
+        score_delta?: number;
+        resume_changes?: string[];
+      }
+    | undefined;
+
+  return (
+    <div className="grid gap-4">
+      <Panel className="p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="flex items-center gap-2 text-base font-semibold">
+              <Workflow size={18} className="text-cobalt" /> Agent Cockpit
+            </h2>
+            <div className="mt-1 max-w-3xl text-sm text-slate-500">
+              Run one lane at a time, inspect trace output, and keep browser apply supervised. The Apply Agent will not submit applications.
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" onClick={() => load().catch((error) => onNotice(error.message))}>
+              <RefreshCcw size={15} /> Refresh
+            </Button>
+            <Button disabled={busy === "pipeline"} onClick={() => runNext().catch((error) => onNotice(error.message))}>
+              <Play size={15} /> {busy === "pipeline" ? "Running..." : "Run Next Safe Step"}
+            </Button>
+          </div>
+        </div>
+        {status && (
+          <div className="mt-4 grid gap-3 text-xs md:grid-cols-4">
+            <div className="rounded border border-line bg-field p-3">
+              <div className="font-semibold uppercase text-slate-500">Latest Job</div>
+              <div className="mt-1 text-sm font-semibold text-ink">{status.latest_job_id ? `#${status.latest_job_id}` : "None"}</div>
+            </div>
+            <div className="rounded border border-line bg-field p-3">
+              <div className="font-semibold uppercase text-slate-500">Resume Version</div>
+              <div className="mt-1 text-sm font-semibold text-ink">{status.selected_resume_version_id ? `#${status.selected_resume_version_id}` : "Not selected"}</div>
+            </div>
+            <div className="rounded border border-line bg-field p-3">
+              <div className="font-semibold uppercase text-slate-500">Apply Task</div>
+              <div className="mt-1 text-sm font-semibold text-ink">{status.latest_task_id ? `#${status.latest_task_id}` : "Not queued"}</div>
+            </div>
+            <div className="rounded border border-line bg-field p-3">
+              <div className="font-semibold uppercase text-slate-500">Threshold</div>
+              <div className="mt-1 text-sm font-semibold text-ink">{status.threshold}/100</div>
+            </div>
+          </div>
+        )}
+      </Panel>
+
+      <div className="grid gap-3">
+        {(status?.lanes ?? catalog.map((agent) => ({ ...agent, status: "not_started", message: agent.description, artifacts: {}, next_actions: agent.actions }))).map((lane) => {
+          const isApply = lane.key === "apply_agent";
+          const isTracker = lane.key === "tracker_agent";
+          const canPreview = Boolean(status?.selected_resume_version_id) && ["resume_builder", "resume_reviewer"].includes(lane.key);
+          return (
+            <Panel key={lane.key} className="p-5">
+              <div className="grid gap-4 lg:grid-cols-[1fr_auto]">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded bg-field px-2 py-1 text-[11px] font-semibold uppercase text-slate-500">{lane.lane}</span>
+                    <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(lane.status)}`}>{lane.status}</span>
+                    <span className="rounded border border-line bg-white px-2 py-1 text-[11px] text-slate-500">{lane.safety_mode}</span>
+                  </div>
+                  <h3 className="mt-3 flex items-center gap-2 text-base font-semibold text-ink">
+                    <Bot size={17} className="text-cobalt" /> {lane.label}
+                  </h3>
+                  <p className="mt-1 text-sm leading-6 text-slate-600">{lane.message || lane.description}</p>
+                  <div className="mt-3 flex flex-wrap gap-1">
+                    {(lane.next_actions || []).slice(0, 5).map((action) => (
+                      <span key={action} className="rounded border border-line bg-white px-2 py-1 text-[11px] text-slate-500">
+                        {action.replace(/_/g, " ")}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-start gap-2 lg:justify-end">
+                  <Button disabled={busy === lane.key} onClick={() => runAgent(lane.key).catch((error) => onNotice(error.message))}>
+                    <Play size={15} /> {busy === lane.key ? "Running..." : "Run"}
+                  </Button>
+                  {isApply && status?.latest_task_id && (
+                    <Button
+                      variant="secondary"
+                      disabled={busy === lane.key}
+                      onClick={() => runAgent(lane.key, { task_id: status.latest_task_id, action: "start", start_browser: true }).catch((error) => onNotice(error.message))}
+                    >
+                      <Linkedin size={15} /> Start Browser
+                    </Button>
+                  )}
+                  {isTracker && status?.latest_task_id && (
+                    <Button
+                      variant="secondary"
+                      disabled={busy === lane.key}
+                      onClick={() => runAgent(lane.key, { task_id: status.latest_task_id, action: "mark_submitted" }).catch((error) => onNotice(error.message))}
+                    >
+                      <CheckCircle2 size={15} /> Mark Submitted
+                    </Button>
+                  )}
+                  {canPreview && (
+                    <Button
+                      variant="secondary"
+                      disabled={busy === "resume_reviewer"}
+                      onClick={() => runAgent("resume_reviewer").catch((error) => onNotice(error.message))}
+                    >
+                      <Eye size={15} /> Preview
+                    </Button>
+                  )}
+                  {latestRun?.agent_key === lane.key && latestRun.run_id && (
+                    <Button variant="secondary" onClick={() => loadRun(latestRun.run_id!).catch((error) => onNotice(error.message))}>
+                      <Bug size={15} /> Debug
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {lane.key === "resume_builder" && (
+                <div className="mt-4 grid gap-3 rounded border border-line bg-white p-3 text-xs md:grid-cols-3">
+                  <div>
+                    <div className="font-semibold uppercase text-slate-500">Base Score</div>
+                    <div className="mt-1 text-lg font-semibold text-ink">{builderComparison?.original_match_score ?? "Run builder"}</div>
+                  </div>
+                  <div>
+                    <div className="font-semibold uppercase text-slate-500">Tailored Score</div>
+                    <div className="mt-1 text-lg font-semibold text-ink">{builderComparison?.tailored_resume_score ?? "Pending"}</div>
+                  </div>
+                  <div>
+                    <div className="font-semibold uppercase text-slate-500">Selected Resume</div>
+                    <div className="mt-1 text-lg font-semibold text-ink">{builderResume?.id ? `#${builderResume.id}` : status?.selected_resume_version_id ? `#${status.selected_resume_version_id}` : "None"}</div>
+                  </div>
+                  {builderComparison?.resume_changes && builderComparison.resume_changes.length > 0 && (
+                    <div className="md:col-span-3">
+                      <div className="font-semibold uppercase text-slate-500">Changes</div>
+                      <div className="mt-2 grid gap-1">
+                        {builderComparison.resume_changes.slice(0, 5).map((change) => (
+                          <div key={change} className="rounded bg-field px-2 py-1 text-slate-700">Changed: {change}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </Panel>
+          );
+        })}
+      </div>
+
+      {latestRun && (
+        <Panel className="p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold">Latest Run: {latestRun.agent_label}</h3>
+              <div className="mt-1 text-sm text-slate-500">{latestRun.message}</div>
+            </div>
+            <span className={`rounded px-2 py-1 text-xs font-semibold ${statusClass(latestRun.status)}`}>{latestRun.status}</span>
+          </div>
+          {latestRun.trace.length > 0 && (
+            <div className="mt-4 grid gap-2">
+              {latestRun.trace.slice(-8).map((step, index) => (
+                <div key={`${step.name}-${index}`} className="rounded border border-line bg-field p-3 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-semibold text-ink">{step.name}</span>
+                    <span className="rounded bg-white px-2 py-0.5 text-slate-600">{step.status}</span>
+                  </div>
+                  <div className="mt-1 text-slate-700">{step.message}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Panel>
+      )}
+
+      {preview && (
+        <Panel className="p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold">Resume Review Preview</h3>
+              <div className="mt-1 text-sm text-slate-500">
+                Version #{preview.version.id} · {preview.version.tailored_score ?? "?"}/100
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {(["diff", "before", "after"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setPreviewMode(mode)}
+                  className={`rounded border px-3 py-1.5 text-xs font-semibold ${previewMode === mode ? "border-cobalt bg-cobalt text-white" : "border-line bg-white text-ink hover:bg-field"}`}
+                >
+                  {mode === "diff" ? "Diff" : mode === "before" ? "Before" : "After"}
+                </button>
+              ))}
+            </div>
+          </div>
+          <pre className="mt-4 max-h-[52vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
+            {previewMode === "diff"
+              ? (preview.diff.length ? preview.diff.join("\n") : "No textual difference was detected.")
+              : previewMode === "before"
+                ? preview.base_preview
+                : preview.tailored_preview}
+          </pre>
+        </Panel>
+      )}
+
+      {debugRun && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+          <div className="flex max-h-[88vh] w-full max-w-5xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold">Agent Run Debug</h3>
+                <div className="mt-1 text-sm text-slate-500">{debugRun.agent_label} · run #{debugRun.run_id}</div>
+              </div>
+              <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setDebugRun(null)}>Close</button>
+            </div>
+            <pre className="mt-4 max-h-[70vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
+              {JSON.stringify(debugRun, null, 2)}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -971,10 +1266,82 @@ function JobSearch({ onNotice }: { onNotice: (message: string) => void }) {
   );
 }
 
+function DebugModal({ title, data, onClose }: { title: string; data: JobDebug | ApplyTaskDebug; onClose: () => void }) {
+  const trace = "trace" in data ? data.trace : data.queue_tasks.flatMap((task) => task.trace ?? []);
+  const diagnosis = data.diagnosis ?? [];
+  const runs = data.agent_runs ?? [];
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+      <div className="flex max-h-[88vh] w-full max-w-5xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold">{title}</h3>
+            <div className="mt-1 text-sm text-slate-500">
+              {"task" in data ? `${data.task.job.company} · ${data.task.job.title}` : `${data.job.company} · ${data.job.title}`}
+            </div>
+          </div>
+          <button className="text-sm text-slate-500 hover:text-ink" onClick={onClose}>Close</button>
+        </div>
+
+        <div className="mt-4 grid gap-3 overflow-auto">
+          <div className="rounded border border-line bg-field p-3">
+            <div className="text-xs font-semibold uppercase text-slate-500">Diagnosis</div>
+            <div className="mt-2 grid gap-1 text-sm text-slate-700">
+              {diagnosis.map((item) => <div key={item}>{item}</div>)}
+            </div>
+          </div>
+
+          {trace.length > 0 && (
+            <div className="rounded border border-line bg-white p-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">Agent Trace</div>
+              <div className="mt-2 grid gap-2">
+                {trace.map((step, index) => (
+                  <div key={`${step.name}-${index}`} className="grid gap-1 rounded border border-line bg-field p-2 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-semibold text-ink">{step.name}</span>
+                      <span className="rounded bg-white px-2 py-0.5 text-slate-600">{step.status}</span>
+                    </div>
+                    <div className="text-slate-700">{step.message}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {runs.length > 0 && (
+            <div className="rounded border border-line bg-white p-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">Agent Runs</div>
+              <div className="mt-2 grid gap-2">
+                {runs.slice(0, 8).map((run) => (
+                  <div key={run.id} className="rounded border border-line bg-field p-2 text-xs text-slate-700">
+                    <div className="font-semibold text-ink">{run.agent_name} · {run.status}</div>
+                    <div>{run.output_summary}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <details className="rounded border border-line bg-white p-3 text-xs">
+            <summary className="cursor-pointer font-semibold text-ink">Raw Debug JSON</summary>
+            <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap text-slate-700">{JSON.stringify(data, null, 2)}</pre>
+          </details>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => void; onRefresh: () => Promise<void> }) {
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [busy, setBusy] = useState<Record<number, boolean>>({});
   const [results, setResults] = useState<Record<number, { lines: string[]; versionId?: number; aiGenerated?: boolean }>>({});
+  const [labs, setLabs] = useState<Record<number, ResumeLab>>({});
+  const [selectedVersions, setSelectedVersions] = useState<Record<number, number>>({});
+  const [refineNotes, setRefineNotes] = useState<Record<number, string>>({});
+  const [preview, setPreview] = useState<ResumePreview | null>(null);
+  const [previewMode, setPreviewMode] = useState<"diff" | "before" | "after">("diff");
+  const [debugData, setDebugData] = useState<JobDebug | null>(null);
   const [appStatus, setAppStatus] = useState<Record<number, string>>({});
 
   const loadJobs = async () => {
@@ -992,6 +1359,15 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
   const setResultFor = (id: number, lines: string[], versionId?: number, aiGenerated?: boolean) =>
     setResults((prev) => ({ ...prev, [id]: { lines, versionId, aiGenerated } }));
 
+  const loadLab = async (jobId: number) => {
+    const lab = await api.resumeLab(jobId);
+    setLabs((prev) => ({ ...prev, [jobId]: lab }));
+    if (lab.selected_resume_version_id) {
+      setSelectedVersions((prev) => ({ ...prev, [jobId]: lab.selected_resume_version_id! }));
+    }
+    return lab;
+  };
+
   const handleScore = async (job: JobRow) => {
     setBusyFor(job.id, true);
     try {
@@ -1001,6 +1377,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         ...score.reason,
         ...score.concerns,
       ]);
+      await loadLab(job.id);
       await loadJobs();
       await onRefresh();
     } finally {
@@ -1034,6 +1411,9 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
         ...(decision.concerns ?? []),
       ].filter(Boolean);
       setResultFor(job.id, lines, decision.resume_version_id, decision.ai_generated);
+      const lab = await loadLab(job.id);
+      const versionId = decision.resume_version_id ?? lab.selected_resume_version_id;
+      if (versionId) setSelectedVersions((prev) => ({ ...prev, [job.id]: versionId }));
       await loadJobs();
       await onRefresh();
     } finally {
@@ -1085,17 +1465,59 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
     }
   };
 
+  const handleRefine = async (job: JobRow) => {
+    const instructions = (refineNotes[job.id] || "").trim();
+    if (!instructions) {
+      onNotice("Add a short comment about what to improve, for example: emphasize GCP, Vertex AI, MLOps if already true.");
+      return;
+    }
+    setBusyFor(job.id, true);
+    try {
+      const result = await api.refineResume(job.id, { instructions, force_new_version: true });
+      setLabs((prev) => ({ ...prev, [job.id]: result.lab }));
+      setSelectedVersions((prev) => ({ ...prev, [job.id]: result.resume_version_id }));
+      setResultFor(job.id, [
+        result.message,
+        `Original resume score: ${result.comparison.original_match_score}/100`,
+        `Refined resume score: ${result.comparison.tailored_resume_score}/100 (${result.comparison.score_delta > 0 ? "+" : ""}${result.comparison.score_delta})`,
+        ...(result.comparison.resume_changes ?? []).map((change) => `Changed: ${change}`),
+      ], result.resume_version_id);
+      setRefineNotes((prev) => ({ ...prev, [job.id]: "" }));
+      await loadJobs();
+      await onRefresh();
+    } finally {
+      setBusyFor(job.id, false);
+    }
+  };
+
+  const handlePreview = async (versionId: number) => {
+    const data = await api.resumePreview(versionId);
+    setPreview(data);
+    setPreviewMode("diff");
+  };
+
+  const handleDebug = async (jobId: number) => {
+    setDebugData(await api.jobDebug(jobId));
+  };
+
   const handleQueue = async (job: JobRow) => {
     setBusyFor(job.id, true);
     try {
-      const result = await api.buildApplyQueue({ job_ids: [job.id], max_items: 1, force: true });
+      const selectedResumeId = selectedVersions[job.id] ?? results[job.id]?.versionId ?? job.resume_version_id;
+      const result = await api.buildApplyQueue({
+        job_ids: [job.id],
+        max_items: 1,
+        force: true,
+        resume_version_id: selectedResumeId ?? undefined,
+      });
       const task = result.tasks[0];
       setResultFor(job.id, [
         result.message,
         task ? `Apply task ${task.id}: ${task.status}` : "Job was not eligible for the supervised LinkedIn queue.",
         task?.message || "",
         result.skipped.length ? `Skipped: ${JSON.stringify(result.skipped)}` : "",
-        "SeekApply will use a LaTeX-backed PDF when a LaTeX template/source is available.",
+        task?.resume?.id ? `Queued resume version: ${task.resume.id}` : "",
+        task?.resume?.pdf_generation ? `PDF generation: ${task.resume.pdf_generation}` : "",
       ].filter(Boolean));
       onNotice(task ? `Queued ${job.title} for supervised apply.` : "Job was not queued. Check source details.");
       await loadJobs();
@@ -1147,6 +1569,11 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
       {jobs.map((job) => {
         const res = results[job.id];
         const isBusy = busy[job.id] ?? false;
+        const lab = labs[job.id];
+        const selectedVersionId = selectedVersions[job.id] ?? lab?.selected_resume_version_id ?? res?.versionId ?? job.resume_version_id ?? null;
+        const selectedVersion = lab?.versions.find((version) => version.id === selectedVersionId) ?? lab?.versions[0];
+        const selectedScore = selectedVersion?.tailored_score ?? null;
+        const scoreDelta = selectedVersion?.score_delta ?? null;
 
         return (
           <Panel key={job.id} className="p-5">
@@ -1215,6 +1642,13 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
               </button>
               <button
                 disabled={isBusy}
+                onClick={() => loadLab(job.id).catch((e) => onNotice(e.message))}
+                className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
+              >
+                <History size={13} /> Compare
+              </button>
+              <button
+                disabled={isBusy}
                 onClick={() => handleQuestions(job).catch((e) => onNotice(e.message))}
                 className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
               >
@@ -1233,6 +1667,13 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                 className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
               >
                 <Send size={13} /> Add to Apply Queue
+              </button>
+              <button
+                disabled={isBusy}
+                onClick={() => handleDebug(job.id).catch((e) => onNotice(e.message))}
+                className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field disabled:opacity-50"
+              >
+                <Shield size={13} /> Debug
               </button>
             </div>
 
@@ -1266,7 +1707,7 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
             )}
 
             {/* Download buttons — from session result OR from existing resume version on the job */}
-            {(res?.versionId || job.resume_version_id) && (
+            {(selectedVersionId || res?.versionId || job.resume_version_id) && (
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 {res?.aiGenerated && (
                   <span className="flex items-center gap-1 text-xs font-medium text-cobalt">
@@ -1274,23 +1715,132 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
                   </span>
                 )}
                 <button
-                  onClick={() => api.downloadResumePdf(res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
+                  onClick={() => api.downloadResumePdf(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
                   className="flex items-center gap-1.5 rounded bg-moss px-3 py-1.5 text-xs font-medium text-white hover:opacity-90"
                 >
                   <Download size={12} /> Download PDF
                 </button>
                 <button
-                  onClick={() => api.downloadResumeDocx(res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
+                  onClick={() => api.downloadResumeDocx(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
                   className="flex items-center gap-1.5 rounded border border-moss px-3 py-1.5 text-xs font-medium text-moss hover:bg-field"
                 >
                   <Download size={12} /> Download DOCX
                 </button>
                 <button
-                  onClick={() => api.downloadResumeTex(res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
+                  onClick={() => api.downloadResumeTex(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
                   className="flex items-center gap-1.5 rounded border border-indigo-400 px-3 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-50"
                 >
                   <Download size={12} /> Download LaTeX
                 </button>
+                <button
+                  onClick={() => handlePreview(selectedVersionId ?? res?.versionId ?? job.resume_version_id!).catch((e) => onNotice(e.message))}
+                  className="flex items-center gap-1.5 rounded border border-line bg-white px-3 py-1.5 text-xs font-medium hover:bg-field"
+                >
+                  <FileText size={12} /> Preview Diff
+                </button>
+              </div>
+            )}
+
+            {lab && (
+              <div className="mt-3 grid gap-3 rounded border border-line bg-white p-3">
+                <div className="grid gap-2 md:grid-cols-3">
+                  <div className="rounded border border-line bg-field p-3">
+                    <div className="text-[11px] font-semibold uppercase text-slate-500">Uploaded Resume</div>
+                    <div className="mt-1 text-lg font-semibold text-ink">{lab.base.score}/100</div>
+                    <div className="text-xs text-slate-500">{lab.base.recommendation}</div>
+                  </div>
+                  <div className="rounded border border-line bg-field p-3">
+                    <div className="text-[11px] font-semibold uppercase text-slate-500">Selected Version</div>
+                    <div className="mt-1 text-lg font-semibold text-ink">
+                      {selectedScore !== null ? `${selectedScore}/100` : "Not generated"}
+                    </div>
+                    <div className="text-xs text-slate-500">
+                      {scoreDelta !== null ? `${scoreDelta >= 0 ? "+" : ""}${scoreDelta} after tailoring` : "Run Resume Decision or Refine"}
+                    </div>
+                  </div>
+                  <div className="rounded border border-line bg-field p-3">
+                    <div className="text-[11px] font-semibold uppercase text-slate-500">Queue Threshold</div>
+                    <div className="mt-1 text-lg font-semibold text-ink">{lab.threshold}/100</div>
+                    <div className="text-xs text-slate-500">{lab.pdf_note}</div>
+                  </div>
+                </div>
+
+                {selectedVersion && (
+                  <div className="rounded border border-line bg-[#fffdf7] p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold uppercase text-slate-500">Selected Resume Version</div>
+                        <div className="mt-1 text-sm font-semibold text-ink">#{selectedVersion.id} · {selectedVersion.role}</div>
+                      </div>
+                      <span className="rounded bg-field px-2 py-1 text-xs text-slate-600">
+                        {selectedVersion.pdf_generation || "pdf pending"}
+                      </span>
+                    </div>
+                    <div className="mt-2 text-xs text-slate-600">{selectedVersion.pdf_note}</div>
+                    {selectedVersion.resume_changes && selectedVersion.resume_changes.length > 0 && (
+                      <div className="mt-2 grid gap-1">
+                        {selectedVersion.resume_changes.slice(0, 5).map((change) => (
+                          <div key={change} className="text-xs text-slate-700">Changed: {change}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {lab.versions.length > 0 && (
+                  <div className="grid gap-2">
+                    <div className="text-xs font-semibold uppercase text-slate-500">Resume History / Reuse</div>
+                    {lab.versions.map((version) => {
+                      const isSelected = selectedVersionId === version.id;
+                      return (
+                        <div key={version.id} className={`flex flex-wrap items-center justify-between gap-2 rounded border p-2 text-xs ${isSelected ? "border-cobalt bg-blue-50" : "border-line bg-[#fffdf7]"}`}>
+                          <div>
+                            <div className="font-semibold text-ink">
+                              #{version.id} · {version.tailored_score ?? "?"}/100
+                              {version.score_delta !== null && version.score_delta !== undefined ? ` (${version.score_delta >= 0 ? "+" : ""}${version.score_delta})` : ""}
+                            </div>
+                            <div className="text-slate-500">
+                              {version.reusable_for_current_job ? "Reusable from another similar job" : "Created for this job"} · {version.skills_emphasized.slice(0, 6).join(", ") || "verified skills"}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedVersions((prev) => ({ ...prev, [job.id]: version.id }))}
+                            className={`rounded px-2 py-1 font-semibold ${isSelected ? "bg-cobalt text-white" : "border border-line bg-white text-ink hover:bg-field"}`}
+                          >
+                            {isSelected ? "Selected" : "Select"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handlePreview(version.id).catch((e) => onNotice(e.message))}
+                            className="rounded border border-line bg-white px-2 py-1 font-semibold text-ink hover:bg-field"
+                          >
+                            Preview
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="grid gap-2">
+                  <Field label="Refine this resume with comments">
+                    <textarea
+                      className={textareaClass}
+                      placeholder="Example: emphasize Vertex AI, MLOps, TensorFlow, PyTorch, and production GenAI if already present in my resume."
+                      value={refineNotes[job.id] || ""}
+                      onChange={(event) => setRefineNotes((prev) => ({ ...prev, [job.id]: event.target.value }))}
+                    />
+                  </Field>
+                  <div className="flex flex-wrap gap-2">
+                    <Button disabled={isBusy} onClick={() => handleRefine(job).catch((e) => onNotice(e.message))}>
+                      <Sparkles size={15} /> Refine &amp; Rescore
+                    </Button>
+                    <Button variant="secondary" disabled={isBusy} onClick={() => handleQueue(job).catch((e) => onNotice(e.message))}>
+                      <Send size={15} /> Queue Selected Resume
+                    </Button>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1307,6 +1857,52 @@ function MatchReview({ onNotice, onRefresh }: { onNotice: (message: string) => v
           </Panel>
         );
       })}
+      {preview && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+          <div className="flex max-h-[88vh] w-full max-w-5xl flex-col rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold">Resume Preview</h3>
+                <div className="mt-1 text-sm text-slate-500">
+                  Version #{preview.version.id} · {preview.version.role} · {preview.version.tailored_score ?? "?"}/100
+                </div>
+              </div>
+              <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setPreview(null)}>Close</button>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {(["diff", "before", "after"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setPreviewMode(mode)}
+                  className={`rounded border px-3 py-1.5 text-xs font-semibold ${previewMode === mode ? "border-cobalt bg-cobalt text-white" : "border-line bg-white text-ink hover:bg-field"}`}
+                >
+                  {mode === "diff" ? "Diff" : mode === "before" ? "Before" : "After"}
+                </button>
+              ))}
+            </div>
+            <div className="mt-4 grid gap-2 overflow-auto">
+              {preview.metadata.resume_changes.length > 0 && (
+                <div className="rounded border border-line bg-field p-3 text-xs text-slate-700">
+                  {preview.metadata.resume_changes.map((change) => (
+                    <div key={change}>Changed: {change}</div>
+                  ))}
+                </div>
+              )}
+              <pre className="max-h-[56vh] overflow-auto rounded border border-line bg-white p-3 text-xs leading-5 text-slate-800">
+                {previewMode === "diff"
+                  ? (preview.diff.length ? preview.diff.join("\n") : "No textual difference was detected.")
+                  : previewMode === "before"
+                    ? preview.base_preview
+                    : preview.tailored_preview}
+              </pre>
+              {preview.diff_truncated && <div className="text-xs text-slate-500">Diff preview truncated. Download LaTeX for the full file.</div>}
+            </div>
+          </div>
+        </div>
+      )}
+      {debugData && (
+        <DebugModal title="Job Debug" data={debugData} onClose={() => setDebugData(null)} />
+      )}
     </div>
   );
 }
@@ -1316,6 +1912,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
   const [busy, setBusy] = useState<Record<number, boolean>>({});
   const [answerTask, setAnswerTask] = useState<ApplyQueueTask | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [debugData, setDebugData] = useState<ApplyTaskDebug | null>(null);
 
   const load = async () => {
     const data = await api.applyQueue();
@@ -1363,13 +1960,17 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
     }
   };
 
+  const debugTask = async (task: ApplyQueueTask) => {
+    setDebugData(await api.applyTaskDebug(task.id));
+  };
+
   const saveMissingAnswers = async () => {
     if (!answerTask) return;
     const items = answerTask.missing_questions
       .map((question) => ({
         question_text: question,
         answer_text: answers[question] || "",
-        source: "linkedin_easy_apply_missing_question",
+        source: "supervised_apply_missing_question",
         sensitive: true,
         approved: true,
       }))
@@ -1388,7 +1989,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
 
   const statusClass = (status: string) => {
     if (status === "ready_for_submit") return "bg-emerald-100 text-emerald-700";
-    if (status === "needs_answers" || status === "needs_login") return "bg-amber-100 text-amber-700";
+    if (status === "needs_answers" || status === "needs_login" || status === "needs_user_action") return "bg-amber-100 text-amber-700";
     if (status === "failed") return "bg-red-100 text-red-700";
     if (status === "submitted_by_user") return "bg-cobalt text-white";
     return "bg-slate-100 text-slate-600";
@@ -1400,7 +2001,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-semibold">Supervised Apply Queue</h2>
-            <div className="mt-1 text-sm text-slate-500">LinkedIn Easy Apply only. SeekApply fills and pauses before Submit.</div>
+            <div className="mt-1 text-sm text-slate-500">LinkedIn Easy Apply first, then supervised external-site fallback. SeekApply pauses before Submit.</div>
           </div>
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" onClick={() => load().catch((error) => onNotice(error.message))}>
@@ -1428,6 +2029,13 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                       <span className={`rounded px-2 py-1 font-semibold ${statusClass(task.status)}`}>{task.status}</span>
                       <span className="text-slate-500">{task.application_status || "No application yet"}</span>
+                      {task.resume && (
+                        <span className="text-slate-500">
+                          Resume #{task.resume.id}
+                          {task.resume.tailored_score !== null && task.resume.tailored_score !== undefined ? ` · ${task.resume.tailored_score}/100` : ""}
+                          {task.resume.pdf_generation ? ` · ${task.resume.pdf_generation}` : ""}
+                        </span>
+                      )}
                       <a href={task.job.job_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-cobalt hover:underline">
                         <ExternalLink size={12} /> Job
                       </a>
@@ -1437,15 +2045,32 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
                     <Button disabled={isBusy || task.status === "submitted_by_user"} onClick={() => runTask(task, "start").catch((error) => onNotice(error.message))}>
                       <Linkedin size={15} /> {isBusy ? "Working..." : "Start"}
                     </Button>
-                    <Button variant="secondary" disabled={isBusy || !["needs_login", "needs_answers", "failed"].includes(task.status)} onClick={() => runTask(task, "resume").catch((error) => onNotice(error.message))}>
+                    <Button variant="secondary" disabled={isBusy || !["needs_login", "needs_answers", "needs_user_action", "failed"].includes(task.status)} onClick={() => runTask(task, "resume").catch((error) => onNotice(error.message))}>
                       <RefreshCcw size={15} /> Resume
                     </Button>
-                    <Button variant="secondary" disabled={isBusy || task.status !== "ready_for_submit"} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
+                    <Button variant="secondary" disabled={isBusy || !["ready_for_submit", "needs_user_action"].includes(task.status)} onClick={() => markSubmitted(task).catch((error) => onNotice(error.message))}>
                       <CheckCircle2 size={15} /> Mark Submitted
+                    </Button>
+                    <Button variant="secondary" disabled={isBusy} onClick={() => debugTask(task).catch((error) => onNotice(error.message))}>
+                      <Shield size={15} /> Debug
                     </Button>
                   </div>
                 </div>
                 {task.message && <div className="mt-3 rounded border border-line bg-field px-3 py-2 text-sm text-slate-700">{task.message}</div>}
+                {task.trace && task.trace.length > 0 && (
+                  <details className="mt-3 rounded border border-line bg-white px-3 py-2 text-xs text-slate-700">
+                    <summary className="cursor-pointer font-semibold text-ink">Agent trace</summary>
+                    <div className="mt-2 grid gap-1">
+                      {task.trace.slice(-6).map((step, index) => (
+                        <div key={`${step.name}-${index}`} className="flex flex-wrap items-center gap-2">
+                          <span className="font-semibold">{step.name}</span>
+                          <span className="text-slate-500">{step.status}</span>
+                          <span>{step.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
                 {task.missing_questions.length > 0 && (
                   <div className="mt-3 grid gap-2">
                     <div className="text-xs font-semibold uppercase text-slate-500">Missing questions</div>
@@ -1465,7 +2090,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         </div>
       ) : (
         <Panel className="p-8 text-center text-sm text-slate-500">
-          No apply queue items yet. Build the queue from imported LinkedIn jobs that pass your match threshold.
+          No apply queue items yet. Build the queue from imported jobs that pass your match threshold.
         </Panel>
       )}
 
@@ -1473,7 +2098,7 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
           <div className="w-full max-w-2xl rounded-[18px] border border-line bg-[#fffdf7] p-5 shadow-float">
             <div className="mb-4 flex items-center justify-between gap-3">
-              <h3 className="text-base font-semibold">Answer LinkedIn Questions</h3>
+              <h3 className="text-base font-semibold">Answer Application Questions</h3>
               <button className="text-sm text-slate-500 hover:text-ink" onClick={() => setAnswerTask(null)}>Close</button>
             </div>
             <div className="grid max-h-[60vh] gap-4 overflow-auto pr-1">
@@ -1495,6 +2120,9 @@ function ApplyQueue({ onNotice, onRefresh }: { onNotice: (message: string) => vo
             </div>
           </div>
         </div>
+      )}
+      {debugData && (
+        <DebugModal title="Apply Task Debug" data={debugData} onClose={() => setDebugData(null)} />
       )}
     </div>
   );

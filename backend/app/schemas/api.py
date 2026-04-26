@@ -53,6 +53,7 @@ class OnboardingIn(BaseModel):
 
 class JobImportIn(BaseModel):
     job_url: HttpUrl
+    user_id: int | None = None
     title: str | None = None
     company: str | None = None
     location: str | None = None
@@ -109,6 +110,7 @@ class ApplyQueueBuildIn(BaseModel):
     job_ids: list[int] = Field(default_factory=list)
     max_items: int = 25
     force: bool = False
+    resume_version_id: int | None = None
 
 
 class ApplyQueueActionIn(BaseModel):
@@ -137,6 +139,25 @@ class ResumeProfileUpdateIn(BaseModel):
     preferred_locations: list[str] | None = None
     remote_preference: str | None = None
     excluded_companies: list[str] | None = None
+
+
+class ResumeRefineIn(BaseModel):
+    user_id: int | None = None
+    instructions: str = Field(min_length=1, max_length=2000)
+    force_new_version: bool = True
+
+
+class AgentRunIn(BaseModel):
+    user_id: int | None = None
+    job_id: int | None = None
+    task_id: int | None = None
+    resume_version_id: int | None = None
+    instructions: str | None = Field(default=None, max_length=2000)
+    action: str | None = None
+    force: bool = False
+    start_browser: bool = False
+    wait_seconds: int = 90
+    max_items: int = 25
 
 
 class BrowserImportIn(BaseModel):

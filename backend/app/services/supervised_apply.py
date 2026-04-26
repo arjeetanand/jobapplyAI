@@ -44,12 +44,6 @@ class SupervisedLinkedInApplyAgent:
         answers: list[ApplicationAnswer],
         wait_seconds: int = 90,
     ) -> SupervisedApplyResult:
-        if "linkedin.com" not in (job.job_url or ""):
-            return SupervisedApplyResult(
-                status="failed",
-                message="This MVP only supports LinkedIn Easy Apply jobs.",
-                errors=["Unsupported portal"],
-            )
         if not resume_path.exists():
             return SupervisedApplyResult(
                 status="failed",
@@ -95,7 +89,12 @@ class SupervisedLinkedInApplyAgent:
                 action_required="Finish or mark the active application before starting another.",
             )
 
-        steps = ["Opening supervised LinkedIn Easy Apply browser."]
+        is_linkedin = "linkedin.com" in (job.job_url or "").lower()
+        steps = [
+            "Opening supervised LinkedIn Easy Apply browser."
+            if is_linkedin
+            else "Opening supervised external application browser."
+        ]
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,35 +124,24 @@ class SupervisedLinkedInApplyAgent:
                 context = self.__class__._active["context"]
                 page = self.__class__._active["page"]
 
-            page.goto(job.job_url, wait_until="domcontentloaded", timeout=max(wait_seconds, 15) * 1000)
-            steps.append(f"Opened {job.job_url}.")
+            start_url = job.job_url or job.apply_url
+            page.goto(start_url, wait_until="domcontentloaded", timeout=max(wait_seconds, 15) * 1000)
+            steps.append(f"Opened {start_url}.")
             page.wait_for_timeout(1500)
 
             if self._needs_user_login(page):
-                logged_in = self._wait_for_login(page, job.job_url, wait_seconds, steps)
+                logged_in = self._wait_for_login(page, start_url, wait_seconds, steps)
                 if not logged_in:
                     self._save_state(context)
                     return SupervisedApplyResult(
                         status="needs_login",
-                        message="LinkedIn needs login, verification, or CAPTCHA before SeekApply can continue.",
+                        message="The application site needs login, verification, or CAPTCHA before SeekApply can continue.",
                         steps=steps,
                         action_required=(
-                            "Complete LinkedIn login in the visible browser, then click Resume in SeekApply. "
+                            "Complete login or verification in the visible browser, then click Resume in SeekApply. "
                             "After one successful login, SeekApply reuses this saved browser session for later queue jobs."
                         ),
                     )
-
-            easy_apply_clicked = self._click_easy_apply(page)
-            if not easy_apply_clicked:
-                self.__class__._close_on_worker(task_id)
-                return SupervisedApplyResult(
-                    status="failed",
-                    message="LinkedIn Easy Apply was not found for this job.",
-                    steps=steps,
-                    errors=["No Easy Apply button detected."],
-                )
-            steps.append("Opened the Easy Apply modal.")
-            page.wait_for_timeout(1200)
 
             answer_lookup = self._answer_lookup(answers)
             fill_report = {
@@ -162,66 +150,64 @@ class SupervisedLinkedInApplyAgent:
                 "answers_filled": 0,
                 "final_submit_detected": False,
                 "session_profile": str(self.profile_dir),
+                "mode": "linkedin_easy_apply" if is_linkedin else "external_site",
             }
-            missing_questions: list[str] = []
 
-            for _ in range(5):
-                uploaded = self._upload_resume(page, resume_path)
-                fill_report["resume_uploaded"] = fill_report["resume_uploaded"] or uploaded
-                filled = self._fill_visible_fields(page, user, answer_lookup)
-                fill_report["profile_fields_filled"] += filled["profile_fields_filled"]
-                fill_report["answers_filled"] += filled["answers_filled"]
-                missing_questions = self._missing_questions(page, answer_lookup)
-                if missing_questions:
-                    self._save_state(context)
-                    return SupervisedApplyResult(
-                        status="needs_answers",
-                        message=f"{len(missing_questions)} question(s) need answers before continuing.",
-                        steps=steps,
-                        missing_questions=missing_questions,
-                        fill_report=fill_report,
-                        action_required="Answer and approve these questions in SeekApply, then click Resume.",
-                    )
-                if self._final_submit_visible(page):
-                    fill_report["final_submit_detected"] = True
-                    self._save_state(context)
-                    return SupervisedApplyResult(
-                        status="ready_for_submit",
-                        message="Application form is filled and paused before final Submit.",
-                        steps=[*steps, "Stopped before final submit."],
-                        fill_report=fill_report,
-                        action_required="Review the visible LinkedIn form, submit manually, then mark submitted in SeekApply.",
-                    )
-                if not self._click_next_step(page):
-                    break
-                steps.append("Advanced to the next Easy Apply step.")
-                page.wait_for_timeout(900)
-
-            if self._final_submit_visible(page):
-                fill_report["final_submit_detected"] = True
-                self._save_state(context)
-                return SupervisedApplyResult(
-                    status="ready_for_submit",
-                    message="Application form is filled and paused before final Submit.",
-                    steps=[*steps, "Stopped before final submit."],
+            if is_linkedin and self._click_easy_apply(page):
+                steps.append("Opened the Easy Apply modal.")
+                page.wait_for_timeout(1200)
+                return self._fill_supervised_form(
+                    page=page,
+                    user=user,
+                    resume_path=resume_path,
+                    answer_lookup=answer_lookup,
+                    steps=steps,
                     fill_report=fill_report,
-                    action_required="Review the visible LinkedIn form, submit manually, then mark submitted in SeekApply.",
+                    final_action_label="Review the visible LinkedIn form, submit manually, then mark submitted in SeekApply.",
+                    unsupported_message="Could not reach LinkedIn's final review/submit step.",
+                    unsupported_error="The LinkedIn form may have changed or contains unsupported controls.",
+                    next_step_label="Advanced to the next Easy Apply step.",
+                    context=context,
                 )
-            self._save_state(context)
-            return SupervisedApplyResult(
-                status="failed",
-                message="Could not reach LinkedIn's final review/submit step.",
+
+            if is_linkedin:
+                steps.append("LinkedIn Easy Apply was not available; switching to the external apply/site link.")
+                fill_report["mode"] = "external_from_linkedin"
+                opened_external = self._open_external_apply(page, job, steps)
+                if not opened_external:
+                    self._save_state(context)
+                    return SupervisedApplyResult(
+                        status="needs_user_action",
+                        message="LinkedIn Easy Apply was not found, and no external Apply link could be opened automatically.",
+                        steps=steps,
+                        fill_report=fill_report,
+                        action_required="Use the visible browser to open the company apply link, then click Resume or Mark Submitted in SeekApply.",
+                    )
+                page.wait_for_timeout(1500)
+            else:
+                self._open_external_apply(page, job, steps)
+                page.wait_for_timeout(1200)
+
+            return self._fill_supervised_form(
+                page=page,
+                user=user,
+                resume_path=resume_path,
+                answer_lookup=answer_lookup,
                 steps=steps,
                 fill_report=fill_report,
-                errors=["The page may have changed or contains unsupported controls."],
-                action_required="Finish this application manually in the visible browser.",
+                final_action_label="Review the visible external application form, submit manually, then mark submitted in SeekApply.",
+                unsupported_message="Opened the external application site, but some steps need manual review.",
+                unsupported_error="External portal controls vary; finish any unsupported fields in the visible browser.",
+                next_step_label="Advanced to the next external application step.",
+                context=context,
+                allow_manual_finish=True,
             )
         except PlaywrightTimeoutError as exc:
-            logger.exception("LinkedIn Easy Apply timed out")
+            logger.exception("Supervised apply timed out")
             self.__class__._close_on_worker(task_id)
             return SupervisedApplyResult(
                 status="failed",
-                message="LinkedIn Easy Apply timed out.",
+                message="Supervised apply timed out.",
                 steps=steps,
                 errors=[str(exc)],
             )
@@ -236,20 +222,20 @@ class SupervisedLinkedInApplyAgent:
                     errors=[message],
                     action_required="Close the existing LinkedIn apply browser window, then click Start/Resume again.",
                 )
-            logger.exception("LinkedIn Easy Apply browser error")
+            logger.exception("Supervised apply browser error")
             self.__class__._close_on_worker(task_id)
             return SupervisedApplyResult(
                 status="failed",
-                message=f"LinkedIn Easy Apply browser error: {exc}",
+                message=f"Supervised apply browser error: {exc}",
                 steps=steps,
                 errors=[message],
             )
         except Exception as exc:
-            logger.exception("LinkedIn Easy Apply automation failed")
+            logger.exception("Supervised apply automation failed")
             self.__class__._close_on_worker(task_id)
             return SupervisedApplyResult(
                 status="failed",
-                message=f"LinkedIn Easy Apply automation failed: {exc}",
+                message=f"Supervised apply automation failed: {exc}",
                 steps=steps,
                 errors=[str(exc)],
             )
@@ -291,19 +277,136 @@ class SupervisedLinkedInApplyAgent:
             logger.warning("Could not save LinkedIn apply session: %s", exc)
 
     def _wait_for_login(self, page, job_url: str, wait_seconds: int, steps: list[str]) -> bool:
-        steps.append("LinkedIn asked for login or verification; waiting in the visible browser.")
+        steps.append("Application site asked for login or verification; waiting in the visible browser.")
         deadline = time.monotonic() + max(wait_seconds, 15)
         while time.monotonic() < deadline:
             page.wait_for_timeout(2000)
             try:
                 if not self._needs_user_login(page):
-                    if "linkedin.com/jobs" not in (page.url or "").lower():
+                    if "linkedin.com" in job_url.lower() and "linkedin.com/jobs" not in (page.url or "").lower():
                         page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
                         page.wait_for_timeout(1500)
-                    steps.append("LinkedIn login/session is available.")
+                    steps.append("Application site login/session is available.")
                     return True
             except Exception:
                 continue
+        return False
+
+    def _fill_supervised_form(
+        self,
+        *,
+        page,
+        user: User,
+        resume_path: Path,
+        answer_lookup: dict[str, str],
+        steps: list[str],
+        fill_report: dict,
+        final_action_label: str,
+        unsupported_message: str,
+        unsupported_error: str,
+        next_step_label: str,
+        context,
+        allow_manual_finish: bool = False,
+    ) -> SupervisedApplyResult:
+        for _ in range(5):
+            uploaded = self._upload_resume(page, resume_path)
+            fill_report["resume_uploaded"] = fill_report["resume_uploaded"] or uploaded
+            filled = self._fill_visible_fields(page, user, answer_lookup)
+            fill_report["profile_fields_filled"] += filled["profile_fields_filled"]
+            fill_report["answers_filled"] += filled["answers_filled"]
+            missing_questions = self._missing_questions(page, answer_lookup)
+            if missing_questions:
+                self._save_state(context)
+                return SupervisedApplyResult(
+                    status="needs_answers",
+                    message=f"{len(missing_questions)} question(s) need answers before continuing.",
+                    steps=steps,
+                    missing_questions=missing_questions,
+                    fill_report=fill_report,
+                    action_required="Answer and approve these questions in SeekApply, then click Resume.",
+                )
+            if self._final_submit_visible(page):
+                fill_report["final_submit_detected"] = True
+                self._save_state(context)
+                return SupervisedApplyResult(
+                    status="ready_for_submit",
+                    message="Application form is filled and paused before final Submit.",
+                    steps=[*steps, "Stopped before final submit."],
+                    fill_report=fill_report,
+                    action_required=final_action_label,
+                )
+            if not self._click_next_step(page):
+                break
+            steps.append(next_step_label)
+            page.wait_for_timeout(900)
+
+        if self._final_submit_visible(page):
+            fill_report["final_submit_detected"] = True
+            self._save_state(context)
+            return SupervisedApplyResult(
+                status="ready_for_submit",
+                message="Application form is filled and paused before final Submit.",
+                steps=[*steps, "Stopped before final submit."],
+                fill_report=fill_report,
+                action_required=final_action_label,
+            )
+
+        self._save_state(context)
+        if allow_manual_finish:
+            return SupervisedApplyResult(
+                status="needs_user_action",
+                message=unsupported_message,
+                steps=steps,
+                fill_report=fill_report,
+                errors=[unsupported_error],
+                action_required="Continue in the visible browser. SeekApply will keep the task open so you can mark it submitted after manual review.",
+            )
+        return SupervisedApplyResult(
+            status="failed",
+            message=unsupported_message,
+            steps=steps,
+            fill_report=fill_report,
+            errors=[unsupported_error],
+            action_required="Finish this application manually in the visible browser.",
+        )
+
+    @staticmethod
+    def _open_external_apply(page, job: Job, steps: list[str]) -> bool:
+        apply_url = (job.apply_url or "").strip()
+        current_url = (page.url or job.job_url or "").strip()
+        if apply_url and apply_url != current_url:
+            try:
+                page.goto(apply_url, wait_until="domcontentloaded", timeout=45_000)
+                steps.append(f"Opened external apply URL: {apply_url}.")
+                return True
+            except Exception:
+                steps.append("External apply URL could not be opened directly; trying the visible Apply button.")
+
+        try:
+            href = page.evaluate(
+                """
+                () => {
+                  const candidates = Array.from(document.querySelectorAll('a[href], button'));
+                  const match = candidates.find((el) => {
+                    const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                    return /(apply|apply now|continue application|external apply|company website)/i.test(text);
+                  });
+                  if (!match) return '';
+                  if (match.href) return match.href;
+                  match.click();
+                  return 'clicked';
+                }
+                """
+            )
+            if href and href != "clicked":
+                page.goto(href, wait_until="domcontentloaded", timeout=45_000)
+                steps.append(f"Opened external apply link: {href}.")
+                return True
+            if href == "clicked":
+                steps.append("Clicked the visible Apply button on the job page.")
+                return True
+        except Exception:
+            return False
         return False
 
     @staticmethod
@@ -360,7 +463,7 @@ class SupervisedLinkedInApplyAgent:
                 const id = el.getAttribute('id');
                 const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
                 const parentLabel = el.closest('label');
-                const wrapper = el.closest('.jobs-easy-apply-form-section__grouping, .fb-dash-form-element, .artdeco-text-input--container');
+                const wrapper = el.closest('.jobs-easy-apply-form-section__grouping, .fb-dash-form-element, .artdeco-text-input--container, fieldset, .form-group, .field, .input, .application-question');
                 return [
                   el.getAttribute('aria-label'),
                   el.getAttribute('placeholder'),
@@ -436,7 +539,7 @@ class SupervisedLinkedInApplyAgent:
               function labelFor(el) {
                 const id = el.getAttribute('id');
                 const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-                const wrapper = el.closest('.jobs-easy-apply-form-section__grouping, .fb-dash-form-element, fieldset');
+                const wrapper = el.closest('.jobs-easy-apply-form-section__grouping, .fb-dash-form-element, fieldset, .form-group, .field, .input, .application-question');
                 return [
                   el.getAttribute('aria-label'),
                   el.getAttribute('placeholder'),
@@ -473,8 +576,10 @@ class SupervisedLinkedInApplyAgent:
         return bool(
             page.evaluate(
                 """
-                () => Array.from(document.querySelectorAll('button')).some((el) =>
-                  /submit application/i.test(el.innerText || el.getAttribute('aria-label') || '')
+                () => Array.from(document.querySelectorAll('button, input[type="submit"]')).some((el) =>
+                  /(submit application|submit|send application|finish application|review application)/i.test(
+                    el.innerText || el.value || el.getAttribute('aria-label') || ''
+                  )
                 )
                 """
             )
@@ -486,10 +591,10 @@ class SupervisedLinkedInApplyAgent:
             page.evaluate(
                 """
                 () => {
-                  const buttons = Array.from(document.querySelectorAll('button'));
+                  const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'));
                   const button = buttons.find((el) => {
-                    const text = el.innerText || el.getAttribute('aria-label') || '';
-                    return /^(next|review|continue)$/i.test(text.trim()) && !/submit/i.test(text);
+                    const text = el.innerText || el.value || el.getAttribute('aria-label') || '';
+                    return /^(next|review|continue|save and continue|next step)$/i.test(text.trim()) && !/submit/i.test(text);
                   });
                   if (!button) return false;
                   button.click();

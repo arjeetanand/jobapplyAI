@@ -28,12 +28,133 @@ export type ResumeVersion = {
   id: number;
   company: string;
   role: string;
+  job_id?: number | null;
   docx_path: string;
   pdf_path: string;
+  tex_path?: string | null;
   metadata_path: string;
   skills_emphasized: string[];
   truthfulness_status: string;
   created_at: string;
+  selected?: boolean;
+  base_score?: number | null;
+  tailored_score?: number | null;
+  score_delta?: number | null;
+  threshold?: number | null;
+  base_reasons?: string[];
+  base_concerns?: string[];
+  tailored_reasons?: string[];
+  resume_changes?: string[];
+  pdf_generation?: string | null;
+  pdf_note?: string;
+  minimal_latex_edit?: boolean;
+  manual_refinement_notes?: string | null;
+  requested_focus_skills?: string[];
+  reusable_for_current_job?: boolean;
+  download_urls?: {
+    pdf: string;
+    docx: string;
+    tex: string;
+  };
+};
+
+export type ResumeLab = {
+  job: {
+    id: number;
+    title: string;
+    company: string;
+    location: string | null;
+    job_url: string;
+    match_score: number | null;
+  };
+  threshold: number;
+  base: {
+    score: number;
+    recommendation: string;
+    reasons: string[];
+    concerns: string[];
+    resume_path: string | null;
+  };
+  selected_resume_version_id: number | null;
+  latex_template_available: boolean;
+  latex_compiler_available: boolean;
+  versions: ResumeVersion[];
+  pdf_note: string;
+};
+
+export type ResumePreview = {
+  version: ResumeVersion;
+  base_source_type: string;
+  base_preview: string;
+  tailored_source_type: string;
+  tailored_preview: string;
+  diff: string[];
+  diff_truncated: boolean;
+  metadata: {
+    resume_changes: string[];
+    score_report: Record<string, unknown>;
+    pdf_generation?: string | null;
+    manual_refinement_notes?: string | null;
+  };
+};
+
+export type AgentTraceStep = {
+  name: string;
+  status: string;
+  message: string;
+  data: Record<string, unknown>;
+  at: string | null;
+};
+
+export type AgentRunDebug = {
+  id: number;
+  agent_name: string;
+  input_summary: string | null;
+  output_summary: string | null;
+  status: string;
+  created_at: string;
+};
+
+export type JobDebug = {
+  job: {
+    id: number;
+    title: string;
+    company: string;
+    location: string | null;
+    source: string;
+    job_url: string;
+    apply_url?: string | null;
+    status: string;
+    match_score: number | null;
+    score_reasons: string[];
+    score_concerns: string[];
+    skills: string[];
+  };
+  threshold: number;
+  application: {
+    id: number;
+    status: string;
+    resume_version_id: number | null;
+    applied_at: string | null;
+  } | null;
+  resume_versions: ResumeVersion[];
+  queue_tasks: ApplyQueueTask[];
+  browser_imports: Array<{ id: number; source_site: string; parser_confidence: string; missing_fields: string[]; created_at: string }>;
+  safety_events: Array<{ id: number; event_type: string; severity: string; message: string; created_at: string }>;
+  agent_runs: AgentRunDebug[];
+  diagnosis: string[];
+};
+
+export type ApplyTaskDebug = {
+  task: ApplyQueueTask;
+  job_debug: JobDebug;
+  application: JobDebug["application"];
+  resume: ResumeVersion | null;
+  resume_metadata: Record<string, unknown>;
+  trace: AgentTraceStep[];
+  fill_report: Record<string, unknown>;
+  diagnosis: string[];
+  agent_runs: AgentRunDebug[];
 };
 
 export type LinkedInPlan = {
@@ -140,6 +261,7 @@ export type ApplyQueueTask = {
   missing_questions: string[];
   fill_report: Record<string, unknown>;
   steps: string[];
+  trace?: AgentTraceStep[];
   last_error: string | null;
   auto_submit: false;
   created_at: string;
@@ -157,7 +279,54 @@ export type ApplyQueueTask = {
     id: number;
     pdf_path: string;
     docx_path: string;
+    tex_path?: string | null;
+    pdf_generation?: string | null;
+    score_delta?: number | null;
+    tailored_score?: number | null;
   } | null;
+};
+
+export type AgentCatalogItem = {
+  key: string;
+  label: string;
+  lane: string;
+  description: string;
+  safety_mode: string;
+  actions: string[];
+  pauses_for: string[];
+  auto_submit: false;
+};
+
+export type AgentPipelineLane = AgentCatalogItem & {
+  status: string;
+  message: string;
+  artifacts: Record<string, unknown>;
+  next_actions: string[];
+};
+
+export type AgentPipelineStatus = {
+  user_id: number | null;
+  latest_job_id: number | null;
+  latest_task_id: number | null;
+  selected_resume_version_id: number | null;
+  threshold: number;
+  lanes: AgentPipelineLane[];
+  auto_submit: false;
+};
+
+export type AgentRunResult = {
+  run_id: number | null;
+  agent_key: string;
+  agent_label: string;
+  status: string;
+  message: string;
+  trace: AgentTraceStep[];
+  artifacts: Record<string, unknown>;
+  next_actions: string[];
+  errors: string[];
+  auto_submit: false;
+  created_at?: string;
+  input_summary?: string | null;
 };
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -184,6 +353,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ status: string }>("/health"),
+  agentCatalog: () => request<{ agents: AgentCatalogItem[]; auto_submit: false; safety: Record<string, unknown> }>("/agents/catalog"),
+  agentPipelineStatus: () => request<AgentPipelineStatus>("/agents/pipeline/status"),
+  runPipeline: (payload: unknown = {}) =>
+    request<{ selected_agent: string; result: AgentRunResult; pipeline: AgentPipelineStatus; auto_submit: false }>(
+      "/agents/pipeline/run",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+  runAgent: (agentKey: string, payload: unknown = {}) =>
+    request<AgentRunResult>(`/agents/${agentKey}/run`, { method: "POST", body: JSON.stringify(payload) }),
+  agentRun: (runId: number) => request<AgentRunResult>(`/agents/runs/${runId}`),
   analytics: () => request<Analytics>("/analytics"),
   tracker: () => request<{ applications: TrackerRow[] }>("/tracker"),
   resumes: () => request<{ resume_versions: ResumeVersion[] }>("/resume-versions"),
@@ -369,6 +548,25 @@ export const api = {
       reasons?: string[];
       concerns?: string[];
     }>(`/jobs/${jobId}/resume-decision`, { method: "POST" }),
+  resumeLab: (jobId: number) => request<ResumeLab>(`/jobs/${jobId}/resume-lab`),
+  refineResume: (jobId: number, payload: unknown) =>
+    request<{
+      message: string;
+      resume_version_id: number;
+      version: ResumeVersion;
+      comparison: {
+        original_match_score: number;
+        tailored_resume_score: number;
+        score_delta: number;
+        tailored_reasons: string[];
+        resume_changes: string[];
+        pdf_generation?: string | null;
+        minimal_latex_edit?: boolean;
+      };
+      lab: ResumeLab;
+    }>(`/jobs/${jobId}/refine-resume`, { method: "POST", body: JSON.stringify(payload) }),
+  resumePreview: (versionId: number) => request<ResumePreview>(`/resume-versions/${versionId}/preview`),
+  jobDebug: (jobId: number) => request<JobDebug>(`/jobs/${jobId}/debug`),
   requiredQuestions: (jobId: number) =>
     request<{ job_id: number; questions: Array<{ question: string; status: string }>; saved_answers: unknown[] }>(
       `/jobs/${jobId}/required-questions`
@@ -393,6 +591,7 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     ),
   applyQueue: () => request<{ tasks: ApplyQueueTask[]; auto_submit: false }>("/apply-queue"),
+  applyTaskDebug: (taskId: number) => request<ApplyTaskDebug>(`/apply-queue/${taskId}/debug`),
   startApplyTask: (taskId: number) =>
     request<{
       task: ApplyQueueTask;

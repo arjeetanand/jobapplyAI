@@ -4,33 +4,96 @@ from collections import Counter
 
 TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+#.\-]{1,}")
 
+KNOWN_JOB_SKILLS = [
+    "Agent Development Kit",
+    "ADK",
+    "Advanced SQL",
+    "AI/ML",
+    "Artificial Intelligence",
+    "AWS S3",
+    "ChromaDB",
+    "CI/CD",
+    "Cloud Build",
+    "Docker",
+    "Embeddings",
+    "FastAPI",
+    "FAISS",
+    "FinBERT",
+    "Fine-tuning",
+    "Flask",
+    "GCP",
+    "GenAI",
+    "Generative AI",
+    "GitHub Actions",
+    "Go",
+    "Google Cloud Platform",
+    "Google Vertex AI",
+    "Hugging Face",
+    "Java",
+    "Jenkins",
+    "Kubernetes",
+    "LangChain",
+    "LangGraph",
+    "LlamaIndex",
+    "LLMs",
+    "Machine Learning",
+    "Microservices",
+    "MLflow",
+    "MLOps",
+    "OCI GenAI",
+    "Oracle Cloud",
+    "Prompt Engineering",
+    "PyTorch",
+    "Python",
+    "RAG",
+    "REST APIs",
+    "Scikit-learn",
+    "SQL",
+    "TensorFlow",
+    "Transformers",
+    "Vector Databases",
+    "Vertex AI",
+]
+
 JOB_KEYWORD_NOISE = {
     "ago",
     "applicant",
     "applicants",
     "apply",
     "actively",
+    "about",
+    "artificial",
     "bengaluru",
     "bangalore",
+    "business",
     "company",
     "data",
     "easy",
     "engineer",
     "gen",
+    "global",
     "hiring",
     "hour",
     "hours",
     "india",
+    "impact",
+    "intelligence",
     "job",
     "jobs",
     "karnataka",
+    "know",
     "linkedin",
+    "machine",
+    "more",
     "open",
     "posted",
+    "potential",
     "promoted",
     "role",
     "scientist",
     "view",
+    "unleashed",
+    "your",
     "week",
     "weeks",
 }
@@ -67,6 +130,20 @@ def clean_job_skills(skills: list[str] | None) -> list[str]:
     return cleaned
 
 
+def known_skill_matches(text: str | None) -> list[str]:
+    normalized_text = normalize(text)
+    matches: list[str] = []
+    seen: set[str] = set()
+    for skill in KNOWN_JOB_SKILLS:
+        key = normalize(skill)
+        if key in seen:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", normalized_text):
+            matches.append(skill)
+            seen.add(key)
+    return matches
+
+
 def extract_keywords(text: str, limit: int = 18) -> list[str]:
     stop = {
         "and",
@@ -88,5 +165,6 @@ def extract_keywords(text: str, limit: int = 18) -> list[str]:
         "work",
         *JOB_KEYWORD_NOISE,
     }
+    known = known_skill_matches(text)
     counts = Counter(token for token in tokenize(text) if token not in stop and len(token) > 2)
-    return clean_job_skills([word for word, _ in counts.most_common(limit)])
+    return clean_job_skills([*known, *[word for word, _ in counts.most_common(limit)]])[:limit]

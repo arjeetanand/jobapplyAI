@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
 from app.models.entities import Job, JobPreference, User
-from app.services.text import clean_job_skills, normalize
+from app.services.text import clean_job_skills, extract_keywords, normalize
 
 
 @dataclass
@@ -49,17 +49,25 @@ class SafetyComplianceAgent:
             for role in allowed_roles:
                 normalized_role = normalize(role)
                 role_tokens = set(normalized_role.split())
+                expanded_title_tokens = set(title.replace("ai", "artificial intelligence").split())
+                expanded_role_tokens = set(normalized_role.replace("ai", "artificial intelligence").split())
                 if normalized_role in title or title in normalized_role:
                     role_match = True
                     break
                 if role_tokens and len(title_tokens & role_tokens) / len(role_tokens) >= 0.6:
                     role_match = True
                     break
+                if expanded_role_tokens and len(expanded_title_tokens & expanded_role_tokens) / len(expanded_role_tokens) >= 0.6:
+                    role_match = True
+                    break
             if not role_match:
                 warnings.append("Role title is outside target/similar roles and needs explicit review.")
 
         user_skills = {normalize(skill) for skill in user.skills}
-        job_skills = {normalize(skill) for skill in clean_job_skills(job.skills)}
+        cleaned_job_skills = clean_job_skills(job.skills)
+        if len(cleaned_job_skills) < 2:
+            cleaned_job_skills = clean_job_skills([*cleaned_job_skills, *extract_keywords(job.description or "", limit=16)])
+        job_skills = {normalize(skill) for skill in cleaned_job_skills}
         if job_skills and user_skills:
             overlap = job_skills & user_skills
             if len(overlap) == 0:

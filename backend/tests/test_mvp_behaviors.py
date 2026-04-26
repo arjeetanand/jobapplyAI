@@ -189,6 +189,52 @@ KEEP_DATAMIND_PROJECT
     assert any("Targeted Focus" in change for change in tailored.metadata["resume_changes"])
 
 
+def test_latex_tailoring_uses_configured_template_and_preserves_base_pdf(tmp_path, monkeypatch):
+    template_path = tmp_path / "main.tex"
+    template_path.write_text(
+        r"""\documentclass{article}
+\begin{document}
+\section{Profile}
+\small{Original profile}
+\section{Experience}
+KEEP_OVERLEAF_EXPERIENCE
+\section{Technical Skills}
+\begin{itemize}[leftmargin=0.1in, label={}]
+\small{\item{\textbf{Languages:} Python, SQL \\}}
+\end{itemize}
+\end{document}
+""",
+        encoding="utf-8",
+    )
+    base_pdf = tmp_path / "base.pdf"
+    base_pdf.write_bytes(b"%PDF-1.4 original-overleaf-pdf")
+    user = sample_user()
+    user.latex_template_source = None
+    user.base_resume_path = str(base_pdf)
+
+    monkeypatch.setattr(
+        "app.services.resume.get_settings",
+        lambda: obj(resolved_storage_root=tmp_path, latex_template_path=template_path),
+    )
+    monkeypatch.setattr("app.services.resume.compile_latex_to_pdf", lambda tex_path, pdf_path: False)
+
+    job = sample_job(
+        title="Artificial Intelligence Engineer",
+        company="Deloitte",
+        description="Python Generative AI RAG Vertex AI Docker Kubernetes CI/CD REST APIs",
+        skills=["Python", "Generative AI", "RAG", "Docker", "Kubernetes"],
+    )
+    tailored = ResumeTailoringAgent(storage_root=tmp_path).tailor(user, job, 61)
+    tex = tailored.tex_path.read_text(encoding="utf-8")
+
+    assert "KEEP_OVERLEAF_EXPERIENCE" in tex
+    assert "Original profile" not in tex
+    assert "Targeted Focus" in tex
+    assert tailored.metadata["minimal_latex_edit"] is True
+    assert tailored.metadata["pdf_generation"] == "base_pdf_fallback"
+    assert tailored.pdf_path.read_bytes() == base_pdf.read_bytes()
+
+
 def test_resume_reuse_for_similar_job(tmp_path):
     existing = [
         obj(
@@ -235,7 +281,7 @@ def test_linkedin_visible_text_import_parser():
     )
     assert parsed["title"] == "Generative AI Engineer"
     assert parsed["company"] == "ExampleAI"
-    assert "python" in parsed["skills"]
+    assert any(skill.lower() == "python" for skill in parsed["skills"])
 
 
 def test_application_packet_requires_review_items_when_missing_assets():
@@ -332,6 +378,133 @@ def test_upload_resume_current_state_and_download(tmp_path, monkeypatch):
     assert downloaded.content == content
 
 
+def test_agent_catalog_and_empty_pipeline_status(tmp_path, monkeypatch):
+    client, _ = make_test_client(tmp_path, monkeypatch)
+
+    catalog = client.get("/agents/catalog")
+    assert catalog.status_code == 200
+    keys = {agent["key"] for agent in catalog.json()["agents"]}
+    assert {
+        "resume_intake",
+        "find_job",
+        "job_import",
+        "match_scorer",
+        "resume_builder",
+        "resume_reviewer",
+        "question_agent",
+        "apply_agent",
+        "tracker_agent",
+    }.issubset(keys)
+    assert catalog.json()["auto_submit"] is False
+
+    status = client.get("/agents/pipeline/status")
+    assert status.status_code == 200
+    lanes = {lane["key"]: lane for lane in status.json()["lanes"]}
+    assert lanes["resume_intake"]["status"] == "ready"
+    assert status.json()["auto_submit"] is False
+
+
+def test_agent_match_builder_reviewer_and_run_detail(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={
+            "file": (
+                "resume.tex",
+                (
+                    b"\\documentclass{article}\\begin{document}"
+                    b"Arjeet Anand arjeet@example.com Python FastAPI RAG TensorFlow PyTorch"
+                    b"\\section*{Profile}AI engineer building GenAI systems."
+                    b"\\section*{Technical Skills}Python, FastAPI, RAG, TensorFlow, PyTorch"
+                    b"\\end{document}"
+                ),
+                "application/x-tex",
+            )
+        },
+    )
+    user_id = upload.json()["user_id"]
+    job_id = client.post(
+        "/jobs/import-url",
+        json={
+            "user_id": user_id,
+            "job_url": "https://www.linkedin.com/jobs/view/agent-1",
+            "title": "Generative AI Engineer",
+            "company": "AgentAI",
+            "description": "Build Python FastAPI RAG LLM systems with TensorFlow and PyTorch.",
+            "skills": ["Python", "FastAPI", "RAG", "TensorFlow", "PyTorch"],
+            "source": "browser_assist:linkedin.com",
+        },
+    ).json()["job_id"]
+
+    scored = client.post("/agents/match_scorer/run", json={"user_id": user_id, "job_id": job_id})
+    assert scored.status_code == 200
+    assert scored.json()["agent_key"] == "match_scorer"
+    assert scored.json()["artifacts"]["score"] is not None
+    run_id = scored.json()["run_id"]
+
+    run_detail = client.get(f"/agents/runs/{run_id}")
+    assert run_detail.status_code == 200
+    assert run_detail.json()["agent_key"] == "match_scorer"
+    assert run_detail.json()["trace"]
+
+    built = client.post("/agents/resume_builder/run", json={"user_id": user_id, "job_id": job_id})
+    assert built.status_code == 200
+    assert built.json()["status"] == "completed"
+    version_id = built.json()["artifacts"]["resume_version"]["id"]
+    assert built.json()["artifacts"]["comparison"]["tailored_resume_score"] is not None
+
+    reviewed = client.post(
+        "/agents/resume_reviewer/run",
+        json={"user_id": user_id, "job_id": job_id, "resume_version_id": version_id},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["artifacts"]["preview"]["diff"]
+
+    status = client.get("/agents/pipeline/status").json()
+    lanes = {lane["key"]: lane for lane in status["lanes"]}
+    assert lanes["resume_builder"]["status"] == "completed"
+    assert lanes["resume_reviewer"]["artifacts"]["resume_version_id"] == version_id
+
+    with session_factory() as db:
+        assert db.get(ResumeVersion, version_id) is not None
+
+
+def test_apply_agent_builds_queue_without_starting_browser(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.pdf", b"%PDF-1.4\nPython FastAPI RAG LLMs", "application/pdf")},
+    )
+    user_id = upload.json()["user_id"]
+    job_id = client.post(
+        "/jobs/import-url",
+        json={
+            "user_id": user_id,
+            "job_url": "https://www.linkedin.com/jobs/view/agent-queue",
+            "title": "Generative AI Engineer",
+            "company": "QueueAI",
+            "description": "Python FastAPI RAG LLMs",
+            "skills": ["Python", "FastAPI", "RAG"],
+            "source": "browser_assist:linkedin.com",
+        },
+    ).json()["job_id"]
+    with session_factory() as db:
+        db.get(Job, job_id).match_score = 94
+        db.commit()
+
+    queued = client.post("/agents/apply_agent/run", json={"user_id": user_id, "job_id": job_id})
+    assert queued.status_code == 200
+    assert queued.json()["agent_key"] == "apply_agent"
+    assert queued.json()["status"] == "ready"
+    assert queued.json()["auto_submit"] is False
+    assert queued.json()["artifacts"]["tasks"][0]["job_id"] == job_id
+
+    with session_factory() as db:
+        task = db.scalar(select(ApplyQueueTask).where(ApplyQueueTask.job_id == job_id))
+        assert task is not None
+        assert task.status == "queued"
+
+
 def test_tailored_resume_tex_and_pdf_downloads(tmp_path, monkeypatch):
     client, _ = make_test_client(tmp_path, monkeypatch)
     client.post(
@@ -360,6 +533,143 @@ def test_tailored_resume_tex_and_pdf_downloads(tmp_path, monkeypatch):
     pdf = client.get(f"/resume-versions/{version_id}/download/pdf")
     assert pdf.status_code == 200
     assert pdf.content.startswith(b"%PDF")
+
+
+def test_import_scores_job_and_resume_lab_tracks_refinement_history(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={
+            "file": (
+                "resume.tex",
+                (
+                    b"\\documentclass{article}\\begin{document}"
+                    b"Arjeet Anand arjeet@example.com Python FastAPI RAG TensorFlow PyTorch MLOps"
+                    b"\\section*{Profile}AI/ML Engineer building production GenAI systems."
+                    b"\\section*{Technical Skills}Python, FastAPI, RAG, TensorFlow, PyTorch, MLOps"
+                    b"\\end{document}"
+                ),
+                "application/x-tex",
+            )
+        },
+    )
+    user_id = upload.json()["user_id"]
+
+    imported = client.post(
+        "/jobs/import-url",
+        json={
+            "user_id": user_id,
+            "job_url": "https://www.linkedin.com/jobs/view/9301",
+            "title": "AI and ML Data Scientist",
+            "company": "Birlasoft",
+            "location": "Bengaluru",
+            "description": "Python deep learning TensorFlow PyTorch MLOps RAG production machine learning.",
+            "skills": ["Python", "TensorFlow", "PyTorch", "MLOps"],
+            "source": "browser_assist:linkedin.com",
+        },
+    )
+    assert imported.status_code == 200
+    job_id = imported.json()["job_id"]
+    assert imported.json()["match_score"] is not None
+    with session_factory() as db:
+        assert db.get(Job, job_id).match_score is not None
+
+    lab = client.get(f"/jobs/{job_id}/resume-lab")
+    assert lab.status_code == 200
+    assert lab.json()["base"]["score"] == imported.json()["match_score"]
+    assert lab.json()["versions"] == []
+
+    refined = client.post(
+        f"/jobs/{job_id}/refine-resume",
+        json={
+            "user_id": user_id,
+            "instructions": "Emphasize TensorFlow, PyTorch, MLOps, RAG and production machine learning.",
+        },
+    )
+    assert refined.status_code == 200
+    body = refined.json()
+    assert body["comparison"]["original_match_score"] == imported.json()["match_score"]
+    assert body["comparison"]["tailored_resume_score"] is not None
+    assert body["lab"]["selected_resume_version_id"] == body["resume_version_id"]
+    assert body["lab"]["versions"][0]["resume_changes"]
+
+    with session_factory() as db:
+        version = db.get(ResumeVersion, body["resume_version_id"])
+        metadata = json.loads(Path(version.metadata_path).read_text(encoding="utf-8"))
+        assert metadata["score_report"]["base_score"] == imported.json()["match_score"]
+        assert "manual_refinement_notes" in metadata
+        assert metadata["minimal_latex_edit"] is True
+
+    preview = client.get(f"/resume-versions/{body['resume_version_id']}/preview")
+    assert preview.status_code == 200
+    assert preview.json()["base_source_type"] == "uploaded_latex_template"
+    assert preview.json()["tailored_source_type"] == "latex"
+    assert preview.json()["diff"]
+
+    debug = client.get(f"/jobs/{job_id}/debug")
+    assert debug.status_code == 200
+    assert debug.json()["resume_versions"][0]["id"] == body["resume_version_id"]
+    assert debug.json()["diagnosis"]
+
+
+def test_apply_queue_supports_external_site_supervised_fallback(tmp_path, monkeypatch):
+    client, session_factory = make_test_client(tmp_path, monkeypatch)
+    upload = client.post(
+        "/resumes/upload-base",
+        files={"file": ("resume.pdf", b"%PDF-1.4\nPython FastAPI RAG", "application/pdf")},
+    )
+    user_id = upload.json()["user_id"]
+    job_id = client.post(
+        "/jobs/import-url",
+        json={
+            "user_id": user_id,
+            "job_url": "https://company.example/jobs/ai-engineer",
+            "apply_url": "https://company.example/apply/ai-engineer",
+            "title": "AI Engineer",
+            "company": "ExternalAI",
+            "description": "Python FastAPI RAG production APIs",
+            "skills": ["Python", "FastAPI", "RAG"],
+            "source": "company_careers",
+        },
+    ).json()["job_id"]
+    with session_factory() as db:
+        db.get(Job, job_id).match_score = 96
+        db.commit()
+
+    built = client.post("/apply-queue/build", json={"user_id": user_id, "job_ids": [job_id]})
+    assert built.status_code == 200
+    task = built.json()["tasks"][0]
+    assert task["source"] == "external_supervised_apply"
+
+    class FakeApplyAgent:
+        def __init__(self, storage_root):
+            self.storage_root = storage_root
+
+        def start(self, **kwargs):
+            assert kwargs["job"].apply_url == "https://company.example/apply/ai-engineer"
+            assert kwargs["resume_path"].exists()
+            return obj(
+                status="needs_user_action",
+                message="Opened external application site.",
+                steps=["Opened external apply URL"],
+                errors=["External portal controls vary."],
+                missing_questions=[],
+                fill_report={"mode": "external_site", "resume_uploaded": False},
+                action_required="Continue in visible browser.",
+            )
+
+    monkeypatch.setattr("app.api.routes.SupervisedLinkedInApplyAgent", FakeApplyAgent)
+    started = client.post(f"/apply-queue/{task['id']}/start", json={})
+    assert started.status_code == 200
+    assert started.json()["status"] == "needs_user_action"
+    assert started.json()["auto_submit"] is False
+    debug = client.get(f"/apply-queue/{task['id']}/debug")
+    assert debug.status_code == 200
+    assert any(step["name"] == "browser_agent" for step in debug.json()["trace"])
+    assert debug.json()["diagnosis"]
+    with session_factory() as db:
+        application = db.scalar(select(Application).where(Application.job_id == job_id))
+        assert application.status == "Needs user action"
 
 
 def test_bulk_answers_upsert_and_sync_profile_preferences(tmp_path, monkeypatch):

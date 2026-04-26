@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from app.models.entities import Job, JobPreference, User
 from app.services.safety import SafetyComplianceAgent
-from app.services.text import clean_job_skills, keyword_overlap, normalize, tokenize
+from app.services.text import clean_job_skills, extract_keywords, keyword_overlap, normalize, tokenize
 
 
 @dataclass
@@ -19,6 +19,8 @@ class JobMatchingAgent:
 
     # ---- fuzzy title helpers ----
     _ROLE_SYNONYMS: dict[str, set[str]] = {
+        "ai engineer": {"artificial intelligence engineer", "ai/ml engineer", "machine learning engineer", "ml engineer"},
+        "ai scientist": {"artificial intelligence scientist", "artificial intelligence engineer", "data scientist", "ml scientist"},
         "software engineer": {"developer", "sde", "swe", "programmer", "coder"},
         "backend engineer": {"backend developer", "server engineer", "api engineer"},
         "frontend engineer": {"frontend developer", "ui engineer", "ui developer"},
@@ -37,6 +39,12 @@ class JobMatchingAgent:
             r = normalize(role)
             # Exact / substring
             if r and (r in t or t in r):
+                return True, role
+            t_expanded = t.replace("ai", "artificial intelligence")
+            r_expanded = r.replace("ai", "artificial intelligence")
+            t_expanded_tokens = set(t_expanded.split())
+            r_expanded_tokens = set(r_expanded.split())
+            if r_expanded_tokens and len(t_expanded_tokens & r_expanded_tokens) / len(r_expanded_tokens) >= 0.6:
                 return True, role
             # Token overlap: e.g. "software engineer" vs "software engineer, backend"
             t_tokens = set(t.split())
@@ -74,7 +82,7 @@ class JobMatchingAgent:
                 concerns.append("Role title is not an obvious target-role match.")
 
         # ---- 2. Skill overlap (max 28) ----
-        job_skills = clean_job_skills(job.skills)
+        job_skills = clean_job_skills([*clean_job_skills(job.skills), *extract_keywords(job.description or "", limit=16)])
         overlap, missing = keyword_overlap(user.skills, job_skills)
         if job_skills:
             skill_ratio = len(overlap) / len(set(normalize(skill) for skill in job_skills if skill))

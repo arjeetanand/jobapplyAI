@@ -1,4 +1,5 @@
 import {
+  Bot,
   BriefcaseBusiness,
   ClipboardCheck,
   History,
@@ -10,14 +11,15 @@ import {
 } from "lucide-react";
 
 export const sections = [
-  { id: "resume", label: "Resume Intake", icon: Upload, idx: "01 / 07" },
-  { id: "linkedin", label: "Find Jobs", icon: Linkedin, idx: "02 / 07" },
-  { id: "review", label: "Match & Resume", icon: ShieldCheck, idx: "03 / 07" },
-  { id: "apply", label: "Apply Queue", icon: Send, idx: "04 / 08" },
-  { id: "questions", label: "Questions KB", icon: ListChecks, idx: "05 / 08" },
-  { id: "tracker", label: "Applications", icon: BriefcaseBusiness, idx: "06 / 08" },
-  { id: "logs", label: "Logs", icon: History, idx: "07 / 08" },
-  { id: "browser", label: "Page Import", icon: ClipboardCheck, idx: "08 / 08" }
+  { id: "cockpit", label: "Agent Cockpit", icon: Bot, idx: "01 / 09" },
+  { id: "resume", label: "Resume Intake", icon: Upload, idx: "02 / 09" },
+  { id: "linkedin", label: "Find Jobs", icon: Linkedin, idx: "03 / 09" },
+  { id: "review", label: "Match & Resume", icon: ShieldCheck, idx: "04 / 09" },
+  { id: "apply", label: "Apply Queue", icon: Send, idx: "05 / 09" },
+  { id: "questions", label: "Questions KB", icon: ListChecks, idx: "06 / 09" },
+  { id: "tracker", label: "Applications", icon: BriefcaseBusiness, idx: "07 / 09" },
+  { id: "logs", label: "Logs", icon: History, idx: "08 / 09" },
+  { id: "browser", label: "Page Import", icon: ClipboardCheck, idx: "09 / 09" }
 ] as const;
 
 export type SectionId = string;

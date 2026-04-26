@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import difflib
 from html import escape
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents import AgentContext, AgentResult, agent_catalog, agent_keys, get_agent
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.models.entities import (
@@ -32,6 +34,7 @@ from app.models.entities import (
     User,
 )
 from app.schemas.api import (
+    AgentRunIn,
     ApplicationAnswerIn,
     ApplyQueueActionIn,
     ApplyQueueBuildIn,
@@ -47,11 +50,13 @@ from app.schemas.api import (
     LinkedInSupervisedImportIn,
     OnboardingIn,
     ResumeProfileUpdateIn,
+    ResumeRefineIn,
     SafetySettingsOut,
     ScoreOut,
     StatusPatchIn,
 )
 from app.services.application_packet import ApplicationPacketAgent
+from app.services.agent_trace import append_trace, normalize_trace, trace_messages
 from app.services.documents import latex_compiler_available
 from app.services.email_outreach import EmailOutreachAgent
 from app.services.job_discovery import JobSearchAgent
@@ -98,6 +103,22 @@ def _configured_match_threshold(preferences: JobPreference | None = None) -> int
     configured = getattr(get_settings(), "match_threshold", None)
     threshold = configured if configured is not None else (preferences.match_threshold if preferences else 60)
     return max(0, min(int(threshold or 60), 100))
+
+
+def _score_job_for_user(db: Session, user: User | None, job: Job) -> object | None:
+    if not user:
+        return None
+    preferences = _preferences_for(db, user)
+    threshold = _configured_match_threshold(preferences)
+    result = JobMatchingAgent().score(user, preferences, job)
+    job.match_score = result.score
+    job.score_reasons = result.reasons
+    job.score_concerns = result.concerns
+    if result.recommendation == "Blocked by safety rules":
+        job.status = "Found"
+    elif result.score >= threshold and job.status == "Found":
+        job.status = "Shortlisted for review"
+    return result
 
 
 def _discovery_preferences_for(db: Session, user: User) -> DiscoveryPreference:
@@ -415,6 +436,8 @@ def _import_visible_job_payload(
         db.flush()
         deduped = False
 
+    score_result = _score_job_for_user(db, user, job)
+
     import_row = BrowserImport(
         user_id=user.id if user else None,
         job_id=job.id,
@@ -447,6 +470,7 @@ def _import_visible_job_payload(
         "job_id": job.id,
         "browser_import_id": import_row.id,
         "deduped": deduped,
+        "match_score": score_result.score if score_result else job.match_score,
         "parser_confidence": import_row.parser_confidence,
         "missing_fields": missing,
         "message": "Visible job page imported for review.",
@@ -516,14 +540,15 @@ def _ensure_queue_resume(
     version = db.get(ResumeVersion, task.resume_version_id) if task.resume_version_id else None
     version = version or (db.get(ResumeVersion, application.resume_version_id) if application.resume_version_id else None)
     version = version or _latest_resume_for_job(db, user, job)
+    agent = ResumeTailoringAgent()
     if version:
-        pdf_path = ResumeTailoringAgent().ensure_pdf_export(user, version, job, force=True)
+        pdf_path = agent.ensure_pdf_export(user, version, job, force=True)
         task.resume_version_id = version.id
         application.resume_version_id = version.id
         return pdf_path
 
     score = job.match_score if job.match_score is not None else JobMatchingAgent().score(user, preferences, job).score
-    if getattr(user, "latex_template_source", None):
+    if agent.has_latex_template(user):
         version = _store_tailored_resume_version(db, user, job, score)
         task.resume_version_id = version.id
         application.resume_version_id = version.id
@@ -558,7 +583,8 @@ def _apply_queue_task_payload(db: Session, task: ApplyQueueTask) -> dict:
         "message": task.message,
         "missing_questions": task.missing_questions or [],
         "fill_report": task.fill_report or {},
-        "steps": task.steps or [],
+        "steps": trace_messages(task.steps or []),
+        "trace": normalize_trace(task.steps or []),
         "last_error": task.last_error,
         "auto_submit": False,
         "created_at": task.created_at,
@@ -576,6 +602,10 @@ def _apply_queue_task_payload(db: Session, task: ApplyQueueTask) -> dict:
             "id": resume.id,
             "pdf_path": resume.pdf_path,
             "docx_path": resume.docx_path,
+            "tex_path": resume.tex_path,
+            "pdf_generation": _resume_version_metadata(resume.metadata_path).get("pdf_generation"),
+            "score_delta": _resume_version_metadata(resume.metadata_path).get("score_delta"),
+            "tailored_score": _resume_version_metadata(resume.metadata_path).get("tailored_resume_score"),
         }
         if resume
         else None,
@@ -619,6 +649,317 @@ def _resume_version_metadata(path: str | None) -> dict:
         return json.loads(metadata_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _trace_task(task: ApplyQueueTask, name: str, status: str, message: str, data: dict | None = None) -> None:
+    task.steps = append_trace(task.steps or [], name, status, message, data)
+
+
+def _debug_agent_runs(db: Session, *, job_id: int | None = None, task_id: int | None = None, limit: int = 20) -> list[dict]:
+    runs = db.scalars(select(AgentRun).order_by(AgentRun.created_at.desc()).limit(200)).all()
+    selected = []
+    markers = [f"job_id={job_id}" if job_id else "", f"task_id={task_id}" if task_id else ""]
+    for run in runs:
+        haystack = f"{run.input_summary or ''} {run.output_summary or ''}"
+        if not any(marker and marker in haystack for marker in markers):
+            continue
+        selected.append(
+            {
+                "id": run.id,
+                "agent_name": run.agent_name,
+                "input_summary": run.input_summary,
+                "output_summary": run.output_summary,
+                "status": run.status,
+                "created_at": run.created_at,
+            }
+        )
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _job_debug_payload(db: Session, user: User, job: Job) -> dict:
+    preferences = _preferences_for(db, user)
+    application = db.scalar(select(Application).where(Application.user_id == user.id, Application.job_id == job.id))
+    tasks = db.scalars(
+        select(ApplyQueueTask)
+        .where(ApplyQueueTask.user_id == user.id, ApplyQueueTask.job_id == job.id)
+        .order_by(ApplyQueueTask.updated_at.desc())
+    ).all()
+    versions = db.scalars(
+        select(ResumeVersion)
+        .where(ResumeVersion.user_id == user.id, ResumeVersion.job_id == job.id)
+        .order_by(ResumeVersion.created_at.desc())
+    ).all()
+    browser_imports = db.scalars(
+        select(BrowserImport).where(BrowserImport.job_id == job.id).order_by(BrowserImport.created_at.desc()).limit(10)
+    ).all()
+    safety_events = db.scalars(
+        select(SafetyEvent).where(SafetyEvent.job_id == job.id).order_by(SafetyEvent.created_at.desc()).limit(10)
+    ).all()
+
+    diagnosis: list[str] = []
+    threshold = _configured_match_threshold(preferences)
+    if job.match_score is None:
+        diagnosis.append("Job has not been scored against the uploaded resume yet.")
+    elif job.match_score < threshold:
+        diagnosis.append(f"Job score {job.match_score} is below queue threshold {threshold}; refine or force queue after review.")
+    if not versions:
+        diagnosis.append("No tailored resume version is linked to this job yet.")
+    if not job.apply_url:
+        diagnosis.append("No separate apply_url was captured; browser starts from job_url and searches visible Apply controls.")
+    if tasks and tasks[0].last_error:
+        diagnosis.append(f"Latest queue task error: {tasks[0].last_error}")
+    if not diagnosis:
+        diagnosis.append("No obvious blockers detected in stored state.")
+
+    return {
+        "job": {
+            "id": job.id,
+            "title": job.title,
+            "company": job.company,
+            "location": job.location,
+            "source": job.source,
+            "job_url": job.job_url,
+            "apply_url": job.apply_url,
+            "status": job.status,
+            "match_score": job.match_score,
+            "score_reasons": job.score_reasons or [],
+            "score_concerns": job.score_concerns or [],
+            "skills": clean_job_skills(job.skills),
+        },
+        "threshold": threshold,
+        "application": {
+            "id": application.id,
+            "status": application.status,
+            "resume_version_id": application.resume_version_id,
+            "applied_at": application.applied_at,
+        }
+        if application
+        else None,
+        "resume_versions": [_resume_version_payload(db, version, user=user, job=job) for version in versions],
+        "queue_tasks": [_apply_queue_task_payload(db, task) for task in tasks],
+        "browser_imports": [
+            {
+                "id": item.id,
+                "source_site": item.source_site,
+                "parser_confidence": item.parser_confidence,
+                "missing_fields": item.missing_fields or [],
+                "created_at": item.created_at,
+            }
+            for item in browser_imports
+        ],
+        "safety_events": [
+            {
+                "id": item.id,
+                "event_type": item.event_type,
+                "severity": item.severity,
+                "message": item.message,
+                "created_at": item.created_at,
+            }
+            for item in safety_events
+        ],
+        "agent_runs": _debug_agent_runs(db, job_id=job.id),
+        "diagnosis": diagnosis,
+    }
+
+
+def _write_resume_version_metadata(version: ResumeVersion, metadata: dict) -> dict:
+    metadata_path = Path(version.metadata_path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+    return metadata
+
+
+def _persist_resume_score_report(
+    version: ResumeVersion,
+    score_payload: dict,
+    *,
+    threshold: int,
+    base_reasons: list[str] | None = None,
+    base_concerns: list[str] | None = None,
+) -> dict:
+    metadata = _resume_version_metadata(version.metadata_path)
+    score_report = {
+        "base_score": score_payload.get("original_match_score"),
+        "tailored_score": score_payload.get("tailored_resume_score"),
+        "score_delta": score_payload.get("score_delta"),
+        "threshold": threshold,
+        "base_reasons": base_reasons or [],
+        "base_concerns": base_concerns or [],
+        "tailored_reasons": score_payload.get("tailored_reasons", []),
+        "resume_changes": score_payload.get("resume_changes", []),
+    }
+    metadata["score_report"] = score_report
+    metadata["original_match_score"] = score_payload.get("original_match_score")
+    metadata["tailored_resume_score"] = score_payload.get("tailored_resume_score")
+    metadata["score_delta"] = score_payload.get("score_delta")
+    metadata["threshold"] = threshold
+    metadata["resume_changes"] = score_payload.get("resume_changes", metadata.get("resume_changes", []))
+    metadata["pdf_generation"] = score_payload.get("pdf_generation", metadata.get("pdf_generation"))
+    metadata["minimal_latex_edit"] = score_payload.get("minimal_latex_edit", metadata.get("minimal_latex_edit", False))
+    return _write_resume_version_metadata(version, metadata)
+
+
+def _pdf_generation_note(metadata: dict) -> str:
+    mode = metadata.get("pdf_generation")
+    if mode == "latex_compiler":
+        return "Prepared tailored PDF by compiling the LaTeX resume."
+    if mode == "base_pdf_fallback":
+        return (
+            "No local LaTeX compiler was found; SeekApply kept your uploaded PDF format for application upload "
+            "and generated tailored LaTeX for review."
+        )
+    if mode == "styled_pdf_fallback":
+        return "No local LaTeX compiler or uploaded base PDF was available, so SeekApply generated a simple styled PDF."
+    return "PDF status will be finalized when you download or queue this resume."
+
+
+def _resume_version_payload(
+    db: Session,
+    version: ResumeVersion,
+    *,
+    user: User | None = None,
+    job: Job | None = None,
+    selected: bool = False,
+) -> dict:
+    metadata = _resume_version_metadata(version.metadata_path)
+    score_report = metadata.get("score_report") or {}
+    return {
+        "id": version.id,
+        "company": version.company,
+        "role": version.role,
+        "job_id": version.job_id,
+        "docx_path": version.docx_path,
+        "pdf_path": version.pdf_path,
+        "tex_path": version.tex_path,
+        "metadata_path": version.metadata_path,
+        "skills_emphasized": version.skills_emphasized or [],
+        "truthfulness_status": version.truthfulness_status,
+        "created_at": version.created_at,
+        "selected": selected,
+        "download_urls": {
+            "pdf": f"/resume-versions/{version.id}/download/pdf",
+            "docx": f"/resume-versions/{version.id}/download/docx",
+            "tex": f"/resume-versions/{version.id}/download/tex",
+        },
+        "base_score": score_report.get("base_score", metadata.get("original_match_score")),
+        "tailored_score": score_report.get("tailored_score", metadata.get("tailored_resume_score")),
+        "score_delta": score_report.get("score_delta", metadata.get("score_delta")),
+        "threshold": score_report.get("threshold", metadata.get("threshold")),
+        "base_reasons": score_report.get("base_reasons", []),
+        "base_concerns": score_report.get("base_concerns", []),
+        "tailored_reasons": score_report.get("tailored_reasons", []),
+        "resume_changes": metadata.get("resume_changes", []),
+        "pdf_generation": metadata.get("pdf_generation"),
+        "pdf_note": _pdf_generation_note(metadata),
+        "minimal_latex_edit": metadata.get("minimal_latex_edit", False),
+        "manual_refinement_notes": metadata.get("manual_refinement_notes"),
+        "requested_focus_skills": metadata.get("requested_focus_skills", []),
+        "reusable_for_current_job": bool(job and version.job_id != job.id),
+        "owner_matches": bool(user and version.user_id == user.id),
+    }
+
+
+def _hydrate_resume_score_report(
+    db: Session,
+    *,
+    user: User,
+    preferences: JobPreference,
+    job: Job,
+    version: ResumeVersion,
+    base_score: object,
+    threshold: int,
+) -> dict:
+    metadata = _resume_version_metadata(version.metadata_path)
+    if metadata.get("score_report"):
+        return metadata
+    score_payload = _score_tailored_resume_payload(
+        user=user,
+        preferences=preferences,
+        job=job,
+        original_score=base_score.score,
+        resume_text=_tailored_resume_text(version, user.base_resume_text or ""),
+        metadata=metadata,
+    )
+    return _persist_resume_score_report(
+        version,
+        score_payload,
+        threshold=threshold,
+        base_reasons=base_score.reasons,
+        base_concerns=base_score.concerns,
+    )
+
+
+def _resume_lab_payload(db: Session, *, user: User, preferences: JobPreference, job: Job) -> dict:
+    threshold = _configured_match_threshold(preferences)
+    base_score = JobMatchingAgent().score(user, preferences, job)
+    if job.match_score is None or job.match_score < base_score.score:
+        job.match_score = base_score.score
+        job.score_reasons = base_score.reasons
+        job.score_concerns = base_score.concerns
+
+    application = db.scalar(select(Application).where(Application.user_id == user.id, Application.job_id == job.id))
+    job_versions = db.scalars(
+        select(ResumeVersion)
+        .where(ResumeVersion.user_id == user.id, ResumeVersion.job_id == job.id)
+        .order_by(ResumeVersion.created_at.desc())
+    ).all()
+    all_versions = db.scalars(select(ResumeVersion).where(ResumeVersion.user_id == user.id)).all()
+    reusable = []
+    reusable_match = ResumeTailoringAgent().find_reusable([version for version in all_versions if version.job_id != job.id], job)
+    if reusable_match:
+        reusable.append(reusable_match)
+
+    selected_id = application.resume_version_id if application and application.resume_version_id else (job_versions[0].id if job_versions else None)
+    for version in [*job_versions, *reusable]:
+        _hydrate_resume_score_report(
+            db,
+            user=user,
+            preferences=preferences,
+            job=job,
+            version=version,
+            base_score=base_score,
+            threshold=threshold,
+        )
+
+    seen_version_ids: set[int] = set()
+    versions_payload = []
+    for version in [*job_versions, *reusable]:
+        if version.id in seen_version_ids:
+            continue
+        seen_version_ids.add(version.id)
+        versions_payload.append(
+            _resume_version_payload(db, version, user=user, job=job, selected=bool(selected_id and version.id == selected_id))
+        )
+
+    return {
+        "job": {
+            "id": job.id,
+            "title": job.title,
+            "company": job.company,
+            "location": job.location,
+            "job_url": job.job_url,
+            "match_score": job.match_score,
+        },
+        "threshold": threshold,
+        "base": {
+            "score": base_score.score,
+            "recommendation": base_score.recommendation,
+            "reasons": base_score.reasons,
+            "concerns": base_score.concerns,
+            "resume_path": user.base_resume_path,
+        },
+        "selected_resume_version_id": selected_id,
+        "latex_template_available": ResumeTailoringAgent().has_latex_template(user),
+        "latex_compiler_available": latex_compiler_available(),
+        "versions": versions_payload,
+        "pdf_note": (
+            "Install a local LaTeX compiler to turn tailored .tex edits into a tailored PDF automatically."
+            if ResumeTailoringAgent().has_latex_template(user) and not latex_compiler_available()
+            else "Tailored PDF generation is available."
+        ),
+    }
 
 
 def _score_tailored_resume_payload(
@@ -665,6 +1006,25 @@ def _tailored_resume_text(tailored_or_version, fallback: str = "") -> str:
     return "\n".join(parts) or fallback
 
 
+def _base_resume_preview_source(user: User) -> tuple[str, str]:
+    agent = ResumeTailoringAgent()
+    latex_source = agent._latex_template_source(user)
+    if latex_source:
+        return "uploaded_latex_template", latex_source
+    if user.base_resume_text:
+        return "uploaded_resume_text", user.base_resume_text
+    if user.base_resume_path:
+        path = Path(user.base_resume_path).expanduser()
+        if path.exists() and path.suffix.lower() in {".tex", ".txt", ".md"}:
+            return f"uploaded_{path.suffix.lower().lstrip('.')}", path.read_text(encoding="utf-8", errors="ignore")
+    return "missing", ""
+
+
+def _preview_excerpt(text: str, *, limit: int = 12000) -> str:
+    text = text.strip()
+    return text[:limit] + ("\n..." if len(text) > limit else "")
+
+
 def _tailor_and_rescore_job(
     db: Session,
     *,
@@ -674,9 +1034,13 @@ def _tailor_and_rescore_job(
     original_score: int | None = None,
 ) -> tuple[ResumeVersion, dict]:
     score = original_score
+    base_reasons: list[str] = []
+    base_concerns: list[str] = []
     if score is None:
         score_result = JobMatchingAgent().score(user, preferences, job)
         score = score_result.score
+        base_reasons = score_result.reasons
+        base_concerns = score_result.concerns
         job.match_score = score_result.score
         job.score_reasons = score_result.reasons
         job.score_concerns = score_result.concerns
@@ -697,10 +1061,671 @@ def _tailor_and_rescore_job(
         resume_text=_tailored_resume_text(version, user.base_resume_text or ""),
         metadata=metadata,
     )
+    _persist_resume_score_report(
+        version,
+        score_payload,
+        threshold=_configured_match_threshold(preferences),
+        base_reasons=base_reasons,
+        base_concerns=base_concerns,
+    )
     job.match_score = max(score, score_payload["tailored_resume_score"])
     job.score_reasons = score_payload.get("tailored_reasons", [])
     job.status = "Resume tailored"
     return version, score_payload
+
+
+def _job_artifact(job: Job | None) -> dict | None:
+    if not job:
+        return None
+    return {
+        "id": job.id,
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "source": job.source,
+        "job_url": job.job_url,
+        "apply_url": job.apply_url,
+        "match_score": job.match_score,
+        "status": job.status,
+    }
+
+
+def _latest_job(db: Session) -> Job | None:
+    return db.scalar(select(Job).order_by(Job.updated_at.desc(), Job.created_at.desc()))
+
+
+def _latest_application_for_user(db: Session, user: User | None, job: Job | None = None) -> Application | None:
+    if not user:
+        return None
+    query = select(Application).where(Application.user_id == user.id)
+    if job:
+        query = query.where(Application.job_id == job.id)
+    return db.scalar(query.order_by(Application.updated_at.desc(), Application.created_at.desc()))
+
+
+def _latest_apply_task_for_user(db: Session, user: User | None, job: Job | None = None) -> ApplyQueueTask | None:
+    if not user:
+        return None
+    query = select(ApplyQueueTask).where(ApplyQueueTask.user_id == user.id)
+    if job:
+        query = query.where(ApplyQueueTask.job_id == job.id)
+    return db.scalar(query.order_by(ApplyQueueTask.updated_at.desc(), ApplyQueueTask.created_at.desc()))
+
+
+def _resume_preview_payload(db: Session, version: ResumeVersion) -> dict:
+    user = db.get(User, version.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Resume owner not found.")
+    job = db.get(Job, version.job_id) if version.job_id else None
+    agent = ResumeTailoringAgent()
+    tex_path = agent.ensure_latex_export(user, version, job, force=False)
+    metadata = _resume_version_metadata(version.metadata_path)
+    source_type, base_source = _base_resume_preview_source(user)
+    tailored_source = tex_path.read_text(encoding="utf-8", errors="ignore") if tex_path.exists() else ""
+    diff_lines = list(
+        difflib.unified_diff(
+            base_source.splitlines(),
+            tailored_source.splitlines(),
+            fromfile="uploaded_resume",
+            tofile=f"resume_version_{version.id}",
+            lineterm="",
+        )
+    )
+    return {
+        "version": _resume_version_payload(db, version, user=user, job=job, selected=True),
+        "base_source_type": source_type,
+        "base_preview": _preview_excerpt(base_source),
+        "tailored_source_type": "latex",
+        "tailored_preview": _preview_excerpt(tailored_source),
+        "diff": [_preview_excerpt(line, limit=600) for line in diff_lines[:240]],
+        "diff_truncated": len(diff_lines) > 240,
+        "metadata": {
+            "resume_changes": metadata.get("resume_changes", []),
+            "score_report": metadata.get("score_report", {}),
+            "pdf_generation": metadata.get("pdf_generation"),
+            "manual_refinement_notes": metadata.get("manual_refinement_notes"),
+        },
+    }
+
+
+def _agent_result_from_catalog(agent_key: str, status: str, message: str, **kwargs) -> AgentResult:
+    agent = get_agent(agent_key)
+    return agent.result(status, message, **kwargs)
+
+
+def _save_agent_result(db: Session, result: AgentResult, input_summary: str) -> dict:
+    output = result.to_dict()
+    run = AgentRun(
+        agent_name=result.agent_label,
+        input_summary=input_summary,
+        output_summary=json.dumps(output, default=str),
+        status=result.status,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    output["run_id"] = run.id
+    return output
+
+
+def _agent_run_payload(run: AgentRun) -> dict:
+    output: dict = {}
+    try:
+        output = json.loads(run.output_summary or "{}")
+    except json.JSONDecodeError:
+        output = {"message": run.output_summary}
+    output["run_id"] = run.id
+    output.setdefault("agent_label", run.agent_name)
+    output.setdefault("status", run.status)
+    output.setdefault("message", run.output_summary or "")
+    output.setdefault("trace", [])
+    output.setdefault("artifacts", {})
+    output.setdefault("next_actions", [])
+    output.setdefault("errors", [])
+    output.setdefault("auto_submit", False)
+    output["created_at"] = run.created_at
+    output["input_summary"] = run.input_summary
+    return output
+
+
+def _lane_payload(
+    key: str,
+    status: str,
+    message: str,
+    *,
+    artifacts: dict | None = None,
+    next_actions: list[str] | None = None,
+) -> dict:
+    capability = get_agent(key).capability.to_dict()
+    return {
+        **capability,
+        "status": status,
+        "message": message,
+        "artifacts": artifacts or {},
+        "next_actions": next_actions or capability["actions"],
+    }
+
+
+def _pipeline_status_payload(db: Session) -> dict:
+    user = db.scalar(select(User).order_by(User.id.desc()))
+    preferences = _preferences_for(db, user) if user else None
+    answers = _answers_for_user(db, user) if user else []
+    jobs = db.scalars(select(Job).order_by(Job.created_at.desc())).all()
+    latest_job = _latest_job(db)
+    application = _latest_application_for_user(db, user, latest_job)
+    task = _latest_apply_task_for_user(db, user, latest_job)
+    latest_resume = None
+    if user and latest_job:
+        latest_resume = (
+            db.get(ResumeVersion, application.resume_version_id)
+            if application and application.resume_version_id
+            else _latest_resume_for_job(db, user, latest_job)
+        )
+    threshold = _configured_match_threshold(preferences) if preferences else _configured_match_threshold(None)
+    missing_questions = _missing_profile_questions(user, preferences, answers) if user and preferences else []
+
+    lanes = []
+    lanes.append(
+        _lane_payload(
+            "resume_intake",
+            "completed" if user and user.base_resume_path else "ready",
+            "Uploaded resume and profile are available." if user and user.base_resume_path else "Upload your base PDF or LaTeX resume to begin.",
+            artifacts={
+                "user_id": user.id if user else None,
+                "base_resume": _base_resume_metadata(user) if user else None,
+                "missing_questions_count": len(missing_questions),
+            },
+            next_actions=["answer_missing_questions"] if missing_questions else ["upload_resume"],
+        )
+    )
+    discovery = _discovery_preferences_for(db, user) if user else None
+    lanes.append(
+        _lane_payload(
+            "find_job",
+            "completed" if jobs else ("ready" if user and user.base_resume_path else "not_started"),
+            f"{len(jobs)} imported job(s) are available." if jobs else "Generate supervised search links or run supervised import.",
+            artifacts={
+                "job_count": len(jobs),
+                "preferences": _discovery_preferences_payload(discovery),
+            },
+            next_actions=["generate_search_links", "supervised_import"],
+        )
+    )
+    lanes.append(
+        _lane_payload(
+            "job_import",
+            "completed" if latest_job else ("ready" if user else "not_started"),
+            "Latest job has visible JD/apply data saved." if latest_job else "Import visible job data from LinkedIn or a company page.",
+            artifacts={"latest_job": _job_artifact(latest_job), "job_count": len(jobs)},
+            next_actions=["import_visible_job", "open_page_import"],
+        )
+    )
+    lanes.append(
+        _lane_payload(
+            "match_scorer",
+            "completed" if latest_job and latest_job.match_score is not None else ("ready" if latest_job and user else "not_started"),
+            f"Latest job score is {latest_job.match_score}/100." if latest_job and latest_job.match_score is not None else "Score the latest job against your uploaded resume.",
+            artifacts={"latest_job": _job_artifact(latest_job), "threshold": threshold},
+            next_actions=["score_job"],
+        )
+    )
+    lanes.append(
+        _lane_payload(
+            "resume_builder",
+            "completed" if latest_resume else ("ready" if latest_job and latest_job.match_score is not None else "not_started"),
+            f"Resume version #{latest_resume.id} is selected." if latest_resume else "Build or reuse a LaTeX-backed resume for the selected job.",
+            artifacts={
+                "resume_version": _resume_version_payload(db, latest_resume, user=user, job=latest_job, selected=True) if latest_resume and user else None,
+                "latest_job": _job_artifact(latest_job),
+            },
+            next_actions=["build_resume", "refine_resume"],
+        )
+    )
+    lanes.append(
+        _lane_payload(
+            "resume_reviewer",
+            "completed" if latest_resume else "not_started",
+            "Before/after resume review is ready." if latest_resume else "Create or select a resume version before review.",
+            artifacts={"resume_version_id": latest_resume.id if latest_resume else None},
+            next_actions=["preview_diff", "approve_resume"],
+        )
+    )
+    question_status = "needs_user_action" if missing_questions or (task and task.missing_questions) else ("completed" if user else "not_started")
+    lanes.append(
+        _lane_payload(
+            "question_agent",
+            question_status,
+            "Missing profile or portal answers need approval." if question_status == "needs_user_action" else "Reusable application answers are ready.",
+            artifacts={
+                "profile_missing_questions": missing_questions,
+                "portal_missing_questions": task.missing_questions if task else [],
+                "answer_count": len(answers),
+            },
+            next_actions=["answer_questions"] if question_status == "needs_user_action" else ["review_kb"],
+        )
+    )
+    apply_status = "not_started"
+    apply_message = "Build an apply queue item after resume review."
+    if task:
+        apply_status = "completed" if task.status == "submitted_by_user" else ("needs_user_action" if task.status in {"needs_login", "needs_answers", "needs_user_action", "ready_for_submit"} else task.status)
+        apply_message = task.message or f"Apply task is {task.status}."
+    elif latest_resume and latest_job:
+        apply_status = "ready"
+        apply_message = "Queue the selected resume for supervised apply."
+    lanes.append(
+        _lane_payload(
+            "apply_agent",
+            apply_status,
+            apply_message,
+            artifacts={"task": _apply_queue_task_payload(db, task) if task else None, "auto_submit": False},
+            next_actions=["build_queue", "start_supervised_apply"] if task else ["build_queue"],
+        )
+    )
+    lanes.append(
+        _lane_payload(
+            "tracker_agent",
+            "completed" if application and application.status == "Applied" else ("ready" if application else "not_started"),
+            "Application is marked submitted." if application and application.status == "Applied" else "Track only after user confirms submission.",
+            artifacts={
+                "application": {
+                    "id": application.id,
+                    "status": application.status,
+                    "applied_at": application.applied_at,
+                    "resume_version_id": application.resume_version_id,
+                }
+                if application
+                else None
+            },
+            next_actions=["mark_submitted", "update_status"],
+        )
+    )
+    return {
+        "user_id": user.id if user else None,
+        "latest_job_id": latest_job.id if latest_job else None,
+        "latest_task_id": task.id if task else None,
+        "selected_resume_version_id": latest_resume.id if latest_resume else None,
+        "threshold": threshold,
+        "lanes": lanes,
+        "auto_submit": False,
+    }
+
+
+def _run_agent_result(agent_key: str, payload: AgentRunIn, db: Session) -> dict:
+    if agent_key not in agent_keys():
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_key}")
+    context = AgentContext(**payload.model_dump())
+    catalog_agent = get_agent(agent_key)
+    trace = [
+        catalog_agent.step(
+            "agent_start",
+            "running",
+            f"Starting {catalog_agent.label}.",
+            {
+                "job_id": context.job_id,
+                "task_id": context.task_id,
+                "resume_version_id": context.resume_version_id,
+                "start_browser": context.start_browser,
+                "auto_submit": False,
+            },
+        )
+    ]
+    user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
+    preferences = _preferences_for(db, user) if user else None
+    latest_job = db.get(Job, payload.job_id) if payload.job_id else _latest_job(db)
+    input_summary = (
+        f"agent={agent_key}, user_id={user.id if user else None}, "
+        f"job_id={latest_job.id if latest_job else None}, task_id={payload.task_id}"
+    )
+
+    if agent_key == "resume_intake":
+        if not user:
+            result = _agent_result_from_catalog(
+                agent_key,
+                "needs_user_action",
+                "Upload a base resume so the pipeline can extract your profile.",
+                trace=trace,
+                artifacts={"current_resume": None},
+                next_actions=["upload_resume"],
+            )
+        else:
+            answers = _answers_for_user(db, user)
+            result = _agent_result_from_catalog(
+                agent_key,
+                "completed" if user.base_resume_path else "needs_user_action",
+                "Resume intake state loaded.",
+                trace=trace,
+                artifacts={
+                    "base_resume": _base_resume_metadata(user),
+                    "profile": _profile_payload(user),
+                    "preferences": _preferences_payload(preferences),
+                    "missing_questions": _missing_profile_questions(user, preferences, answers),
+                    "latex_template_available": bool(user.latex_template_source),
+                },
+                next_actions=["answer_missing_questions"] if user.base_resume_path else ["upload_resume"],
+            )
+        return _save_agent_result(db, result, input_summary)
+
+    if not user or not preferences:
+        result = _agent_result_from_catalog(
+            agent_key,
+            "needs_user_action",
+            "Upload a resume before running this agent.",
+            trace=trace,
+            next_actions=["upload_resume"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "find_job":
+        discovery = _discovery_preferences_for(db, user)
+        plans = LinkedInAssistAgent().build_search_plans(
+            preferences=preferences,
+            keywords=discovery.keywords or None,
+            location=discovery.location,
+            date_since_posted=discovery.date_since_posted,
+            work_mode=discovery.work_mode,
+            easy_apply=discovery.easy_apply,
+            limit=discovery.limit,
+        )
+        trace.append(catalog_agent.step("generate_search_links", "completed", f"Prepared {len(plans)} supervised search plan(s)."))
+        result = _agent_result_from_catalog(
+            agent_key,
+            "completed",
+            "Search plans are ready. Run supervised import or open the links in a visible browser.",
+            trace=trace,
+            artifacts={
+                "preferences": _discovery_preferences_payload(discovery),
+                "plans": [plan.__dict__ for plan in plans],
+                "checklist": LinkedInAssistAgent().application_checklist(user),
+            },
+            next_actions=["supervised_import", "open_search_links", "import_visible_job"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "job_import":
+        if not latest_job:
+            result = _agent_result_from_catalog(
+                agent_key,
+                "needs_user_action",
+                "Import a visible job page before the Job Import Agent can continue.",
+                trace=trace,
+                next_actions=["open_page_import", "supervised_import"],
+            )
+        else:
+            trace.append(catalog_agent.step("load_job", "completed", f"Loaded job {latest_job.id}."))
+            result = _agent_result_from_catalog(
+                agent_key,
+                "completed",
+                "Visible job data is saved and ready for scoring.",
+                trace=trace,
+                artifacts={"job": _job_artifact(latest_job), "description_preview": (latest_job.description or "")[:2000]},
+                next_actions=["score_job"],
+            )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "match_scorer":
+        if not latest_job:
+            result = _agent_result_from_catalog(agent_key, "needs_user_action", "Import a job before scoring.", trace=trace, next_actions=["import_visible_job"])
+            return _save_agent_result(db, result, input_summary)
+        score = JobMatchingAgent().score(user, preferences, latest_job)
+        threshold = _configured_match_threshold(preferences)
+        latest_job.match_score = score.score
+        latest_job.score_reasons = score.reasons
+        latest_job.score_concerns = score.concerns
+        latest_job.status = "Shortlisted for review" if score.score >= threshold and "Blocked" not in score.recommendation else "Found"
+        trace.append(catalog_agent.step("score_base_resume", "completed", f"Base resume scored {score.score}/100.", {"threshold": threshold}))
+        result = _agent_result_from_catalog(
+            agent_key,
+            "completed",
+            f"Base resume scored {score.score}/100 for {latest_job.title}.",
+            trace=trace,
+            artifacts={
+                "job": _job_artifact(latest_job),
+                "threshold": threshold,
+                "score": score.score,
+                "recommendation": score.recommendation,
+                "reasons": score.reasons,
+                "concerns": score.concerns,
+            },
+            next_actions=["build_resume", "review_score"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "resume_builder":
+        if not latest_job:
+            result = _agent_result_from_catalog(agent_key, "needs_user_action", "Import and score a job before building a resume.", trace=trace, next_actions=["import_visible_job"])
+            return _save_agent_result(db, result, input_summary)
+        safety = SafetyComplianceAgent().evaluate_job(user, preferences, latest_job)
+        if not safety.allowed and not payload.force:
+            trace.append(catalog_agent.step("safety_check", "needs_user_action", "Safety settings blocked automatic resume tailoring.", {"blocks": safety.blocks}))
+            result = _agent_result_from_catalog(
+                agent_key,
+                "needs_user_action",
+                "Safety settings blocked automatic resume tailoring. Review the job and run with force only if you approve.",
+                trace=trace,
+                artifacts={"job": _job_artifact(latest_job), "safety_blocks": safety.blocks},
+                next_actions=["review_job", "force_build_resume"],
+                errors=safety.blocks,
+            )
+            return _save_agent_result(db, result, input_summary)
+        version, score_payload = _tailor_and_rescore_job(db, user=user, preferences=preferences, job=latest_job)
+        application = _application_for_job(db, user, latest_job)
+        application.resume_version_id = version.id
+        application.status = "Resume tailored"
+        trace.append(
+            catalog_agent.step(
+                "build_resume",
+                "completed",
+                f"Prepared resume version {version.id}; score {score_payload['original_match_score']}->{score_payload['tailored_resume_score']}.",
+                {"resume_version_id": version.id, "score_delta": score_payload["score_delta"]},
+            )
+        )
+        lab = _resume_lab_payload(db, user=user, preferences=preferences, job=latest_job)
+        result = _agent_result_from_catalog(
+            agent_key,
+            "completed",
+            "Resume version is ready for review.",
+            trace=trace,
+            artifacts={
+                "job": _job_artifact(latest_job),
+                "resume_version": _resume_version_payload(db, version, user=user, job=latest_job, selected=True),
+                "comparison": score_payload,
+                "lab": lab,
+            },
+            next_actions=["preview_diff", "queue_selected_resume"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "resume_reviewer":
+        version = db.get(ResumeVersion, payload.resume_version_id) if payload.resume_version_id else None
+        if not version and latest_job:
+            version = _latest_resume_for_job(db, user, latest_job)
+        if not version:
+            result = _agent_result_from_catalog(agent_key, "needs_user_action", "Build or select a resume version before review.", trace=trace, next_actions=["build_resume"])
+            return _save_agent_result(db, result, input_summary)
+        preview = _resume_preview_payload(db, version)
+        trace.append(catalog_agent.step("preview_diff", "completed", f"Prepared diff for resume version {version.id}."))
+        result = _agent_result_from_catalog(
+            agent_key,
+            "completed",
+            "Before/after resume preview is ready.",
+            trace=trace,
+            artifacts={"preview": preview, "resume_version": preview["version"]},
+            next_actions=["approve_resume", "refine_resume", "download_pdf"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "question_agent":
+        answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.user_id == user.id)).all()
+        questions: list[dict] = []
+        packet_answers: list = []
+        if latest_job:
+            packet = ApplicationPacketAgent().prepare(user, latest_job, None, None, answers)
+            packet_answers = packet.packet["answers"]
+            questions = [
+                {"question": item.replace("Missing approved answer for: ", ""), "status": "missing"}
+                for item in packet.missing_items
+                if item.startswith("Missing approved answer for:")
+            ]
+        profile_missing = _missing_profile_questions(user, preferences, answers)
+        trace.append(catalog_agent.step("detect_missing_questions", "completed", f"Found {len(profile_missing) + len(questions)} missing question(s)."))
+        status = "needs_user_action" if profile_missing or questions else "completed"
+        result = _agent_result_from_catalog(
+            agent_key,
+            status,
+            "Some questions need approved answers." if status == "needs_user_action" else "Approved answers are ready for reuse.",
+            trace=trace,
+            artifacts={"profile_missing_questions": profile_missing, "job_questions": questions, "saved_answers": packet_answers},
+            next_actions=["answer_questions"] if status == "needs_user_action" else ["review_kb"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "apply_agent":
+        task = db.get(ApplyQueueTask, payload.task_id) if payload.task_id else _latest_apply_task_for_user(db, user, latest_job)
+        if task and (payload.start_browser or payload.action in {"start", "resume"}):
+            action_payload = ApplyQueueActionIn(user_id=user.id, wait_seconds=payload.wait_seconds)
+            run_payload = _run_apply_task(task.id, action_payload, db, resume_existing=payload.action == "resume")
+            trace.append(catalog_agent.step("supervised_browser", run_payload["status"], run_payload["message"], {"task_id": task.id}))
+            result = _agent_result_from_catalog(
+                agent_key,
+                run_payload["status"],
+                run_payload["message"],
+                trace=trace + normalize_trace(run_payload["task"].get("trace", [])),
+                artifacts=run_payload,
+                next_actions=["answer_questions", "resume"] if run_payload["status"] == "needs_answers" else ["mark_submitted"] if run_payload["status"] == "ready_for_submit" else ["debug_task"],
+                errors=run_payload.get("errors", []),
+            )
+            return _save_agent_result(db, result, input_summary)
+        if not latest_job:
+            result = _agent_result_from_catalog(agent_key, "needs_user_action", "Import and review a job before building the apply queue.", trace=trace, next_actions=["import_visible_job"])
+            return _save_agent_result(db, result, input_summary)
+        if not task:
+            queue_payload = ApplyQueueBuildIn(
+                user_id=user.id,
+                job_ids=[latest_job.id],
+                max_items=1,
+                force=payload.force,
+                resume_version_id=payload.resume_version_id,
+            )
+            queue_result = build_apply_queue(queue_payload, db)
+            task = db.get(ApplyQueueTask, queue_result["tasks"][0]["id"]) if queue_result["tasks"] else None
+            trace.append(catalog_agent.step("build_queue", "completed" if task else "needs_user_action", queue_result["message"], {"skipped": queue_result["skipped"]}))
+            result = _agent_result_from_catalog(
+                agent_key,
+                "ready" if task else "needs_user_action",
+                "Apply queue item is ready. Start the visible browser when you approve." if task else "No apply queue item was created.",
+                trace=trace,
+                artifacts=queue_result,
+                next_actions=["start_supervised_apply"] if task else ["review_skipped_jobs"],
+            )
+            return _save_agent_result(db, result, input_summary)
+        trace.append(catalog_agent.step("load_task", "completed", f"Loaded apply task {task.id}."))
+        result = _agent_result_from_catalog(
+            agent_key,
+            "ready" if task.status == "queued" else task.status,
+            "Apply task is ready. Start supervised browser apply when you approve.",
+            trace=trace,
+            artifacts={"task": _apply_queue_task_payload(db, task)},
+            next_actions=["start_supervised_apply", "debug_task"],
+        )
+        return _save_agent_result(db, result, input_summary)
+
+    if agent_key == "tracker_agent":
+        task = db.get(ApplyQueueTask, payload.task_id) if payload.task_id else _latest_apply_task_for_user(db, user, latest_job)
+        if task and payload.action == "mark_submitted":
+            marked = mark_apply_queue_submitted(task.id, ApplyQueueActionIn(user_id=user.id), db)
+            trace.append(catalog_agent.step("mark_submitted", "completed", "User-confirmed submission was recorded.", {"task_id": task.id}))
+            result = _agent_result_from_catalog(
+                agent_key,
+                "completed",
+                "Application marked submitted by user confirmation.",
+                trace=trace,
+                artifacts=marked,
+                next_actions=["track_follow_up"],
+            )
+        else:
+            application = _latest_application_for_user(db, user, latest_job)
+            result = _agent_result_from_catalog(
+                agent_key,
+                "needs_user_action" if application else "not_started",
+                "Confirm submission manually before the tracker marks this applied." if application else "No application exists yet.",
+                trace=trace,
+                artifacts={
+                    "application": {
+                        "id": application.id,
+                        "status": application.status,
+                        "applied_at": application.applied_at,
+                        "resume_version_id": application.resume_version_id,
+                    }
+                    if application
+                    else None,
+                    "task": _apply_queue_task_payload(db, task) if task else None,
+                },
+                next_actions=["mark_submitted"] if application else ["build_queue"],
+            )
+        return _save_agent_result(db, result, input_summary)
+
+    result = catalog_agent.run(context)
+    return _save_agent_result(db, result, input_summary)
+
+
+def _next_safe_agent_from_status(status_payload: dict) -> str:
+    for key in ["resume_intake", "find_job", "job_import", "match_scorer", "resume_builder", "resume_reviewer", "question_agent", "apply_agent", "tracker_agent"]:
+        lane = next((item for item in status_payload["lanes"] if item["key"] == key), None)
+        if not lane:
+            continue
+        if lane["status"] in {"ready", "needs_user_action", "not_started"}:
+            return key
+    return "tracker_agent"
+
+
+@router.get("/agents/catalog")
+def agents_catalog() -> dict:
+    return {
+        "agents": agent_catalog(),
+        "auto_submit": False,
+        "safety": {
+            "browser_mode": "visible_supervised",
+            "password_storage": "none",
+            "captcha_bypass": False,
+            "final_submit": "user_only",
+        },
+    }
+
+
+@router.get("/agents/pipeline/status")
+def agents_pipeline_status(db: Session = Depends(get_db)) -> dict:
+    return _pipeline_status_payload(db)
+
+
+@router.post("/agents/pipeline/run")
+def agents_pipeline_run(payload: AgentRunIn | None = None, db: Session = Depends(get_db)) -> dict:
+    payload = payload or AgentRunIn()
+    if payload.action in agent_keys():
+        agent_key = payload.action
+    else:
+        status_payload = _pipeline_status_payload(db)
+        agent_key = _next_safe_agent_from_status(status_payload)
+
+    if agent_key == "apply_agent":
+        # Running the whole pipeline should never surprise-open a browser. The Apply
+        # Agent only launches Playwright when its own endpoint receives start_browser.
+        payload.start_browser = False
+        payload.action = None
+    result = _run_agent_result(agent_key, payload, db)
+    return {"selected_agent": agent_key, "result": result, "pipeline": _pipeline_status_payload(db), "auto_submit": False}
+
+
+@router.get("/agents/runs/{run_id}")
+def agents_run_detail(run_id: int, db: Session = Depends(get_db)) -> dict:
+    run = db.get(AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found.")
+    return _agent_run_payload(run)
+
+
+@router.post("/agents/{agent_key}/run")
+def agents_run(agent_key: str, payload: AgentRunIn | None = None, db: Session = Depends(get_db)) -> dict:
+    return _run_agent_result(agent_key, payload or AgentRunIn(), db)
 
 
 @router.post("/onboarding/profile")
@@ -939,7 +1964,15 @@ def update_resume_profile(payload: ResumeProfileUpdateIn, db: Session = Depends(
 def import_job(payload: JobImportIn, db: Session = Depends(get_db)) -> dict:
     existing = db.scalar(select(Job).where(Job.job_url == str(payload.job_url)))
     if existing:
-        return {"job_id": existing.id, "deduped": True, "message": "Job already exists."}
+        user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
+        score_result = _score_job_for_user(db, user, existing)
+        db.commit()
+        return {
+            "job_id": existing.id,
+            "deduped": True,
+            "message": "Job already exists.",
+            "match_score": score_result.score if score_result else existing.match_score,
+        }
     job = Job(
         title=payload.title or "Imported Role",
         company=payload.company or "Unknown Company",
@@ -959,9 +1992,17 @@ def import_job(payload: JobImportIn, db: Session = Depends(get_db)) -> dict:
         deadline=payload.deadline,
     )
     db.add(job)
+    db.flush()
+    user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
+    score_result = _score_job_for_user(db, user, job)
     db.commit()
     db.refresh(job)
-    return {"job_id": job.id, "deduped": False, "message": "Job imported for review."}
+    return {
+        "job_id": job.id,
+        "deduped": False,
+        "message": "Job imported for review.",
+        "match_score": score_result.score if score_result else job.match_score,
+    }
 
 
 @router.post("/jobs/search")
@@ -975,9 +2016,11 @@ def search_jobs(payload: JobSearchIn, db: Session = Depends(get_db)) -> dict:
     searcher = JobSearchAgent()
     discovered = searcher.search_public_career_page(str(payload.company_career_url), payload.query)
     created = []
+    user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
     for item in discovered:
         existing = db.scalar(select(Job).where(Job.job_url == item.job_url))
         if existing:
+            _score_job_for_user(db, user, existing)
             created.append({"job_id": existing.id, "title": existing.title, "deduped": True})
             continue
         job = Job(
@@ -992,6 +2035,7 @@ def search_jobs(payload: JobSearchIn, db: Session = Depends(get_db)) -> dict:
         )
         db.add(job)
         db.flush()
+        _score_job_for_user(db, user, job)
         created.append({"job_id": job.id, "title": job.title, "deduped": False})
     db.commit()
     return {"jobs": created, "message": "Public career page search completed."}
@@ -1136,9 +2180,17 @@ def linkedin_supervised_import(payload: LinkedInSupervisedImportIn, db: Session 
 @router.post("/linkedin/assist/import-visible")
 def linkedin_import_visible(payload: LinkedInImportIn, db: Session = Depends(get_db)) -> dict:
     parsed = LinkedInAssistAgent().parse_visible_job_text(payload.visible_text)
+    user = db.get(User, payload.user_id) if payload.user_id else db.scalar(select(User).order_by(User.id.desc()))
     existing = db.scalar(select(Job).where(Job.job_url == str(payload.job_url)))
     if existing:
-        return {"job_id": existing.id, "deduped": True, "message": "LinkedIn job already exists."}
+        score_result = _score_job_for_user(db, user, existing)
+        db.commit()
+        return {
+            "job_id": existing.id,
+            "deduped": True,
+            "message": "LinkedIn job already exists.",
+            "match_score": score_result.score if score_result else existing.match_score,
+        }
     job = Job(
         title=parsed["title"],
         company=parsed["company"],
@@ -1151,12 +2203,15 @@ def linkedin_import_visible(payload: LinkedInImportIn, db: Session = Depends(get
         status="Found",
     )
     db.add(job)
+    db.flush()
+    score_result = _score_job_for_user(db, user, job)
     db.commit()
     db.refresh(job)
     return {
         "job_id": job.id,
         "deduped": False,
         "message": "LinkedIn visible job data imported for review.",
+        "match_score": score_result.score if score_result else job.match_score,
         "parsed": parsed,
     }
 
@@ -1348,10 +2403,11 @@ def score_job(job_id: int, user_id: int | None = None, db: Session = Depends(get
     preferences = _preferences_for(db, user)
     job = _job_or_404(db, job_id)
     result = JobMatchingAgent().score(user, preferences, job)
+    threshold = _configured_match_threshold(preferences)
     job.match_score = result.score
     job.score_reasons = result.reasons
     job.score_concerns = result.concerns
-    job.status = "Shortlisted for review" if result.score >= 60 and "Blocked" not in result.recommendation else "Found"
+    job.status = "Shortlisted for review" if result.score >= threshold and "Blocked" not in result.recommendation else "Found"
     if result.recommendation == "Blocked by safety rules":
         db.add(
             SafetyEvent(
@@ -1400,6 +2456,13 @@ def tailor_resume(job_id: int, user_id: int | None = None, db: Session = Depends
             resume_text=_tailored_resume_text(reusable, user.base_resume_text or ""),
             metadata=metadata,
         )
+        _persist_resume_score_report(
+            reusable,
+            score_payload,
+            threshold=_configured_match_threshold(preferences),
+            base_reasons=score_result.reasons,
+            base_concerns=score_result.concerns,
+        )
         job.match_score = max(score_result.score, score_payload["tailored_resume_score"])
         job.status = "Resume tailored"
         db.commit()
@@ -1436,9 +2499,16 @@ def tailor_resume(job_id: int, user_id: int | None = None, db: Session = Depends
         truthfulness_status="passed",
     )
     db.add(version)
+    db.flush()
+    _persist_resume_score_report(
+        version,
+        score_payload,
+        threshold=_configured_match_threshold(preferences),
+        base_reasons=score_result.reasons,
+        base_concerns=score_result.concerns,
+    )
     job.match_score = max(score, score_payload["tailored_resume_score"])
     job.status = "Resume tailored"
-    db.flush()
     application = db.scalar(select(Application).where(Application.user_id == user.id, Application.job_id == job.id))
     if not application:
         application = Application(
@@ -1569,6 +2639,13 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
     )
     db.add(version)
     db.flush()
+    _persist_resume_score_report(
+        version,
+        score_payload,
+        threshold=threshold,
+        base_reasons=score.reasons,
+        base_concerns=score.concerns,
+    )
     application.resume_version_id = version.id
     application.status = "Resume tailored"
     job.match_score = max(score.score, score_payload["tailored_resume_score"])
@@ -1597,6 +2674,93 @@ def decide_resume_for_job(job_id: int, user_id: int | None = None, db: Session =
         "concerns": score.concerns,
         "tex_path": str(tailored.tex_path) if tailored.tex_path else None,
         **score_payload,
+    }
+
+
+@router.get("/jobs/{job_id}/resume-lab")
+def resume_lab(job_id: int, user_id: int | None = None, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, user_id) if user_id else _default_user(db)
+    preferences = _preferences_for(db, user)
+    job = _job_or_404(db, job_id)
+    payload = _resume_lab_payload(db, user=user, preferences=preferences, job=job)
+    db.commit()
+    return payload
+
+
+@router.post("/jobs/{job_id}/refine-resume")
+def refine_resume_for_job(job_id: int, payload: ResumeRefineIn, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, payload.user_id) if payload.user_id else _default_user(db)
+    preferences = _preferences_for(db, user)
+    job = _job_or_404(db, job_id)
+    threshold = _configured_match_threshold(preferences)
+    base_score = JobMatchingAgent().score(user, preferences, job)
+    job.match_score = base_score.score
+    job.score_reasons = base_score.reasons
+    job.score_concerns = base_score.concerns
+
+    suffix = f"refine-{datetime.now().strftime('%H%M%S%f')}" if payload.force_new_version else "refine"
+    tailored = ResumeTailoringAgent().tailor(
+        user,
+        job,
+        base_score.score,
+        manual_instructions=payload.instructions,
+        resume_id_suffix=suffix,
+    )
+    score_payload = _score_tailored_resume_payload(
+        user=user,
+        preferences=preferences,
+        job=job,
+        original_score=base_score.score,
+        resume_text=_tailored_resume_text(tailored, user.base_resume_text or ""),
+        metadata=tailored.metadata,
+    )
+    version = ResumeVersion(
+        user_id=user.id,
+        company=job.company,
+        role=job.title,
+        job_id=job.id,
+        file_path=str(tailored.pdf_path),
+        docx_path=str(tailored.docx_path),
+        pdf_path=str(tailored.pdf_path),
+        tex_path=str(tailored.tex_path) if tailored.tex_path else None,
+        metadata_path=str(tailored.metadata_path),
+        skills_emphasized=tailored.skills_emphasized,
+        similarity_group="-".join(tailored.skills_emphasized[:4]) or None,
+        truthfulness_status="passed",
+    )
+    db.add(version)
+    db.flush()
+    _persist_resume_score_report(
+        version,
+        score_payload,
+        threshold=threshold,
+        base_reasons=base_score.reasons,
+        base_concerns=base_score.concerns,
+    )
+
+    application = _application_for_job(db, user, job)
+    application.resume_version_id = version.id
+    application.status = "Resume tailored"
+    job.match_score = max(base_score.score, score_payload["tailored_resume_score"])
+    job.status = "Resume tailored"
+    db.add(
+        AgentRun(
+            agent_name="Resume Refinement Agent",
+            input_summary=f"job_id={job.id}",
+            output_summary=(
+                f"Created resume version {version.id}; score "
+                f"{base_score.score}->{score_payload['tailored_resume_score']}"
+            ),
+        )
+    )
+    lab = _resume_lab_payload(db, user=user, preferences=preferences, job=job)
+    db.commit()
+    return {
+        "message": "Created a refined LaTeX-backed resume version and rescored it.",
+        "resume_version_id": version.id,
+        "version": _resume_version_payload(db, version, user=user, job=job, selected=True),
+        "comparison": score_payload,
+        "lab": lab,
     }
 
 
@@ -1638,14 +2802,16 @@ def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db))
     for job in jobs:
         if len(queued) >= max_items:
             break
-        if not _is_linkedin_job(job):
-            skipped.append({"job_id": job.id, "reason": "not_linkedin"})
+        if not (job.apply_url or job.job_url):
+            skipped.append({"job_id": job.id, "reason": "missing_apply_url"})
             continue
         if job.match_score is None:
             score = JobMatchingAgent().score(user, preferences, job)
             job.match_score = score.score
             job.score_reasons = score.reasons
             job.score_concerns = score.concerns
+        else:
+            score = None
         below_threshold = (job.match_score or 0) < threshold
         if below_threshold and not payload.force:
             before_score = job.match_score or 0
@@ -1683,7 +2849,19 @@ def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db))
                 continue
 
         application = _application_for_job(db, user, job)
-        version = _latest_resume_for_job(db, user, job)
+        selected_version = None
+        if payload.resume_version_id and len(jobs) == 1:
+            selected_version = db.get(ResumeVersion, payload.resume_version_id)
+            if not selected_version or selected_version.user_id != user.id:
+                skipped.append({"job_id": job.id, "reason": "selected_resume_not_found"})
+                continue
+            if selected_version.job_id not in {None, job.id}:
+                reusable = ResumeTailoringAgent().find_reusable([selected_version], job)
+                if not reusable:
+                    skipped.append({"job_id": job.id, "reason": "selected_resume_not_reusable_for_job"})
+                    continue
+            application.resume_version_id = selected_version.id
+        version = selected_version or _latest_resume_for_job(db, user, job)
         if version and not application.resume_version_id:
             application.resume_version_id = version.id
         existing = db.scalar(
@@ -1696,6 +2874,17 @@ def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db))
             .order_by(ApplyQueueTask.created_at.desc())
         )
         if existing:
+            if selected_version:
+                existing.resume_version_id = selected_version.id
+                application.resume_version_id = selected_version.id
+                existing.message = "Updated queued task to use the selected resume version."
+                _trace_task(
+                    existing,
+                    "select_resume",
+                    "completed",
+                    f"Updated queued task to use resume version {selected_version.id}.",
+                    {"resume_version_id": selected_version.id},
+                )
             queued.append(existing)
             continue
 
@@ -1705,23 +2894,58 @@ def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db))
             application_id=application.id,
             resume_version_id=application.resume_version_id,
             status="queued",
-            source="linkedin_easy_apply",
-            message="Queued for supervised LinkedIn Easy Apply.",
+            source="linkedin_easy_apply" if _is_linkedin_job(job) else "external_supervised_apply",
+            message=(
+                "Queued for supervised LinkedIn Easy Apply with external fallback."
+                if _is_linkedin_job(job)
+                else "Queued for supervised external-site apply."
+            ),
             auto_submit=False,
         )
         db.add(task)
         db.flush()
+        _trace_task(
+            task,
+            "score_job",
+            "completed",
+            f"Job score is {job.match_score}; threshold is {threshold}.",
+            {
+                "match_score": job.match_score,
+                "threshold": threshold,
+                "scored_now": score is not None,
+                "below_threshold": below_threshold,
+            },
+        )
+        _trace_task(
+            task,
+            "select_apply_mode",
+            "completed",
+            "Selected LinkedIn Easy Apply with external fallback." if _is_linkedin_job(job) else "Selected supervised external-site apply.",
+            {"source": task.source, "job_url": job.job_url, "apply_url": job.apply_url},
+        )
         try:
             task.status = "preparing_resume"
             resume_path = _ensure_queue_resume(db, user=user, preferences=preferences, job=job, application=application, task=task)
+            _trace_task(
+                task,
+                "prepare_resume",
+                "completed",
+                f"Prepared resume at {resume_path}.",
+                {"resume_path": str(resume_path), "resume_version_id": task.resume_version_id},
+            )
             task.status = "queued"
-            notes = ["Resume is ready. Start supervised browser apply when ready."]
+            notes = [
+                "Resume is ready. Start supervised browser apply when ready."
+                if _is_linkedin_job(job)
+                else "Resume is ready. Start supervised external-site apply when ready."
+            ]
             if below_threshold and payload.force:
                 notes.append(f"Queued manually even though score {job.match_score} is below threshold {threshold}.")
             if task.resume_version_id:
-                notes.append("Prepared PDF from the LaTeX-backed resume version.")
-                if not latex_compiler_available():
-                    notes.append("No local LaTeX compiler was found, so SeekApply used the styled PDF fallback.")
+                queued_version = db.get(ResumeVersion, task.resume_version_id)
+                metadata = _resume_version_metadata(queued_version.metadata_path if queued_version else None)
+                notes.append("Prepared PDF from the selected LaTeX-backed resume version.")
+                notes.append(_pdf_generation_note(metadata))
             elif resume_path == (Path(user.base_resume_path).expanduser() if user.base_resume_path else None):
                 notes.append("Using the uploaded base PDF because no LaTeX template is available.")
             task.message = " ".join(notes)
@@ -1730,18 +2954,19 @@ def build_apply_queue(payload: ApplyQueueBuildIn, db: Session = Depends(get_db))
             task.status = "failed"
             task.message = "Could not prepare resume for supervised apply."
             task.last_error = str(exc)
+            _trace_task(task, "prepare_resume", "failed", "Could not prepare resume for supervised apply.", {"error": str(exc)})
         queued.append(task)
 
     db.add(
         AgentRun(
             agent_name="Apply Queue Builder",
             input_summary=f"user_id={user.id}, job_ids={payload.job_ids or 'auto'}",
-            output_summary=f"Queued {len(queued)} LinkedIn job(s); skipped {len(skipped)}.",
+            output_summary=f"Queued {len(queued)} supervised apply job(s); skipped {len(skipped)}.",
         )
     )
     db.commit()
     return {
-        "message": f"Queued {len(queued)} LinkedIn job(s) for supervised apply.",
+        "message": f"Queued {len(queued)} job(s) for supervised apply.",
         "threshold": threshold,
         "tasks": [_apply_queue_task_payload(db, task) for task in queued],
         "skipped": skipped,
@@ -1758,6 +2983,56 @@ def list_apply_queue(user_id: int | None = None, db: Session = Depends(get_db)) 
     return {"tasks": [_apply_queue_task_payload(db, task) for task in tasks], "auto_submit": False}
 
 
+@router.get("/apply-queue/{task_id}/debug")
+def debug_apply_queue_task(task_id: int, user_id: int | None = None, db: Session = Depends(get_db)) -> dict:
+    task = db.get(ApplyQueueTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Apply queue task not found.")
+    user = db.get(User, user_id) if user_id else db.get(User, task.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Apply queue user not found.")
+    job = _job_or_404(db, task.job_id)
+    application = db.get(Application, task.application_id) if task.application_id else None
+    resume = db.get(ResumeVersion, task.resume_version_id) if task.resume_version_id else None
+    metadata = _resume_version_metadata(resume.metadata_path if resume else None)
+    diagnosis = []
+    if task.status == "needs_login":
+        diagnosis.append("Login/CAPTCHA/verification is blocking the browser agent. Complete it in the visible browser, then Resume.")
+    if task.status == "needs_answers":
+        diagnosis.append("The portal asked questions that do not have approved KB answers yet.")
+    if task.status == "needs_user_action":
+        diagnosis.append("The portal was opened but has unsupported or ambiguous controls; continue manually in the visible browser.")
+    if task.status == "failed" and task.last_error:
+        diagnosis.append(task.last_error)
+    if not diagnosis:
+        diagnosis.append("No active blocker detected from the queue task state.")
+    return {
+        "task": _apply_queue_task_payload(db, task),
+        "job_debug": _job_debug_payload(db, user, job),
+        "application": {
+            "id": application.id,
+            "status": application.status,
+            "resume_version_id": application.resume_version_id,
+            "applied_at": application.applied_at,
+        }
+        if application
+        else None,
+        "resume": _resume_version_payload(db, resume, user=user, job=job) if resume else None,
+        "resume_metadata": metadata,
+        "trace": normalize_trace(task.steps or []),
+        "fill_report": task.fill_report or {},
+        "diagnosis": diagnosis,
+        "agent_runs": _debug_agent_runs(db, job_id=job.id, task_id=task.id),
+    }
+
+
+@router.get("/jobs/{job_id}/debug")
+def debug_job(job_id: int, user_id: int | None = None, db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, user_id) if user_id else _default_user(db)
+    job = _job_or_404(db, job_id)
+    return _job_debug_payload(db, user, job)
+
+
 def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, resume_existing: bool = False) -> dict:
     task = db.get(ApplyQueueTask, task_id)
     if not task:
@@ -1770,11 +3045,41 @@ def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, r
     application = db.get(Application, task.application_id) if task.application_id else _application_for_job(db, user, job)
     task.application_id = application.id
     task.status = "opening_browser"
-    task.message = "Opening supervised LinkedIn Easy Apply browser."
+    task.message = (
+        "Opening supervised LinkedIn Easy Apply browser."
+        if _is_linkedin_job(job)
+        else "Opening supervised external application browser."
+    )
+    _trace_task(
+        task,
+        "start_apply",
+        "running",
+        task.message,
+        {"resume_existing": resume_existing, "source": task.source, "job_url": job.job_url, "apply_url": job.apply_url},
+    )
     db.flush()
 
     resume_path = _ensure_queue_resume(db, user=user, preferences=preferences, job=job, application=application, task=task)
+    _trace_task(
+        task,
+        "prepare_resume",
+        "completed",
+        f"Using resume file {resume_path}.",
+        {"resume_path": str(resume_path), "resume_version_id": task.resume_version_id},
+    )
     answers = db.scalars(select(ApplicationAnswer).where(ApplicationAnswer.user_id == user.id)).all()
+    approved_answer_count = sum(
+        1
+        for answer in answers
+        if answer.approved and answer.answer_text.strip() and answer.answer_text != "[NEEDS HUMAN REVIEW]"
+    )
+    _trace_task(
+        task,
+        "load_answers",
+        "completed",
+        f"Loaded {approved_answer_count} approved reusable answer(s).",
+        {"approved_answers": approved_answer_count, "total_answers": len(answers)},
+    )
     result = SupervisedLinkedInApplyAgent(get_settings().resolved_storage_root).start(
         task_id=task.id,
         user=user,
@@ -1790,7 +3095,19 @@ def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, r
     task.message = result.message
     task.missing_questions = result.missing_questions
     task.fill_report = result.fill_report
-    task.steps = result.steps
+    _trace_task(
+        task,
+        "browser_agent",
+        result.status,
+        result.message,
+        {
+            "browser_steps": result.steps,
+            "errors": result.errors,
+            "missing_questions": result.missing_questions,
+            "fill_report": result.fill_report,
+            "action_required": result.action_required,
+        },
+    )
     task.last_error = "; ".join(result.errors) if result.errors else None
     task.auto_submit = False
     if result.status == "ready_for_submit":
@@ -1798,12 +3115,14 @@ def _run_apply_task(task_id: int, payload: ApplyQueueActionIn, db: Session, *, r
     elif result.status == "needs_answers":
         application.status = "Needs application answers"
     elif result.status == "needs_login":
-        application.status = "Needs LinkedIn login"
+        application.status = "Needs application login"
+    elif result.status == "needs_user_action":
+        application.status = "Needs user action"
     elif result.status == "failed":
         application.status = "Supervised apply failed"
     db.add(
         AgentRun(
-            agent_name="Supervised LinkedIn Easy Apply",
+            agent_name="Supervised Apply",
             input_summary=f"task_id={task.id}, job_id={job.id}",
             output_summary=result.message,
             status=result.status,
@@ -1848,12 +3167,12 @@ def mark_apply_queue_submitted(task_id: int, payload: ApplyQueueActionIn | None 
     if not application.applied_at:
         application.applied_at = datetime.utcnow()
     task.status = "submitted_by_user"
-    task.message = "User confirmed the LinkedIn application was submitted manually."
+    task.message = "User confirmed the application was submitted manually."
     task.auto_submit = False
     SupervisedLinkedInApplyAgent(get_settings().resolved_storage_root).close(task.id)
     db.add(
         AgentRun(
-            agent_name="Supervised LinkedIn Easy Apply",
+            agent_name="Supervised Apply",
             input_summary=f"task_id={task.id}, job_id={job.id}",
             output_summary="User marked application as submitted.",
             status="submitted_by_user",
@@ -1871,7 +3190,7 @@ def auto_apply_job(job_id: int, db: Session = Depends(get_db)) -> dict:
     return {
         **result,
         "status": "queued_for_supervised_apply" if result["tasks"] else "not_queued",
-        "message": "Job was queued for supervised LinkedIn Easy Apply. Start it from Apply Queue.",
+        "message": "Job was queued for supervised apply. Start it from Apply Queue.",
         "auto_submit": False,
     }
 
@@ -2169,17 +3488,7 @@ def resume_versions(db: Session = Depends(get_db)) -> dict:
     versions = db.scalars(select(ResumeVersion).order_by(ResumeVersion.created_at.desc())).all()
     return {
         "resume_versions": [
-            {
-                "id": version.id,
-                "company": version.company,
-                "role": version.role,
-                "docx_path": version.docx_path,
-                "pdf_path": version.pdf_path,
-                "metadata_path": version.metadata_path,
-                "skills_emphasized": version.skills_emphasized,
-                "truthfulness_status": version.truthfulness_status,
-                "created_at": version.created_at,
-            }
+            _resume_version_payload(db, version)
             for version in versions
         ]
     }
@@ -2237,6 +3546,14 @@ def download_resume_tex(version_id: int, db: Session = Depends(get_db)) -> FileR
         media_type="application/x-tex",
         filename=filename,
     )
+
+
+@router.get("/resume-versions/{version_id}/preview")
+def preview_resume_version(version_id: int, db: Session = Depends(get_db)) -> dict:
+    version = db.get(ResumeVersion, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Resume version not found.")
+    return _resume_preview_payload(db, version)
 
 
 @router.get("/jobs")

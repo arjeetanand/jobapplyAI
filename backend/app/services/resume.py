@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,13 +166,23 @@ class ResumeTailoringAgent:
     def __init__(self, storage_root: Path | None = None) -> None:
         self.storage_root = storage_root or get_settings().resolved_storage_root
 
-    def tailor(self, user: User, job: Job, match_score: int) -> TailoredResume:
+    def tailor(
+        self,
+        user: User,
+        job: Job,
+        match_score: int,
+        *,
+        manual_instructions: str | None = None,
+        resume_id_suffix: str | None = None,
+    ) -> TailoredResume:
+        latex_template_source = self._latex_template_source(user)
         verified_skills = self._verified_resume_skills(user)
         job_keywords = self._job_keywords(job)
         overlap, missing = keyword_overlap(verified_skills, job_keywords)
-        emphasized = self._emphasized_verified_skills(verified_skills, job)
+        requested_focus = self._requested_focus_skills(verified_skills, manual_instructions)
+        emphasized = self._dedupe_skills([*requested_focus, *self._emphasized_verified_skills(verified_skills, job)])[:12]
         recommended_projects = self._recommended_projects(missing)
-        resume_id = self._resume_id(job)
+        resume_id = self._resume_id(job, resume_id_suffix)
         version_dir = self.storage_root / "resume_versions"
         metadata_dir = self.storage_root / "metadata"
         docx_path = version_dir / f"{resume_id}.docx"
@@ -181,7 +192,7 @@ class ResumeTailoringAgent:
         # --- Try LLM tailoring first ---
         ai_generated = False
         paragraphs: list[str] = []
-        if not getattr(user, "latex_template_source", None):
+        if not latex_template_source:
             try:
                 from app.services.oci_genai import OCIGenerativeAIProvider
                 provider = OCIGenerativeAIProvider()
@@ -195,7 +206,7 @@ class ResumeTailoringAgent:
                 logger.warning("AI tailoring failed, using template fallback: %s", exc)
 
         if not paragraphs:
-            paragraphs = self._build_resume_text(user, job, emphasized, recommended_projects)
+            paragraphs = self._build_resume_text(user, job, emphasized, recommended_projects, manual_instructions)
 
         title = f"{user.name} - {job.title} at {job.company}"
 
@@ -204,7 +215,6 @@ class ResumeTailoringAgent:
         # Always generate a LaTeX export. If the user uploaded a .tex template,
         # the writer keeps that structure; otherwise it creates a clean fallback.
         tex_path = version_dir / f"{resume_id}.tex"
-        latex_template_source = getattr(user, "latex_template_source", None)
         ordered_skills = self._ordered_verified_skills(verified_skills, emphasized)
         write_latex(
             path=tex_path,
@@ -219,8 +229,15 @@ class ResumeTailoringAgent:
         )
 
         compiled_pdf = compile_latex_to_pdf(tex_path, pdf_path)
+        pdf_generation = "latex_compiler" if compiled_pdf else "styled_pdf_fallback"
         if not compiled_pdf:
-            write_pdf(pdf_path, title, paragraphs)
+            base_pdf = self._base_pdf_path(user)
+            if latex_template_source and base_pdf:
+                pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(base_pdf, pdf_path)
+                pdf_generation = "base_pdf_fallback"
+            else:
+                write_pdf(pdf_path, title, paragraphs)
 
         plain_paragraphs = [p.replace("__HEADING__", "") for p in paragraphs]
 
@@ -236,11 +253,19 @@ class ResumeTailoringAgent:
             "truthfulness_check": "passed",
             "ai_generated": ai_generated,
             "minimal_latex_edit": bool(latex_template_source),
-            "pdf_generation": "latex_compiler" if compiled_pdf else "styled_pdf_fallback",
-            "resume_changes": self._resume_changes(bool(latex_template_source), emphasized, ordered_skills),
+            "pdf_generation": pdf_generation,
+            "resume_changes": self._resume_changes(
+                bool(latex_template_source),
+                emphasized,
+                ordered_skills,
+                requested_focus,
+                bool(manual_instructions and manual_instructions.strip()),
+            ),
             "ordered_verified_skills": ordered_skills,
             "verified_skills_source": "uploaded_resume_and_profile",
             "recommended_projects_to_build": recommended_projects,
+            "manual_refinement_notes": manual_instructions.strip() if manual_instructions else None,
+            "requested_focus_skills": requested_focus,
         }
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -268,7 +293,7 @@ class ResumeTailoringAgent:
         verified_skills = self._verified_resume_skills(user)
         write_latex(
             path=tex_path,
-            template_source=getattr(user, "latex_template_source", None),
+            template_source=self._latex_template_source(user),
             user_name=user.name or "Candidate",
             skills=self._ordered_verified_skills(verified_skills, version.skills_emphasized or []),
             experience=user.experience or [],
@@ -286,10 +311,33 @@ class ResumeTailoringAgent:
         tex_path = self.ensure_latex_export(user, version, job, force=force)
         if force or not pdf_path.exists():
             title = f"{user.name} - {version.role} at {version.company}"
+            pdf_generation = "latex_compiler"
             if not compile_latex_to_pdf(tex_path, pdf_path):
-                write_pdf(pdf_path, title, paragraphs)
+                base_pdf = self._base_pdf_path(user)
+                if self._latex_template_source(user) and base_pdf:
+                    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(base_pdf, pdf_path)
+                    pdf_generation = "base_pdf_fallback"
+                else:
+                    write_pdf(pdf_path, title, paragraphs)
+                    pdf_generation = "styled_pdf_fallback"
+            self._update_pdf_generation_metadata(version, pdf_generation)
         version.pdf_path = str(pdf_path)
         return pdf_path
+
+    @staticmethod
+    def _update_pdf_generation_metadata(version: ResumeVersion, pdf_generation: str) -> None:
+        if not version.metadata_path:
+            return
+        metadata_path = Path(version.metadata_path)
+        if not metadata_path.exists():
+            return
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["pdf_generation"] = pdf_generation
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Could not update PDF generation metadata for resume version %s: %s", version.id, exc)
 
     def _version_export_path(self, version: ResumeVersion, suffix: str) -> Path:
         version_dir = self.storage_root / "resume_versions"
@@ -299,13 +347,15 @@ class ResumeTailoringAgent:
 
     def _export_paragraphs(self, user: User, version: ResumeVersion, job: Job | None = None) -> list[str]:
         skills = version.skills_emphasized or user.skills[:12] or (job.skills if job else [])
+        role_label = self._role_label(user)
+        experience_phrase = self._experience_phrase(user)
         paragraphs = [
             f"Email: {user.email} | Phone: {user.phone or 'Not provided'} | Location: {user.location or 'Not provided'}",
             f"LinkedIn: {user.linkedin_url or 'Not provided'} | GitHub: {user.github_url or 'Not provided'}",
             f"Target Role: {version.role} at {version.company}",
             "__HEADING__Professional Summary",
             (
-                f"{user.current_role or 'Candidate'} with {user.experience_years:g} years of experience. "
+                f"{role_label}{experience_phrase}. "
                 f"This resume version emphasizes {', '.join(skills) or 'verified resume strengths'} for {version.role}."
             ),
             "__HEADING__Relevant Skills",
@@ -321,7 +371,7 @@ class ResumeTailoringAgent:
                 paragraphs.append(f"{role} - {company}{f' | {duration}' if duration else ''}")
                 paragraphs.extend(str(bullet) for bullet in item.get("bullets", [])[:4])
         elif user.base_resume_text:
-            paragraphs.append(user.base_resume_text[:1600])
+            paragraphs.append("Experience details are preserved in the uploaded base resume; no unsupported experience was invented.")
         else:
             paragraphs.append("Experience details were not provided during onboarding.")
 
@@ -340,6 +390,82 @@ class ResumeTailoringAgent:
             paragraphs.append(job.description[:600])
         return paragraphs
 
+    def has_latex_template(self, user: User) -> bool:
+        return bool(self._latex_template_source(user))
+
+    def _latex_template_source(self, user: User) -> str | None:
+        source = getattr(user, "latex_template_source", None)
+        if source and "\\documentclass" in source:
+            return source
+
+        settings = get_settings()
+        candidates: list[Path] = []
+        configured_path = getattr(settings, "latex_template_path", None)
+        repo_root = Path(__file__).resolve().parents[3]
+        if configured_path:
+            configured = Path(configured_path).expanduser()
+            if configured.is_absolute():
+                candidates.append(configured)
+            else:
+                candidates.extend([Path.cwd() / configured, repo_root / configured, repo_root / "backend" / configured])
+
+        base_resume_dir = self.storage_root / "base_resumes"
+        if base_resume_dir.exists():
+            candidates.extend(sorted(base_resume_dir.glob("*.tex"), key=lambda path: path.stat().st_mtime, reverse=True))
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            path = candidate.expanduser().resolve()
+            if path in seen:
+                continue
+            seen.add(path)
+            if not path.exists() or path.suffix.lower() != ".tex":
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning("Could not read LaTeX template %s: %s", path, exc)
+                continue
+            if "\\documentclass" in text and "\\begin{document}" in text:
+                return text
+        return None
+
+    @staticmethod
+    def _base_pdf_path(user: User) -> Path | None:
+        base_path_value = getattr(user, "base_resume_path", None)
+        if not base_path_value:
+            return None
+        base_path = Path(base_path_value).expanduser()
+        if base_path.exists() and base_path.suffix.lower() == ".pdf":
+            return base_path
+        return None
+
+    @staticmethod
+    def _role_label(user: User) -> str:
+        if getattr(user, "current_role", None):
+            return user.current_role
+        if user.experience:
+            role = user.experience[0].get("role")
+            if role:
+                return str(role)
+        text = normalize(getattr(user, "base_resume_text", "") or "")
+        if "ai/ml engineer" in text:
+            return "AI/ML Engineer"
+        if "machine learning" in text:
+            return "Machine Learning Engineer"
+        if "generative ai" in text or "genai" in text:
+            return "Generative AI Engineer"
+        return "Candidate"
+
+    @staticmethod
+    def _experience_phrase(user: User) -> str:
+        years = getattr(user, "experience_years", 0) or 0
+        if years > 0:
+            return f" with {years:g}+ years of experience"
+        if getattr(user, "experience", None) or getattr(user, "base_resume_text", None):
+            return " with production experience"
+        return ""
+
     @staticmethod
     def _ordered_verified_skills(user_skills: list[str], emphasized: list[str]) -> list[str]:
         selected: list[str] = []
@@ -350,6 +476,17 @@ class ResumeTailoringAgent:
                 normalized_seen.add(key)
                 selected.append(str(skill))
         return selected[:28]
+
+    @classmethod
+    def _dedupe_skills(cls, skills: list[str]) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for skill in skills:
+            key = normalize(str(skill))
+            if key and key not in seen:
+                seen.add(key)
+                selected.append(str(skill))
+        return selected
 
     @staticmethod
     def _job_keywords(job: Job) -> list[str]:
@@ -362,14 +499,13 @@ class ResumeTailoringAgent:
                 selected.append(str(skill))
         return selected
 
-    @staticmethod
-    def _verified_resume_skills(user: User) -> list[str]:
+    def _verified_resume_skills(self, user: User) -> list[str]:
         selected: list[str] = []
         seen: set[str] = set()
         raw_sources = [
             *(user.skills or []),
             *ResumeExtractionService._extract_skills(getattr(user, "base_resume_text", "") or ""),
-            *ResumeExtractionService._extract_skills(getattr(user, "latex_template_source", "") or ""),
+            *ResumeExtractionService._extract_skills(self._latex_template_source(user) or ""),
         ]
         for skill in raw_sources:
             key = normalize(str(skill))
@@ -396,7 +532,27 @@ class ResumeTailoringAgent:
         return emphasized[:12]
 
     @staticmethod
-    def _resume_changes(has_latex_template: bool, emphasized: list[str], ordered_skills: list[str]) -> list[str]:
+    def _requested_focus_skills(verified_skills: list[str], manual_instructions: str | None) -> list[str]:
+        if not manual_instructions:
+            return []
+        instruction_text = normalize(manual_instructions)
+        requested: list[str] = []
+        seen: set[str] = set()
+        for skill in verified_skills:
+            key = normalize(str(skill))
+            if key and key in instruction_text and key not in seen:
+                seen.add(key)
+                requested.append(str(skill))
+        return requested[:8]
+
+    @staticmethod
+    def _resume_changes(
+        has_latex_template: bool,
+        emphasized: list[str],
+        ordered_skills: list[str],
+        requested_focus: list[str] | None = None,
+        manual_refinement: bool = False,
+    ) -> list[str]:
         changes = []
         if has_latex_template:
             changes.append("Kept the uploaded LaTeX resume template and preserved core formatting.")
@@ -408,6 +564,11 @@ class ResumeTailoringAgent:
             changes.append(f"Emphasized verified overlap: {', '.join(emphasized[:8])}.")
         elif ordered_skills:
             changes.append(f"Kept verified skills visible: {', '.join(ordered_skills[:8])}.")
+        if manual_refinement:
+            if requested_focus:
+                changes.append(f"Applied your refinement comments where they matched verified skills: {', '.join(requested_focus[:8])}.")
+            else:
+                changes.append("Saved your refinement comments for review; no unsupported new skills were added.")
         return changes
 
     def find_reusable(self, existing: list[ResumeVersion], job: Job) -> ResumeVersion | None:
@@ -428,10 +589,11 @@ class ResumeTailoringAgent:
         return None
 
     @staticmethod
-    def _resume_id(job: Job) -> str:
+    def _resume_id(job: Job, suffix: str | None = None) -> str:
         date_prefix = datetime.now(UTC).strftime("%Y%m%d")
         slug = re.sub(r"[^a-z0-9]+", "-", f"{job.company}-{job.title}".lower()).strip("-")
-        return f"resume_{date_prefix}_{slug[:80]}"
+        clean_suffix = re.sub(r"[^a-z0-9]+", "-", suffix.lower()).strip("-") if suffix else ""
+        return f"resume_{date_prefix}_{slug[:80]}{f'-{clean_suffix[:32]}' if clean_suffix else ''}"
 
     @staticmethod
     def _recommended_projects(missing: set[str]) -> list[str]:
@@ -441,21 +603,34 @@ class ResumeTailoringAgent:
         return [f"Recommended project to build demonstrating {', '.join(notable)} in a production-style workflow."]
 
     @staticmethod
-    def _build_resume_text(user: User, job: Job, emphasized: list[str], recommended: list[str]) -> list[str]:
+    def _build_resume_text(
+        user: User,
+        job: Job,
+        emphasized: list[str],
+        recommended: list[str],
+        manual_instructions: str | None = None,
+    ) -> list[str]:
         """Deterministic template fallback — used when LLM is unavailable."""
+        role_label = ResumeTailoringAgent._role_label(user)
+        experience_phrase = ResumeTailoringAgent._experience_phrase(user)
         paragraphs = [
             f"Email: {user.email} | Phone: {user.phone or 'Not provided'} | Location: {user.location or 'Not provided'}",
             f"LinkedIn: {user.linkedin_url or 'Not provided'} | GitHub: {user.github_url or 'Not provided'}",
             f"Target Role: {job.title} at {job.company}",
             "__HEADING__Professional Summary",
             (
-                f"{user.current_role or 'Candidate'} with {user.experience_years:g} years of experience. "
+                f"{role_label}{experience_phrase}. "
                 f"This version emphasizes truthful evidence relevant to {job.title}: {', '.join(emphasized) or 'core resume strengths'}."
             ),
             "__HEADING__Relevant Skills",
             ", ".join(emphasized or user.skills[:12] or ["Skills not provided"]),
             "__HEADING__Experience",
         ]
+        if manual_instructions and emphasized:
+            paragraphs.insert(
+                6,
+                "Refinement focus applied using verified resume evidence: " + ", ".join(emphasized[:8]),
+            )
         if user.experience:
             for item in user.experience[:4]:
                 company = item.get("company", "Company")
@@ -464,7 +639,7 @@ class ResumeTailoringAgent:
                 paragraphs.append(f"{role} - {company}")
                 paragraphs.extend(str(bullet) for bullet in bullets[:4])
         elif user.base_resume_text:
-            paragraphs.append(user.base_resume_text[:1200])
+            paragraphs.append("Experience details are preserved in the uploaded base resume; no unsupported experience was invented.")
         else:
             paragraphs.append("Experience details were not provided during onboarding.")
 
